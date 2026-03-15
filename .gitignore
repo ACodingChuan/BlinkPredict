@@ -1,0 +1,46 @@
+# Ignore everything by default (we only want to version a small subset of this repo)
+*
+
+# Always keep the ignore file itself
+!.gitignore
+
+# Allowlist: only these three top-level folders (and their contents) are tracked
+!Banckend/
+!Banckend/**
+!Contract/
+!Contract/**
+!Frontened/
+!Frontened/**
+
+# Environment files / secrets (keep examples)
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+
+# Keys / credentials
+**/*.pem
+**/*.key
+**/*.p12
+**/*.keystore
+**/*mnemonic*
+**/*secret*
+**/*private*
+**/id_rsa
+**/id_rsa.pub
+**/phantom.json
+
+# Common build / OS junk
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/target/
+**/*.log
+**/.DS_Store
+
+# Go build artifacts
+**/*.out
+**/*.test
+**/vendor/
