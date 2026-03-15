@@ -8,12 +8,12 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMenu } from "@/components/user-menu";
 import { usePrivy } from "@privy-io/react-auth";
 import { useUSDCBalance } from "@/hooks/useUSDCBalance";
-import { getIdentityToken } from "@privy-io/react-auth";
+import { getSolanaWalletAddress } from "@/lib/privy";
 import { toast } from "sonner";
 
 export default function HomePage() {
-  const { user, login } = usePrivy();
-  const { balance } = useUSDCBalance();
+  const { user, login, authenticated, getAccessToken } = usePrivy();
+  const { balance, syncAfterMutation } = useUSDCBalance();
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
   const [faucetLoading, setFaucetLoading] = useState(false);
@@ -42,7 +42,7 @@ export default function HomePage() {
           </div>
           <div className="flex items-center gap-3">
             <ThemeToggle />
-            {user ? (
+            {authenticated && user ? (
               <div className="flex items-center gap-3">
                 <div className="rounded-full bg-zinc-900 px-3 py-1 text-xs font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900">{balance} vUSDC</div>
                 <UserMenu />
@@ -61,20 +61,30 @@ export default function HomePage() {
             <h2 className="mt-4 max-w-2xl text-4xl font-semibold tracking-tight text-zinc-950 dark:text-zinc-50">A Solana prediction market shell built for creator-resolved and Pyth-secured markets.</h2>
             <div className="mt-6 flex flex-wrap gap-3">
               <Link className="rounded-full bg-emerald-600 px-5 py-3 text-sm font-semibold text-white" href="/markets/create">Create market</Link>
-              {user ? (
+              {authenticated && user ? (
                 <button
                   className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200"
                   disabled={faucetLoading}
                   onClick={async () => {
                     try {
                       setFaucetLoading(true);
-                      const token = await getIdentityToken();
+                      const token = await getAccessToken();
                       if (!token) {
                         toast.error("Not authenticated", { description: "Please login again." });
                         return;
                       }
-                      const { data } = await api.post("/faucet/claim", {}, { headers: { "privy-id-token": token } });
+                      const walletAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
+                      if (!walletAddress) {
+                        toast.error("No Solana wallet", { description: "Please connect/link a Solana wallet first." });
+                        return;
+                      }
+                      const { data } = await api.post(
+                        "/faucet/claim",
+                        { wallet_address: walletAddress },
+                        { headers: { "privy-id-token": token } },
+                      );
                       toast.success("Faucet submitted", { description: data.signature });
+                      void syncAfterMutation();
                     } catch (error: unknown) {
                       const response =
                         typeof error === "object" && error !== null && "response" in error

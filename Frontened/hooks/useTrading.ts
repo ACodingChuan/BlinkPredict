@@ -3,8 +3,10 @@ import { useState } from "react";
 import api from "@/app/utils/axiosInstance";
 import { Market, TransactionEnvelope } from "@/types/market";
 import { toast } from "sonner";
-import { useIdentityToken } from "@privy-io/react-auth";
+import { useIdentityToken, usePrivy } from "@privy-io/react-auth";
 import { useSignAndSendTransaction, useWallets } from "@privy-io/react-auth/solana";
+import { useUSDCStore } from "@/store/usdcStore";
+import { getSolanaWalletAddress } from "@/lib/privy";
 
 interface TradeParams {
   market: Market;
@@ -18,8 +20,24 @@ interface TradeParams {
 export const useTrading = () => {
   const [loading, setLoading] = useState(false);
   const { identityToken } = useIdentityToken();
+  const { user } = usePrivy();
   const { signAndSendTransaction } = useSignAndSendTransaction();
   const { wallets } = useWallets();
+  const syncBalance = useUSDCStore((state) => state.syncBalance);
+
+  const triggerBalanceSync = () => {
+    const walletAddress =
+      getSolanaWalletAddress(
+        user as {
+          wallet?: { address?: string; chainType?: string; chain_type?: string };
+          linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[];
+        } | null,
+      ) || wallets[0]?.address;
+
+    if (walletAddress) {
+      void syncBalance(walletAddress);
+    }
+  };
 
   const maybeSendTransaction = async (payload: TransactionEnvelope) => {
     if (!payload.tx_message) {
@@ -57,7 +75,9 @@ export const useTrading = () => {
           },
           { headers: { "privy-id-token": identityToken } },
         );
-        return maybeSendTransaction(data);
+        const ok = await maybeSendTransaction(data);
+        if (ok) triggerBalanceSync();
+        return ok;
       }
 
       if (orderType === "claim") {
@@ -66,7 +86,9 @@ export const useTrading = () => {
           { market_id: market.market_id, collateral_mint: market.collateral_mint, amount: 0 },
           { headers: { "privy-id-token": identityToken } },
         );
-        return maybeSendTransaction(data);
+        const ok = await maybeSendTransaction(data);
+        if (ok) triggerBalanceSync();
+        return ok;
       }
 
       const { data } = await api.post<{ code?: string; message: string }>(
@@ -88,6 +110,7 @@ export const useTrading = () => {
       }
 
       toast.success(data.message);
+      triggerBalanceSync();
       return true;
     } catch (error: unknown) {
       const response = typeof error === "object" && error !== null && "response" in error ? (error as { response?: { data?: { message?: string; code?: string } } }).response : undefined;

@@ -23,6 +23,7 @@ type Config struct {
 	FaucetPayerKeypair        string
 	FaucetMintAuthorityKeypair string
 	FaucetAmount              uint64
+	FaucetDisableRateLimit    bool
 }
 
 func Load() Config {
@@ -46,6 +47,7 @@ func Load() Config {
 		FaucetPayerKeypair:        os.Getenv("FAUCET_PAYER_KEYPAIR"),
 		FaucetMintAuthorityKeypair: getEnv("FAUCET_MINT_AUTHORITY_KEYPAIR", os.Getenv("FAUCET_PAYER_KEYPAIR")),
 		FaucetAmount:              uint64(getEnvInt("FAUCET_AMOUNT", 500)),
+		FaucetDisableRateLimit:    getEnvBool("FAUCET_DISABLE_RATE_LIMIT", false),
 	}
 }
 
@@ -66,6 +68,21 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func csvSet(value string) map[string]struct{} {

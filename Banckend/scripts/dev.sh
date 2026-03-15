@@ -32,5 +32,17 @@ echo "- VUSDC_MINT=${VUSDC_MINT:-}"
 echo "- DB_HOST=${DB_HOST:-} DB_PORT=${DB_PORT:-} APP_DB=${APP_DB:-} APP_DB_USER=${APP_DB_USER:-}"
 echo
 
-exec go run ./cmd/api
+# By default, also write logs to a file so you can always "tail -f" them (useful in IDE tasks
+# where the terminal output is not visible/scrolling).
+LOG_DIR_DEFAULT="${ROOT_DIR}/.logs"
+LOG_FILE_DEFAULT="${LOG_DIR_DEFAULT}/banckend-dev.log"
+LOG_FILE="${LOG_FILE:-${LOG_FILE_DEFAULT}}"
 
+mkdir -p "$(dirname -- "${LOG_FILE}")"
+echo "Logging:"
+echo "- file: ${LOG_FILE}"
+echo "- follow: tail -f \"${LOG_FILE}\""
+echo
+
+# Keep stdout/stderr in the current terminal AND persist to disk.
+go run ./cmd/api 2>&1 | tee -a "${LOG_FILE}"

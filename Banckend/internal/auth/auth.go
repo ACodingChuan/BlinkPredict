@@ -24,9 +24,10 @@ type User struct {
 }
 
 type linkedAccount struct {
-	Type      string `json:"type"`
-	ChainType string `json:"chain_type"`
-	Address   string `json:"address"`
+	Type           string `json:"type"`
+	ChainType      string `json:"chain_type"`
+	ChainTypeCamel string `json:"chainType"`
+	Address        string `json:"address"`
 }
 
 type claims struct {
@@ -34,6 +35,10 @@ type claims struct {
 	Email          string          `json:"email"`
 	Name           string          `json:"name"`
 	LinkedAccounts []linkedAccount `json:"linked_accounts"`
+	Wallets        []linkedAccount `json:"wallets"`
+	Wallet         linkedAccount   `json:"wallet"`
+	SolanaAddress  string          `json:"solana_address"`
+	WalletAddress  string          `json:"wallet_address"`
 }
 
 func Middleware(cfg config.Config) func(http.Handler) http.Handler {
@@ -99,7 +104,7 @@ func ParseToken(raw string, cfg config.Config) (User, error) {
 		Subject:       parsed.Subject,
 		Email:         parsed.Email,
 		Name:          parsed.Name,
-		SolanaAddress: findSolanaAddress(parsed.LinkedAccounts),
+		SolanaAddress: findSolanaAddress(parsed),
 	}
 	_, emailAdmin := cfg.AdminEmails[strings.ToLower(user.Email)]
 	_, walletAdmin := cfg.AdminWallets[strings.ToLower(user.SolanaAddress)]
@@ -107,11 +112,45 @@ func ParseToken(raw string, cfg config.Config) (User, error) {
 	return user, nil
 }
 
-func findSolanaAddress(accounts []linkedAccount) string {
-	for _, account := range accounts {
-		if strings.EqualFold(account.ChainType, "solana") && account.Address != "" {
-			return account.Address
+func (a linkedAccount) normalizedChainType() string {
+	if a.ChainType != "" {
+		return a.ChainType
+	}
+	return a.ChainTypeCamel
+}
+
+func findSolanaAddress(payload claims) string {
+	findFromAccounts := func(accounts []linkedAccount) string {
+		for _, account := range accounts {
+			if account.Address == "" {
+				continue
+			}
+			chain := account.normalizedChainType()
+			// Some Privy token variants omit chain_type on single-wallet payloads.
+			if chain == "" || strings.EqualFold(chain, "solana") {
+				return account.Address
+			}
 		}
+		return ""
+	}
+
+	if address := findFromAccounts(payload.LinkedAccounts); address != "" {
+		return address
+	}
+	if address := findFromAccounts(payload.Wallets); address != "" {
+		return address
+	}
+	if payload.Wallet.Address != "" {
+		chain := payload.Wallet.normalizedChainType()
+		if chain == "" || strings.EqualFold(chain, "solana") {
+			return payload.Wallet.Address
+		}
+	}
+	if payload.SolanaAddress != "" {
+		return payload.SolanaAddress
+	}
+	if payload.WalletAddress != "" {
+		return payload.WalletAddress
 	}
 	return ""
 }

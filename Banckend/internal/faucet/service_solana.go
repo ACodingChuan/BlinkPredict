@@ -23,7 +23,7 @@ type SolanaServiceConfig struct {
 	MintAuthority      solana.PrivateKey
 	AmountTokens       uint64
 	Cooldown           time.Duration
-	TokenProgramID     solana.PublicKey
+	DisableRateLimit   bool
 	AssociatedProgramID solana.PublicKey
 }
 
@@ -55,9 +55,6 @@ func NewSolanaService(cfg SolanaServiceConfig, repo ClaimsRepository) (*SolanaSe
 	if cfg.Cooldown == 0 {
 		cfg.Cooldown = 24 * time.Hour
 	}
-	if cfg.TokenProgramID.IsZero() {
-		cfg.TokenProgramID = token.ProgramID
-	}
 	if cfg.AssociatedProgramID.IsZero() {
 		cfg.AssociatedProgramID = associatedtokenaccount.ProgramID
 	}
@@ -82,18 +79,25 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 	}
 
 	now := time.Now().UTC()
-	if at, ok, err := s.repo.LastClaimedAtByWallet(ctx, solanaAddress); err != nil {
-		return Result{}, err
-	} else if ok && now.Sub(at) < s.cfg.Cooldown {
-		return Result{}, WrapRateLimit(nil, at.Add(s.cfg.Cooldown))
-	}
-	if at, ok, err := s.repo.LastClaimedAtByIP(ctx, ip); err != nil {
-		return Result{}, err
-	} else if ok && now.Sub(at) < s.cfg.Cooldown {
-		return Result{}, WrapRateLimit(nil, at.Add(s.cfg.Cooldown))
+	if !s.cfg.DisableRateLimit {
+		if at, ok, err := s.repo.LastClaimedAtByWallet(ctx, solanaAddress); err != nil {
+			return Result{}, err
+		} else if ok && now.Sub(at) < s.cfg.Cooldown {
+			return Result{}, WrapRateLimit(nil, at.Add(s.cfg.Cooldown))
+		}
+		if at, ok, err := s.repo.LastClaimedAtByIP(ctx, ip); err != nil {
+			return Result{}, err
+		} else if ok && now.Sub(at) < s.cfg.Cooldown {
+			return Result{}, WrapRateLimit(nil, at.Add(s.cfg.Cooldown))
+		}
 	}
 
-	ata, _, err := solana.FindAssociatedTokenAddress(user, s.cfg.Mint)
+	tokenProgramID, err := s.detectMintTokenProgram(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+
+	ata, err := findAssociatedTokenAddress(user, s.cfg.Mint, tokenProgramID)
 	if err != nil {
 		return Result{}, fmt.Errorf("derive ata: %w", err)
 	}
@@ -110,11 +114,14 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 
 	instructions := make([]solana.Instruction, 0, 2)
 	if !ataExists {
-		instructions = append(instructions, associatedtokenaccount.NewCreateInstruction(
+		instructions = append(instructions, buildCreateATAInstruction(
 			s.cfg.Payer.PublicKey(),
 			user,
 			s.cfg.Mint,
-		).Build())
+			ata,
+			tokenProgramID,
+			s.cfg.AssociatedProgramID,
+		))
 	}
 
 	amountBaseUnits, err := s.amountBaseUnits()
@@ -122,13 +129,22 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, err
 	}
 
-	instructions = append(instructions, token.NewMintToInstruction(
+	mintTo := token.NewMintToInstruction(
 		amountBaseUnits,
 		s.cfg.Mint,
 		ata,
 		s.cfg.MintAuthority.PublicKey(),
 		nil,
-	).Build())
+	).Build()
+	mintToData, err := mintTo.Data()
+	if err != nil {
+		return Result{}, fmt.Errorf("encode mint_to instruction: %w", err)
+	}
+	instructions = append(instructions, solana.NewInstruction(
+		tokenProgramID,
+		mintTo.Accounts(),
+		mintToData,
+	))
 
 	latest, err := s.rpc.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
 	if err != nil {
@@ -204,6 +220,56 @@ func (s *SolanaService) amountBaseUnits() (uint64, error) {
 		return 0, fmt.Errorf("amount too large")
 	}
 	return s.cfg.AmountTokens * multiplier, nil
+}
+
+func (s *SolanaService) detectMintTokenProgram(ctx context.Context) (solana.PublicKey, error) {
+	info, err := s.rpc.GetAccountInfo(ctx, s.cfg.Mint)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("get mint account info: %w", err)
+	}
+	if info == nil || info.Value == nil {
+		return solana.PublicKey{}, fmt.Errorf("mint account not found")
+	}
+	owner := info.Value.Owner
+	if owner.Equals(solana.TokenProgramID) || owner.Equals(solana.Token2022ProgramID) {
+		return owner, nil
+	}
+	return solana.PublicKey{}, fmt.Errorf("unsupported token program for mint: %s", owner.String())
+}
+
+func findAssociatedTokenAddress(wallet, mint, tokenProgramID solana.PublicKey) (solana.PublicKey, error) {
+	ata, _, err := solana.FindProgramAddress(
+		[][]byte{
+			wallet[:],
+			tokenProgramID[:],
+			mint[:],
+		},
+		solana.SPLAssociatedTokenAccountProgramID,
+	)
+	if err != nil {
+		return solana.PublicKey{}, err
+	}
+	return ata, nil
+}
+
+func buildCreateATAInstruction(
+	payer solana.PublicKey,
+	wallet solana.PublicKey,
+	mint solana.PublicKey,
+	ata solana.PublicKey,
+	tokenProgramID solana.PublicKey,
+	associatedProgramID solana.PublicKey,
+) solana.Instruction {
+	accounts := solana.AccountMetaSlice{
+		{PublicKey: payer, IsSigner: true, IsWritable: true},
+		{PublicKey: ata, IsSigner: false, IsWritable: true},
+		{PublicKey: wallet, IsSigner: false, IsWritable: false},
+		{PublicKey: mint, IsSigner: false, IsWritable: false},
+		{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
+		{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
+	}
+	// Associated token create instruction has empty data payload.
+	return solana.NewInstruction(associatedProgramID, accounts, []byte{})
 }
 
 // LoadKeypair parses either a solana-keygen JSON array or a file path to that JSON.

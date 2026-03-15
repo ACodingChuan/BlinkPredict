@@ -6,7 +6,8 @@ import { usePrivy } from "@privy-io/react-auth";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import api from "@/app/utils/axiosInstance";
-import { getIdentityToken } from "@privy-io/react-auth";
+import { useUSDCStore } from "@/store/usdcStore";
+import { getSolanaWalletAddress } from "@/lib/privy";
 
 type OAuthAccount = { type: "google_oauth"; email?: string; name?: string };
 type WalletAccount = { type: "wallet"; address?: string };
@@ -15,11 +16,12 @@ type EmailAccount = { type: "email"; address?: string };
 type BasicAccount = OAuthAccount | WalletAccount | EmailAccount | { type: string };
 
 export const UserMenu = () => {
-  const { user, logout } = usePrivy();
+  const { user, authenticated, logout, getAccessToken } = usePrivy();
+  const syncBalance = useUSDCStore((state) => state.syncBalance);
   const { theme, setTheme } = useTheme();
   const [isOpen, setIsOpen] = useState(false);
 
-  if (!user) return null;
+  if (!user || !authenticated) return null;
 
   const linkedAccounts = user.linkedAccounts as BasicAccount[];
   const googleAccount = linkedAccounts.find((account): account is OAuthAccount => account.type === "google_oauth");
@@ -27,24 +29,30 @@ export const UserMenu = () => {
   const emailAccount = linkedAccounts.find((account): account is EmailAccount => account.type === "email");
 
   const email = googleAccount?.email || emailAccount?.address;
-  const address = walletAccount?.address || user.wallet?.address;
+  const solanaAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
+  const address = solanaAddress || walletAccount?.address || user.wallet?.address;
   const displayName = googleAccount?.name || (address ? `${address.slice(0, 6)}...${address.slice(-4)}` : "User");
   const isAdmin = email === process.env.NEXT_PUBLIC_ADMIN_EMAIL;
   const initial = (googleAccount?.name?.[0] || address?.[0] || "U").toUpperCase();
 
   const handleFaucet = async () => {
     try {
-      const token = await getIdentityToken();
+      const token = await getAccessToken();
       if (!token) {
         toast.error("Not authenticated", { description: "Please login again." });
         return;
       }
+      if (!solanaAddress) {
+        toast.error("No Solana wallet", { description: "Please connect/link a Solana wallet first." });
+        return;
+      }
       const { data } = await api.post(
         "/faucet/claim",
-        {},
+        { wallet_address: solanaAddress },
         { headers: { "privy-id-token": token } },
       );
       toast.success("Faucet submitted", { description: data.signature });
+      void syncBalance(solanaAddress);
       setIsOpen(false);
     } catch (error: unknown) {
       const response =

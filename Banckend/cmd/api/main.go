@@ -46,6 +46,7 @@ func main() {
 			MintAuthority: mintAuthority,
 			AmountTokens:  cfg.FaucetAmount,
 			Cooldown:      24 * time.Hour,
+			DisableRateLimit: cfg.FaucetDisableRateLimit,
 		}, repo)
 		if err != nil {
 			log.Fatalf("faucet service: %v", err)

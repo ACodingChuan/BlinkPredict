@@ -1,11 +1,14 @@
 package httpapi
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"blinkpredict/banckend/internal/auth"
@@ -86,12 +89,42 @@ func (s *Server) Router() http.Handler {
 }
 
 func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WalletAddress string `json:"wallet_address"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
 	user, ok := auth.FromContext(r.Context())
-	if !ok || user.SolanaAddress == "" {
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	result, err := s.faucet.Claim(r.Context(), user.SolanaAddress, faucet.ClientIP(r))
+
+	walletAddress := user.SolanaAddress
+	if walletAddress == "" && req.WalletAddress != "" {
+		walletAddress = strings.TrimSpace(req.WalletAddress)
+	}
+	if walletAddress == "" {
+		rawToken := authTokenFromRequest(r)
+		if rawToken != "" {
+			resolved, err := s.resolveSolanaAddressFromPrivy(r.Context(), rawToken, r.Header.Get("Origin"))
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "unable to resolve wallet from privy token: "+err.Error())
+				return
+			}
+			walletAddress = resolved
+		}
+	}
+	if walletAddress == "" {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if _, err := gsolana.PublicKeyFromBase58(walletAddress); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid wallet_address")
+		return
+	}
+
+	result, err := s.faucet.Claim(r.Context(), walletAddress, faucet.ClientIP(r))
 	if err != nil {
 		var rate faucet.RateLimitError
 		if errors.As(err, &rate) {
@@ -116,6 +149,85 @@ func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
 		"amount":    result.Amount,
 		"claimed_at": result.ClaimedAt.Format(time.RFC3339),
 	})
+}
+
+func authTokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.Header.Get("privy-id-token")); token != "" {
+		return token
+	}
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return strings.TrimSpace(authHeader[len("Bearer "):])
+	}
+	return ""
+}
+
+func (s *Server) resolveSolanaAddressFromPrivy(ctx context.Context, token string, origin string) (string, error) {
+	appID := strings.TrimSpace(s.cfg.PrivyAppID)
+	if appID == "" {
+		appID = parsePrivyAppIDFromToken(token)
+	}
+	if appID == "" {
+		return "", errors.New("missing privy app id")
+	}
+
+	if strings.TrimSpace(origin) == "" {
+		origin = "http://localhost:3000"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://auth.privy.io/api/v1/users/me", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("privy-app-id", appID)
+	req.Header.Set("Origin", origin)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("privy /users/me status=%d", resp.StatusCode)
+	}
+
+	var payload struct {
+		User struct {
+			LinkedAccounts []struct {
+				Type      string `json:"type"`
+				Address   string `json:"address"`
+				ChainType string `json:"chain_type"`
+			} `json:"linked_accounts"`
+		} `json:"user"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	for _, account := range payload.User.LinkedAccounts {
+		if strings.EqualFold(account.Type, "wallet") && strings.EqualFold(account.ChainType, "solana") && account.Address != "" {
+			return account.Address, nil
+		}
+	}
+	return "", errors.New("no solana wallet in privy profile")
+}
+
+func parsePrivyAppIDFromToken(raw string) string {
+	parts := strings.Split(raw, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var decoded struct {
+		AppID string `json:"aid"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(decoded.AppID)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

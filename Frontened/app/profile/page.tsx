@@ -3,12 +3,14 @@
 import Link from "next/link";
 import { usePrivy } from "@privy-io/react-auth";
 import { useUSDCBalance } from "@/hooks/useUSDCBalance";
+import { getSolanaWalletAddress } from "@/lib/privy";
 
 type LinkedAccount = { type: string; email?: string; address?: string };
 
 export default function ProfilePage() {
   const { user, login } = usePrivy();
   const { balance } = useUSDCBalance();
+  const solanaAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
   const primaryAccount = user ? getPrimaryAccount(user.linkedAccounts as LinkedAccount[]) : "Wallet-first account";
 
   return (
@@ -23,7 +25,7 @@ export default function ProfilePage() {
           </div>
         ) : (
           <div className="mt-6 grid gap-4 md:grid-cols-2">
-            <Info label="Wallet" value={user.wallet?.address || "No embedded wallet"} mono />
+            <Info label="Wallet" value={solanaAddress || "No Solana wallet linked"} mono />
             <Info label="vUSDC balance" value={`${balance} vUSDC`} />
             <Info label="v1a status" value="Position and claim flows are scaffolded; matching-led fills arrive in v1b." />
             <Info label="Primary account" value={primaryAccount} />
