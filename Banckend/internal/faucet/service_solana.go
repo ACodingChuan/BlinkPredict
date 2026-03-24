@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -13,23 +14,26 @@ import (
 	"github.com/gagliardetto/solana-go/programs/associated-token-account"
 	"github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
+	sendconfirm "github.com/gagliardetto/solana-go/rpc/sendAndConfirmTransaction"
+	"github.com/gagliardetto/solana-go/rpc/ws"
 )
 
 type SolanaServiceConfig struct {
-	RPCURL             string
-	Mint               solana.PublicKey
-	Decimals           int
-	Payer              solana.PrivateKey
-	MintAuthority      solana.PrivateKey
-	AmountTokens       uint64
-	Cooldown           time.Duration
-	DisableRateLimit   bool
+	RPCURL              string
+	Mint                solana.PublicKey
+	Decimals            int
+	Payer               solana.PrivateKey
+	MintAuthority       solana.PrivateKey
+	AmountTokens        uint64
+	Cooldown            time.Duration
+	DisableRateLimit    bool
 	AssociatedProgramID solana.PublicKey
 }
 
 type SolanaService struct {
 	cfg  SolanaServiceConfig
 	rpc  *rpc.Client
+	ws   *ws.Client
 	repo ClaimsRepository
 }
 
@@ -62,9 +66,18 @@ func NewSolanaService(cfg SolanaServiceConfig, repo ClaimsRepository) (*SolanaSe
 		return nil, fmt.Errorf("claims repo is required")
 	}
 
+	wsURL, err := rpcURLToWSURL(cfg.RPCURL)
+	if err != nil {
+		return nil, err
+	}
+	wsClient, err := ws.Connect(context.Background(), wsURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect ws: %w", err)
+	}
 	return &SolanaService{
 		cfg:  cfg,
 		rpc:  rpc.New(cfg.RPCURL),
+		ws:   wsClient,
 		repo: repo,
 	}, nil
 }
@@ -73,8 +86,7 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 	if strings.TrimSpace(solanaAddress) == "" || strings.TrimSpace(ip) == "" {
 		return Result{}, fmt.Errorf("missing address or ip")
 	}
-	user, err := solana.PublicKeyFromBase58(solanaAddress)
-	if err != nil {
+	if _, err := solana.PublicKeyFromBase58(solanaAddress); err != nil {
 		return Result{}, fmt.Errorf("invalid solana address: %w", err)
 	}
 
@@ -97,9 +109,10 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, err
 	}
 
-	ata, err := findAssociatedTokenAddress(user, s.cfg.Mint, tokenProgramID)
+	treasuryOwner := s.cfg.Payer.PublicKey()
+	ata, err := findAssociatedTokenAddress(treasuryOwner, s.cfg.Mint, tokenProgramID)
 	if err != nil {
-		return Result{}, fmt.Errorf("derive ata: %w", err)
+		return Result{}, fmt.Errorf("derive treasury ata: %w", err)
 	}
 
 	ataExists := true
@@ -116,7 +129,7 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 	if !ataExists {
 		instructions = append(instructions, buildCreateATAInstruction(
 			s.cfg.Payer.PublicKey(),
-			user,
+			treasuryOwner,
 			s.cfg.Mint,
 			ata,
 			tokenProgramID,
@@ -174,13 +187,27 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, fmt.Errorf("sign transaction: %w", err)
 	}
 
-	sig, err := s.rpc.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+	sig, err := sendconfirm.SendAndConfirmTransactionWithOpts(ctx, s.rpc, s.ws, tx, rpc.TransactionOpts{
 		SkipPreflight:       false,
 		PreflightCommitment: rpc.CommitmentProcessed,
-	})
+	}, nil)
 	if err != nil {
 		return Result{}, fmt.Errorf("send transaction: %w", err)
 	}
+
+	confirmedAt := time.Now().UTC()
+	_ = s.repo.InsertDepositRequest(ctx, DepositRequestRow{
+		WalletAddress:       solanaAddress,
+		AmountUnits:         amountBaseUnits / divisorForLedgerUnits(s.cfg.Decimals),
+		Mint:                s.cfg.Mint.String(),
+		TreasuryDestination: ata.String(),
+		ChainSignature:      sig.String(),
+		Status:              "confirmed",
+		Source:              "faucet",
+		CreatedAt:           now,
+		ConfirmedAt:         &confirmedAt,
+	})
+	_ = s.repo.CreditWalletAccount(ctx, solanaAddress, amountBaseUnits/divisorForLedgerUnits(s.cfg.Decimals))
 
 	if err := s.repo.InsertClaim(ctx, ClaimRow{
 		SolanaAddress: solanaAddress,
@@ -203,6 +230,31 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		Amount:    s.cfg.AmountTokens,
 		ClaimedAt: now,
 	}, nil
+}
+
+func rpcURLToWSURL(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	switch parsed.Scheme {
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		parsed.Scheme = "ws"
+	}
+	return parsed.String(), nil
+}
+
+func divisorForLedgerUnits(decimals int) uint64 {
+	if decimals <= 2 {
+		return 1
+	}
+	divisor := uint64(1)
+	for i := 0; i < decimals-2; i++ {
+		divisor *= 10
+	}
+	return divisor
 }
 
 func (s *SolanaService) amountBaseUnits() (uint64, error) {

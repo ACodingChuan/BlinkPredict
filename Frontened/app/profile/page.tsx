@@ -9,7 +9,7 @@ type LinkedAccount = { type: string; email?: string; address?: string };
 
 export default function ProfilePage() {
   const { user, login } = usePrivy();
-  const { balance } = useUSDCBalance();
+  const { balance, totalBalance } = useUSDCBalance();
   const solanaAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
   const primaryAccount = user ? getPrimaryAccount(user.linkedAccounts as LinkedAccount[]) : "Wallet-first account";
 
@@ -26,7 +26,8 @@ export default function ProfilePage() {
         ) : (
           <div className="mt-6 grid gap-4 md:grid-cols-2">
             <Info label="Wallet" value={solanaAddress || "No Solana wallet linked"} mono />
-            <Info label="vUSDC balance" value={`${balance} vUSDC`} />
+            <Info label="Trading total" value={`${totalBalance} vUSDC`} />
+            <Info label="Trading available" value={`${balance} vUSDC`} />
             <Info label="v1a status" value="Position and claim flows are scaffolded; matching-led fills arrive in v1b." />
             <Info label="Primary account" value={primaryAccount} />
           </div>

@@ -73,19 +73,21 @@ describe("BlinkPredict Contract", () => {
 
   it("initializes a creator resolved market", async () => {
     const metadataURL = "https://example.com/creator.json";
-    const endTime = new BN(Math.floor(Date.now() / 1000) + 60 * 60);
+    const closeTime = new BN(Math.floor(Date.now() / 1000) + 60 * 60);
+    const resolveAfter = new BN(closeTime.toNumber() + 60);
+    const emptyFeedId = new Array(32).fill(0);
 
     await program.methods
       .initializeMarket(
         creatorMarketId,
         metadataURL,
-        endTime,
+        closeTime,
+        resolveAfter,
         { creator: {} },
-        creatorResolver.publicKey,
-        PublicKey.default,
+        emptyFeedId,
         { greaterThan: {} },
         new BN(0),
-        new BN(0),
+        0,
       )
       .accounts({
         market: creatorMarketPda,
@@ -100,8 +102,7 @@ describe("BlinkPredict Contract", () => {
 
     const marketAccount = await program.account.market.fetch(creatorMarketPda);
     expect(marketAccount.resolutionMode).to.deep.equal({ creator: {} });
-    expect(marketAccount.resolutionAuthority.toBase58()).to.equal(creatorResolver.publicKey.toBase58());
-    expect(marketAccount.oracleFeed.toBase58()).to.equal(PublicKey.default.toBase58());
+    expect(marketAccount.oracleFeedId).to.deep.equal(emptyFeedId);
   });
 
   it("splits, merges, resolves, and claims a creator market", async () => {
@@ -161,9 +162,9 @@ describe("BlinkPredict Contract", () => {
       .resolveByCreator(creatorMarketId, { yes: {} })
       .accounts({
         market: creatorMarketPda,
-        authority: creatorResolver.publicKey,
+        authority: admin.publicKey,
       })
-      .signers([creatorResolver])
+      .signers([admin])
       .rpc();
 
     await program.methods
@@ -187,21 +188,21 @@ describe("BlinkPredict Contract", () => {
 
   it("initializes a pyth market configuration", async () => {
     const { market, vault, yesMint, noMint } = deriveAddresses(pythMarketId);
-    const endTime = new BN(Math.floor(Date.now() / 1000) + 2 * 60 * 60);
-    const observationTime = new BN(Math.floor(Date.now() / 1000) + 60 * 60);
-    const fakeOracle = anchor.web3.Keypair.generate().publicKey;
+    const closeTime = new BN(Math.floor(Date.now() / 1000) + 2 * 60 * 60);
+    const resolveAfter = new BN(Math.floor(Date.now() / 1000) + 60 * 60);
+    const feedId = Array.from(Buffer.from("0".repeat(64), "hex"));
 
     await program.methods
       .initializeMarket(
         pythMarketId,
         "https://example.com/pyth.json",
-        endTime,
+        closeTime,
+        resolveAfter,
         { pyth: {} },
-        PublicKey.default,
-        fakeOracle,
+        feedId,
         { greaterThanOrEqual: {} },
         new BN(250_000_000),
-        observationTime,
+        -8,
       )
       .accounts({
         market,
@@ -216,7 +217,8 @@ describe("BlinkPredict Contract", () => {
 
     const marketAccount = await program.account.market.fetch(market);
     expect(marketAccount.resolutionMode).to.deep.equal({ pyth: {} });
-    expect(marketAccount.oracleFeed.toBase58()).to.equal(fakeOracle.toBase58());
-    expect(marketAccount.oracleTargetPrice.toString()).to.equal("250000000");
+    expect(marketAccount.oracleFeedId).to.deep.equal(feedId);
+    expect(marketAccount.oracleTargetPriceInt.toString()).to.equal("250000000");
+    expect(marketAccount.oracleTargetExpo).to.equal(-8);
   });
 });

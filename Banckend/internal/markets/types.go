@@ -38,7 +38,7 @@ type ResolutionConfig struct {
 
 type Market struct {
 	ID              string           `json:"id"`
-	MarketID        uint64           `json:"market_id"`
+	MarketID        uint64           `json:"market_id,string"`
 	MarketPDA       string           `json:"market_pda"`
 	MetadataURL     string           `json:"metadata_url"`
 	CollateralMint  string           `json:"collateral_mint"`

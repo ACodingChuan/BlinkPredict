@@ -44,7 +44,7 @@ type claims struct {
 func Middleware(cfg config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			token := strings.TrimSpace(r.Header.Get("privy-id-token"))
+			token := tokenFromRequest(r)
 			if token == "" {
 				next.ServeHTTP(w, r)
 				return
@@ -60,6 +60,17 @@ func Middleware(cfg config.Config) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+func tokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.Header.Get("privy-id-token")); token != "" {
+		return token
+	}
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(authHeader) > len("Bearer ") && strings.EqualFold(authHeader[:len("Bearer ")], "Bearer ") {
+		return strings.TrimSpace(authHeader[len("Bearer "):])
+	}
+	return ""
 }
 
 func RequireUser(next http.Handler) http.Handler {

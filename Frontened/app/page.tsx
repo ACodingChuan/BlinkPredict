@@ -13,9 +13,10 @@ import { toast } from "sonner";
 
 export default function HomePage() {
   const { user, login, authenticated, getAccessToken } = usePrivy();
-  const { balance, syncAfterMutation } = useUSDCBalance();
+  const { balance, totalBalance, syncAfterMutation } = useUSDCBalance();
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState("");
   const [faucetLoading, setFaucetLoading] = useState(false);
 
   useEffect(() => {
@@ -23,6 +24,9 @@ export default function HomePage() {
       try {
         const { data } = await api.get<MarketsResponse>("/markets");
         setMarkets(data.markets || []);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "Failed to load markets";
+        setFetchError(msg);
       } finally {
         setLoading(false);
       }
@@ -44,7 +48,8 @@ export default function HomePage() {
             <ThemeToggle />
             {authenticated && user ? (
               <div className="flex items-center gap-3">
-                <div className="rounded-full bg-zinc-900 px-3 py-1 text-xs font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900">{balance} vUSDC</div>
+                <div className="rounded-full bg-zinc-900 px-3 py-1 text-xs font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900">Avail {balance} vUSDC</div>
+                <div className="rounded-full border border-zinc-300 px-3 py-1 text-xs font-semibold text-zinc-700 dark:border-zinc-700 dark:text-zinc-200">Total {totalBalance} vUSDC</div>
                 <UserMenu />
               </div>
             ) : (
@@ -104,6 +109,12 @@ export default function HomePage() {
               ) : null}
               <Link className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 dark:border-zinc-700 dark:text-zinc-200" href="/profile">Portfolio shell</Link>
             </div>
+            {authenticated && user ? (
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <BalanceCard label="Trading total" value={`${totalBalance} vUSDC`} />
+                <BalanceCard label="Trading available" value={`${balance} vUSDC`} />
+              </div>
+            ) : null}
           </div>
           <div className="rounded-[2rem] border border-black/5 bg-[#111827] p-8 text-white shadow-sm dark:border-white/10">
             <div className="text-xs uppercase tracking-[0.3em] text-emerald-300">v1a status</div>
@@ -120,6 +131,10 @@ export default function HomePage() {
             {Array.from({ length: 3 }).map((_, index) => (
               <div key={index} className="h-64 animate-pulse rounded-[2rem] bg-white/80 dark:bg-zinc-900/80" />
             ))}
+          </div>
+        ) : fetchError ? (
+          <div className="rounded-[2rem] border border-rose-200 bg-rose-50 p-10 text-center text-rose-700 dark:border-rose-900/50 dark:bg-rose-900/20 dark:text-rose-300">
+            Failed to load markets: {fetchError}
           </div>
         ) : items.length === 0 ? (
           <div className="rounded-[2rem] border border-dashed border-zinc-300 bg-white/80 p-10 text-center text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900/80 dark:text-zinc-400">No markets yet. Create one from the admin surface.</div>
@@ -153,3 +168,10 @@ const ResolutionBadge = ({ market }: { market: Market }) => {
   }
   return <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">Creator Resolved</span>;
 };
+
+const BalanceCard = ({ label, value }: { label: string; value: string }) => (
+  <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-950">
+    <div className="text-xs uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">{label}</div>
+    <div className="mt-2 text-base font-semibold text-zinc-900 dark:text-zinc-100">{value}</div>
+  </div>
+);

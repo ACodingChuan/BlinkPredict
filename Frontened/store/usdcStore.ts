@@ -12,7 +12,7 @@ interface USDCState {
 }
 
 const DEFAULT_DECIMALS = 6;
-const DEFAULT_SYNC_DELAYS_MS = [0, 1200, 3000, 7000];
+const DEFAULT_SYNC_DELAYS_MS = [0];
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -138,14 +138,13 @@ export const useUSDCStore = create<USDCState>((set, get) => ({
     set({ isRefreshing: true });
 
     try {
-      for (const delayMs of schedule) {
+      const delayMs = schedule[0] ?? 0;
+      if (jobId !== latestSyncJob) return;
+      if (delayMs > 0) {
+        await sleep(delayMs);
         if (jobId !== latestSyncJob) return;
-        if (delayMs > 0) {
-          await sleep(delayMs);
-          if (jobId !== latestSyncJob) return;
-        }
-        await get().fetchBalance(walletAddress);
       }
+      await get().fetchBalance(walletAddress);
     } finally {
       if (jobId === latestSyncJob) {
         set({ isRefreshing: false });

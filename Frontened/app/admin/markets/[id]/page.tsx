@@ -48,13 +48,13 @@ export default function AdminMarketDetailPage() {
   );
 }
 
-async function resolveCreator(outcome: "yes" | "no", marketId: number, identityToken: string | null, setMessage: (value: string) => void, setMarket: (market: Market) => void) {
+async function resolveCreator(outcome: "yes" | "no", marketId: string, identityToken: string | null, setMessage: (value: string) => void, setMarket: (market: Market) => void) {
   const { data } = await api.post(`/admin/markets/${marketId}/resolve`, { outcome }, { headers: { "privy-id-token": identityToken } });
   setMessage(data.message);
   setMarket(data.market);
 }
 
-async function triggerPyth(marketId: number, identityToken: string | null, setMessage: (value: string) => void) {
+async function triggerPyth(marketId: string, identityToken: string | null, setMessage: (value: string) => void) {
   const { data } = await api.post(`/admin/markets/${marketId}/trigger-oracle-resolve`, {}, { headers: { "privy-id-token": identityToken } });
   setMessage(data.message);
 }

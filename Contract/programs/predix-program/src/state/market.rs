@@ -26,7 +26,7 @@ pub enum OracleCondition {
 pub struct Market {
     pub authority: Pubkey,
     #[max_len(256)]
-    pub metadata_url: String,
+    pub metadata_uri: String,
     pub collateral_vault: Pubkey,
     pub collateral_mint: Pubkey,
     pub yes_mint: Pubkey,
@@ -35,16 +35,14 @@ pub struct Market {
     pub yes_total: u64,
     pub no_total: u64,
     pub outcome: MarketOutcome,
-    pub expiration_timestamp: i64,
-    pub is_settled: bool,
+    pub close_ts: i64,
+    pub resolve_after_ts: i64,
     pub resolution_mode: ResolutionMode,
-    pub resolution_authority: Pubkey,
-    pub oracle_feed: Pubkey,
+    pub oracle_feed_id: [u8; 32],
     pub oracle_condition: OracleCondition,
-    pub oracle_target_price: u64,
-    pub oracle_observation_time: i64,
+    pub oracle_target_price_int: u64,
+    pub oracle_target_expo: i32,
     pub resolved_at: i64,
-    pub bump: u8,
 }
 
 #[event]
@@ -54,16 +52,16 @@ pub struct MarketInitialized {
     pub authority: Pubkey,
     pub collateral_mint: Pubkey,
     pub collateral_vault: Pubkey,
-    pub metadata_url: String,
+    pub metadata_uri: String,
     pub yes_mint: Pubkey,
     pub no_mint: Pubkey,
-    pub expiration_timestamp: i64,
+    pub close_ts: i64,
+    pub resolve_after_ts: i64,
     pub resolution_mode: ResolutionMode,
-    pub resolution_authority: Pubkey,
-    pub oracle_feed: Pubkey,
+    pub oracle_feed_id: [u8; 32],
     pub oracle_condition: OracleCondition,
-    pub oracle_target_price: u64,
-    pub oracle_observation_time: i64,
+    pub oracle_target_price_int: u64,
+    pub oracle_target_expo: i32,
 }
 
 #[event]

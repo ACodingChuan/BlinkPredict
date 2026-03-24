@@ -1,31 +1,77 @@
+import { useEffect, useState } from "react";
 import { usePrivy } from "@privy-io/react-auth";
-import { useEffect } from "react";
+import api from "@/app/utils/axiosInstance";
 import { useUSDCStore } from "@/store/usdcStore";
-import { getSolanaWalletAddress } from "@/lib/privy";
+import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
+
+type WalletAccountResponse = {
+  collateral_total_units: string;
+  collateral_free_units: string;
+};
 
 export const useUSDCBalance = () => {
-    const { user, ready, authenticated } = usePrivy();
-    const { balance, loading, isRefreshing, fetchBalance, syncBalance } = useUSDCStore();
-    const walletAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
+  const { walletAddress } = useCurrentSolanaWallet();
+  const { authenticated, getAccessToken } = usePrivy();
+  const { balance, loading, isRefreshing, fetchBalance, syncBalance } = useUSDCStore();
+  const [tradingTotal, setTradingTotal] = useState("0.00");
+  const [tradingAvailable, setTradingAvailable] = useState("0.00");
 
-    useEffect(() => {
-        if (ready && authenticated && walletAddress) {
-            fetchBalance(walletAddress);
+  useEffect(() => {
+    const load = async () => {
+      if (!walletAddress) return;
+      setTradingTotal("0.00");
+      setTradingAvailable("0.00");
+      if (authenticated) {
+        const token = await getAccessToken();
+        if (token) {
+          try {
+            const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
+              headers: { "privy-id-token": token },
+            });
+            setTradingTotal(formatUnits(data.collateral_total_units));
+            setTradingAvailable(formatUnits(data.collateral_free_units));
+          } catch {
+            // Keep trading balances at 0.00 until the system account is initialized.
+          }
         }
-    }, [authenticated, fetchBalance, ready, walletAddress]);
-
-    return {
-        balance,
-        loading,
-        isRefreshing,
-        walletAddress,
-        refetch: async () => {
-            if (!walletAddress) return;
-            await fetchBalance(walletAddress);
-        },
-        syncAfterMutation: async () => {
-            if (!walletAddress) return;
-            await syncBalance(walletAddress);
-        }
+      }
+      await fetchBalance(walletAddress);
     };
+    void load();
+  }, [authenticated, fetchBalance, getAccessToken, walletAddress]);
+
+  return {
+    balance: tradingAvailable,
+    totalBalance: tradingTotal,
+    walletBalance: balance,
+    loading,
+    isRefreshing,
+    walletAddress,
+    refetch: async () => {
+      if (!walletAddress) return;
+      await fetchBalance(walletAddress);
+    },
+    syncAfterMutation: async () => {
+      if (!walletAddress) return;
+      await syncBalance(walletAddress);
+      if (!authenticated) return;
+      const token = await getAccessToken();
+      if (!token) return;
+      try {
+        const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
+          headers: { "privy-id-token": token },
+        });
+        setTradingTotal(formatUnits(data.collateral_total_units));
+        setTradingAvailable(formatUnits(data.collateral_free_units));
+      } catch {
+        // noop
+      }
+    }
+  };
 };
+
+function formatUnits(raw: string): string {
+  const parsed = Number(raw || "0");
+  if (!Number.isFinite(parsed)) return "0.00";
+  return (parsed / 100).toFixed(2);
+}

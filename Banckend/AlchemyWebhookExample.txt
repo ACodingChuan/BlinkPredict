@@ -1,0 +1,105 @@
+package notify
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"time"
+)
+
+// AlchemyWebhookEvent 定义了 Alchemy 推送过来的 JSON 数据的基本结构
+type AlchemyWebhookEvent struct {
+	WebhookId string
+	Id        string
+	CreatedAt time.Time
+	Type      string
+	Event     map[string]interface{} // 具体的链上事件数据存放在这个 map 里
+}
+
+// jsonToAlchemyWebhookEvent 将接收到的 JSON 字节流反序列化为 Go 结构体
+func jsonToAlchemyWebhookEvent(body []byte) (*AlchemyWebhookEvent, error) {
+	event := new(AlchemyWebhookEvent)
+	if err := json.Unmarshal(body, &event); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+// AlchemyRequestHandler 定义了一个自定义的 HTTP 处理函数签名
+// 相比标准的 http.HandlerFunc，它多了一个参数：解析好的 AlchemyWebhookEvent
+type AlchemyRequestHandler func(http.ResponseWriter, *http.Request, *AlchemyWebhookEvent)
+
+// AlchemyRequestHandlerMiddleware 是一个中间件结构体
+// 它包装了你的自定义处理函数 (handler) 和用于验证签名的秘钥 (signingKey)
+type AlchemyRequestHandlerMiddleware struct {
+	handler    AlchemyRequestHandler
+	signingKey string
+}
+
+// NewAlchemyRequestHandlerMiddleware 是构造函数，用于创建上述中间件实例
+func NewAlchemyRequestHandlerMiddleware(handler AlchemyRequestHandler, signingKey string) *AlchemyRequestHandlerMiddleware {
+	return &AlchemyRequestHandlerMiddleware{handler, signingKey}
+}
+
+// isValidSignatureForStringBody 是核心安全函数：验证签名是否合法
+// 原理：使用你的私有 signingKey 对接收到的 body 内容进行 HMAC-SHA256 哈希计算，
+// 然后将计算结果与请求头中携带的 signature 进行对比。
+func isValidSignatureForStringBody(
+	body []byte,
+	signature string,
+	signingKey []byte,
+) bool {
+	// 创建一个新的 HMAC-SHA256 哈希对象，使用你的签名秘钥
+	h := hmac.New(sha256.New, signingKey)
+	// 将接收到的原始请求体写入哈希对象
+	h.Write([]byte(body))
+	// 计算哈希值，并将其转换为十六进制字符串
+	digest := hex.EncodeToString(h.Sum(nil))
+	// 对比计算出的哈希值是否与 Alchemy 传过来的签名一致
+	return digest == signature
+}
+
+// ServeHTTP 实现了 http.Handler 接口，这是 Go 语言处理 HTTP 请求的标准入口
+// 每次有 Webhook 请求打过来时，都会先执行这个方法
+func (arh *AlchemyRequestHandlerMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 1. 从 HTTP 请求头中获取 Alchemy 附带的签名 (x-alchemy-signature)
+	signature := r.Header.Get("x-alchemy-signature")
+    
+	// 2. 读取 HTTP 请求的完整 Body (原始 JSON 字符串)
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Panic(err)
+		return
+	}
+	r.Body.Close() // 养成好习惯，读取完关闭资源
+
+	// 3. 安全校验：调用验证函数，检查签名是否匹配
+	isValidSignature := isValidSignatureForStringBody(body, signature, []byte(arh.signingKey))
+	if !isValidSignature {
+		// 如果签名不匹配，说明是伪造请求，直接拦截并返回 403 Forbidden
+		errMsg := "Signature validation failed, unauthorized!"
+		http.Error(w, errMsg, http.StatusForbidden)
+		log.Panic(errMsg)
+		return
+	}
+
+	// 4. 数据解析：签名没问题，将 JSON 字节流转换为结构体
+	event, err := jsonToAlchemyWebhookEvent(body)
+	if err != nil {
+		// JSON 格式不对，返回 400 Bad Request
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Panic(err)
+		return
+	}
+    
+	// 5. 放行：所有前置校验通过，将解析好的数据 (event) 传递给你自己写的实际业务处理逻辑 (handler)
+	arh.handler(w, r, event)
+}
+
+Example Event Payload
+{"webhookId":"wh_8jieyl1ck9xywmm1","id":"whevt_muf6jz9tqkvia876","createdAt":"2024-09-19T16:03:51.396Z","type":"ADDRESS_ACTIVITY","event":{"transaction":[{"signature":"5GRcJvEm2nepdhEkWgp49sKWt8x87dkHVmcci1Ta9mCSreAxQctcyVnHV9NvT7GiKmk6MDgbiriqne3RpuVuamLt","transaction":[{"signatures":["5GRcJvEm2nepdhEkWgp49sKWt8x87dkHVmcci1Ta9mCSreAxQctcyVnHV9NvT7GiKmk6MDgbiriqne3RpuVuamLt"],"message":[{"header":[{"num_required_signatures":1,"num_readonly_signed_accounts":0,"num_readonly_unsigned_accounts":2}],"instructions":[{"data":"3DVGviTXKAPH","program_id_index":2},{"data":"LKoyXd","program_id_index":2},{"accounts":[0,0],"data":"3Bxs4Bc3VYuGVB19","program_id_index":1}],"versioned":false,"account_keys":["5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7","11111111111111111111111111111111","ComputeBudget111111111111111111111111111111"],"recent_blockhash":"5Gd97GyWYP2jo5ofMQXHo4UWENgntMrrd7poVWmaJvXK"}]}],"meta":[{"fee":15000,"pre_balances":[2068097212,1,1],"post_balances":[2068082212,1,1],"inner_instructions_none":false,"log_messages":["Program ComputeBudget111111111111111111111111111111 invoke [1]", "Program ComputeBudget111111111111111111111111111111 success", "Program ComputeBudget111111111111111111111111111111 invoke [1]", "Program ComputeBudget111111111111111111111111111111 success", "Program 11111111111111111111111111111111 invoke [1]", "Program 11111111111111111111111111111111 success"],"log_messages_none":false,"return_data_none":true,"compute_units_consumed":450}],"index":93,"is_vote":false}],"slot":290766538,"network":"SOLANA_MAINNET"}}

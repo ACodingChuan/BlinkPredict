@@ -1,10 +1,13 @@
 "use client";
 
+import { Buffer } from "buffer";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import api from "@/app/utils/axiosInstance";
-import { useIdentityToken } from "@privy-io/react-auth";
-import { useWallets } from "@privy-io/react-auth/solana";
+import { useSignAndSendTransaction } from "@privy-io/react-auth/solana";
+import { Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
+console.log("RPC", process.env.NEXT_PUBLIC_RPC_URL, "MINT", process.env.NEXT_PUBLIC_VUSDC_MINT);
 
 type HermesLatestPrice = {
   id?: string;
@@ -37,9 +40,12 @@ type FeedCheckState =
 
 export default function CreateMarketPage() {
   const router = useRouter();
-  const { identityToken } = useIdentityToken();
-  const { wallets } = useWallets();
+  const { wallet, walletAddress } = useCurrentSolanaWallet();
+  const { signAndSendTransaction } = useSignAndSendTransaction();
+  const localWalletMode = process.env.NEXT_PUBLIC_LOCAL_WALLET_MODE === "true";
   const [loading, setLoading] = useState(false);
+  const [successSig, setSuccessSig] = useState("");
+  const [copied, setCopied] = useState(false);
   const [mode, setMode] = useState<"creator" | "pyth">("creator");
   const [form, setForm] = useState({
     title: "",
@@ -56,47 +62,14 @@ export default function CreateMarketPage() {
   const [feedCheck, setFeedCheck] = useState<FeedCheckState>({ status: "idle" });
   const [error, setError] = useState("");
 
-  const resolutionAuthority = wallets?.[0]?.address || "";
+  const resolutionAuthority =
+    walletAddress || (localWalletMode ? getLocalWalletAddress() : "") || "";
 
   const targetPriceIntAtExpo = useMemo(() => {
     if (mode !== "pyth") return "";
     if (feedCheck.status !== "valid") return "";
     return decimalToPythPriceInt(form.oracle_target_price, feedCheck.expo);
   }, [feedCheck, form.oracle_target_price, mode]);
-
-  const payload = useMemo(
-    () => ({
-      title: form.title,
-      description: form.description,
-      // v1a: metadata/image are still evolving; keep contract stable and avoid forcing users to paste URLs.
-      metadata_url: "",
-      image_url: imageDataUrl,
-      close_time: form.close_time ? new Date(form.close_time).toISOString() : "",
-      // v1a schema only has oracle_observation_time under resolution; we reuse it as the universal "earliest settle time".
-      resolution:
-        mode === "creator"
-          ? {
-              mode,
-              authority: resolutionAuthority,
-              oracle_observation_time: form.settle_time
-                ? new Date(form.settle_time).toISOString()
-                : "",
-            }
-          : {
-              mode,
-              oracle_feed: form.oracle_feed_id,
-              oracle_condition: form.oracle_condition,
-              // NOTE: In pull-mode designs, it is safer to store target as Pyth-style (price_int, expo)
-              // to avoid precision loss. We currently send the int-only form; future backend/contract
-              // can also store the expo to lock semantics.
-              oracle_target_price: Number(targetPriceIntAtExpo || "0"),
-              oracle_observation_time: form.settle_time
-                ? new Date(form.settle_time).toISOString()
-                : "",
-            },
-    }),
-    [form, imageDataUrl, mode, resolutionAuthority, targetPriceIntAtExpo],
-  );
 
   useEffect(() => {
     if (mode !== "pyth") {
@@ -211,6 +184,66 @@ export default function CreateMarketPage() {
   ]);
 
   const pythIsValid = mode !== "pyth" ? true : feedCheck.status === "valid";
+
+  if (successSig) {
+    return (
+      <div className="min-h-screen bg-stone-100 px-4 py-10 dark:bg-zinc-950 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-3xl rounded-[2rem] border border-black/5 bg-white p-8 shadow-sm dark:border-white/10 dark:bg-zinc-900">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-900/40">
+              <svg className="h-5 w-5 text-emerald-600 dark:text-emerald-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+            </div>
+            <h1 className="text-2xl font-semibold text-zinc-950 dark:text-zinc-50">Market created</h1>
+          </div>
+          <p className="mt-4 text-sm text-zinc-500 dark:text-zinc-400">
+            Transaction confirmed on-chain. Copy the signature below for your records.
+          </p>
+          <div className="mt-6">
+            <label className="text-xs font-medium uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+              Transaction signature
+            </label>
+            <div className="mt-2 flex items-center gap-2 rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-700 dark:bg-zinc-950">
+              <span className="flex-1 break-all font-mono text-sm text-zinc-900 dark:text-zinc-100">
+                {successSig}
+              </span>
+              <button
+                type="button"
+                className="shrink-0 rounded-full bg-zinc-900 px-3 py-1.5 text-xs font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900"
+                onClick={() => {
+                  void navigator.clipboard.writeText(successSig);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                }}
+              >
+                {copied ? "Copied!" : "Copy"}
+              </button>
+            </div>
+          </div>
+          <div className="mt-6 flex gap-3">
+            <button
+              type="button"
+              className="rounded-full bg-zinc-900 px-5 py-3 text-sm font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900"
+              onClick={() => router.push("/")}
+            >
+              Back to markets
+            </button>
+            <button
+              type="button"
+              className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
+              onClick={() => {
+                setSuccessSig("");
+                setForm({ title: "", description: "", close_time: "", settle_time: "", oracle_feed_id: "", oracle_condition: "gte", oracle_target_price: "250.00" });
+              }}
+            >
+              Create another
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-stone-100 px-4 py-10 dark:bg-zinc-950 sm:px-6 lg:px-8">
@@ -455,12 +488,7 @@ export default function CreateMarketPage() {
             disabled={loading || !pythIsValid}
             onClick={async () => {
               try {
-                // Basic UX validation on the client; the API should also validate.
-                if (!identityToken) {
-                  setError("Please connect and login first.");
-                  return;
-                }
-                if (!resolutionAuthority) {
+                if (!resolutionAuthority && !localWalletMode) {
                   setError("No wallet connected.");
                   return;
                 }
@@ -490,6 +518,11 @@ export default function CreateMarketPage() {
                   setError("Invalid time value.");
                   return;
                 }
+                const now = Date.now();
+                if (closeTime <= now + 30_000) {
+                  setError("Close time must be at least 30 seconds in the future.");
+                  return;
+                }
                 if (settleTime < closeTime) {
                   setError("Earliest settle time must be >= close time.");
                   return;
@@ -503,30 +536,188 @@ export default function CreateMarketPage() {
                     setError("Oracle target price is invalid.");
                     return;
                   }
-                  const maybeUnsafe = BigInt(targetPriceIntAtExpo) > BigInt(Number.MAX_SAFE_INTEGER);
-                  if (maybeUnsafe) {
-                    setError("Oracle target price is too large to safely send as JSON number in v1a.");
-                    return;
-                  }
                 }
 
                 setLoading(true);
                 setError("");
-                await api.post("/markets", payload, {
-                  headers: { "privy-id-token": identityToken },
+                const pinataJwt = process.env.NEXT_PUBLIC_PINATA_JWT || "";
+                if (!pinataJwt) {
+                  setError("Pinata JWT missing. Set NEXT_PUBLIC_PINATA_JWT.");
+                  return;
+                }
+
+                let creatorAddress = resolutionAuthority;
+                let localProvider:
+                  | {
+                      publicKey?: PublicKey;
+                      connect?: () => Promise<void>;
+                      signTransaction?: (tx: Transaction) => Promise<Transaction>;
+                    }
+                  | null = null;
+                if (localWalletMode) {
+                  localProvider = getLocalWalletProvider();
+                  if (!localProvider) {
+                    setError("Local wallet provider not found. Install Phantom.");
+                    return;
+                  }
+                  if (!localProvider.publicKey && localProvider.connect) {
+                    await localProvider.connect();
+                  }
+                  if (!localProvider.publicKey) {
+                    setError("Local wallet is not connected.");
+                    return;
+                  }
+                  creatorAddress = localProvider.publicKey.toBase58();
+                }
+
+                const imageUri = imageDataUrl
+                  ? await pinImageDataUrl(imageDataUrl, pinataJwt)
+                  : "";
+
+                const closeISO = new Date(form.close_time).toISOString();
+                const resolveISO = new Date(form.settle_time).toISOString();
+
+                const metadata = buildMetadata({
+                  title: form.title.trim(),
+                  description: form.description.trim(),
+                  imageUri,
+                  category: "",
+                  closeTime: closeISO,
+                  resolveAfterTime: resolveISO,
+                  resolution:
+                    mode === "creator"
+                      ? {
+                          mode,
+                          authority: creatorAddress,
+                        }
+                      : {
+                          mode,
+                          oracleFeedId: form.oracle_feed_id.trim().toLowerCase(),
+                          oracleCondition: form.oracle_condition,
+                          oracleTargetPrice: form.oracle_target_price.trim(),
+                        },
                 });
-                router.push("/");
+
+                const metadataUri = await pinJSONToIPFS(metadata, pinataJwt);
+                const marketId = await computeMarketId({
+                  creator: creatorAddress,
+                  title: metadata.title,
+                  closeTime: closeISO,
+                  metadataUri,
+                });
+
+                const programId = new PublicKey(
+                  process.env.NEXT_PUBLIC_PROGRAM_ID ||
+                    "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE",
+                );
+                const collateralMint = process.env.NEXT_PUBLIC_VUSDC_MINT;
+                if (!collateralMint) {
+                  setError("NEXT_PUBLIC_VUSDC_MINT is required.");
+                  return;
+                }
+
+                const priceInt = mode === "pyth" ? BigInt(targetPriceIntAtExpo) : BigInt(0);
+                const priceExpo = mode === "pyth" && feedCheck.status === "valid" ? feedCheck.expo : 0;
+                const oracleFeedId =
+                  mode === "pyth"
+                    ? hexToBytes32(form.oracle_feed_id.trim())
+                    : new Uint8Array(32);
+
+                const instruction = await buildInitializeMarketInstruction({
+                  programId,
+                  marketId,
+                  metadataUri,
+                  closeTime: BigInt(Math.floor(new Date(form.close_time).getTime() / 1000)),
+                  resolveAfterTime: BigInt(Math.floor(new Date(form.settle_time).getTime() / 1000)),
+                  resolutionMode: mode === "creator" ? 0 : 1,
+                  oracleFeedId,
+                  oracleCondition: mode === "pyth" ? conditionToIndex(form.oracle_condition) : 0,
+                  oracleTargetPriceInt: priceInt,
+                  oracleTargetExpo: priceExpo,
+                  collateralMint: new PublicKey(collateralMint),
+                  creator: new PublicKey(creatorAddress),
+                });
+
+                const connection = new Connection(
+                  process.env.NEXT_PUBLIC_RPC_URL || "https://api.devnet.solana.com",
+                );
+                const latest = await connection.getLatestBlockhash();
+                const tx = new Transaction({
+                  feePayer: new PublicKey(creatorAddress),
+                  recentBlockhash: latest.blockhash,
+                }).add(instruction);
+
+                if (localWalletMode) {
+                  if (!localProvider || !localProvider.signTransaction) {
+                    setError("Local wallet does not support signTransaction.");
+                    return;
+                  }
+                  const signed = await localProvider.signTransaction(tx);
+                  const sig = await connection.sendRawTransaction(signed.serialize());
+                  await connection.confirmTransaction(sig, "confirmed");
+                  setSuccessSig(sig);
+                } else {
+                  // 先模拟交易以获取详细错误信息
+                  try {
+                    console.log("Simulating transaction...");
+                    const simulation = await connection.simulateTransaction(tx);
+                    console.log("Simulation result:", simulation);
+
+                    if (simulation.value.err) {
+                      console.error("Simulation failed:", simulation.value.err);
+                      console.error("Simulation logs:", simulation.value.logs);
+                      setError(`Transaction simulation failed: ${JSON.stringify(simulation.value.err)}\nLogs: ${simulation.value.logs?.join('\n')}`);
+                      setLoading(false);
+                      return;
+                    }
+                    console.log("Simulation successful!");
+                  } catch (simError) {
+                    console.error("Simulation error:", simError);
+                    setError(`Simulation error: ${simError instanceof Error ? simError.message : String(simError)}`);
+                    setLoading(false);
+                    return;
+                  }
+
+                  const raw = tx.serialize({ requireAllSignatures: false });
+                  console.log("Transaction serialized, length:", raw.length);
+                  console.log("Transaction base64:", Buffer.from(raw).toString('base64'));
+
+                  if (!wallet) {
+                    setError("No wallet connected.");
+                    return;
+                  }
+                  console.log("Selected wallet:", wallet.address);
+
+                  try {
+                    console.log("Calling signAndSendTransaction...");
+                    const result = await signAndSendTransaction({
+                      transaction: new Uint8Array(raw),
+                      wallet,
+                      chain: "solana:devnet",
+                    });
+                    console.log("signAndSendTransaction result:", result);
+                    console.log("Result JSON:", JSON.stringify(result, null, 2));
+
+                    if (result?.signature) {
+                      console.log("Success! Signature:", result.signature);
+                      setSuccessSig(result.signature);
+                    } else {
+                      console.error("No signature in result:", result);
+                      setError("Transaction sent but no signature returned");
+                      setLoading(false);
+                      return;
+                    }
+                  } catch (txError) {
+                    console.error("signAndSendTransaction error:", txError);
+                    throw txError;
+                  }
+                }
+
               } catch (error: unknown) {
+                console.error("Full error object:", error);
                 const message =
                   error instanceof Error ? error.message : "Failed to create market";
-                const fallback =
-                  typeof error === "object" &&
-                  error !== null &&
-                  "response" in error
-                    ? (error as { response?: { data?: { message?: string } } }).response?.data
-                        ?.message
-                    : undefined;
-                setError(fallback || message);
+                setError(message);
               } finally {
                 setLoading(false);
               }
@@ -627,6 +818,326 @@ function decimalToPythPriceInt(value: string, expo: number): string {
     return "";
   }
   return (numerator / denom).toString();
+}
+
+function getLocalWalletProvider():
+  | {
+      publicKey?: PublicKey;
+      connect?: () => Promise<void>;
+      signTransaction?: (tx: Transaction) => Promise<Transaction>;
+    }
+  | null {
+  if (typeof window === "undefined") return null;
+  const provider = (window as { solana?: { isPhantom?: boolean } }).solana;
+  if (!provider) return null;
+  return provider as typeof provider;
+}
+
+function getLocalWalletAddress(): string {
+  const provider = getLocalWalletProvider();
+  if (!provider || !provider.publicKey) return "";
+  return provider.publicKey.toBase58();
+}
+
+type MetadataPayload = {
+  title: string;
+  description: string;
+  image?: string;
+  category: string;
+  close_time: string;
+  resolve_after_time: string;
+  resolution: {
+    mode: "creator" | "pyth";
+    authority?: string;
+    oracle_feed_id?: string;
+    oracle_condition?: "gte" | "gt" | "lt" | "lte";
+    oracle_target_price?: string;
+  };
+  version: string;
+};
+
+function buildMetadata(input: {
+  title: string;
+  description: string;
+  imageUri: string;
+  category: string;
+  closeTime: string;
+  resolveAfterTime: string;
+  resolution:
+    | { mode: "creator"; authority: string }
+    | {
+        mode: "pyth";
+        oracleFeedId: string;
+        oracleCondition: "gte" | "gt" | "lt" | "lte";
+        oracleTargetPrice: string;
+      };
+}): MetadataPayload {
+  return {
+    title: input.title,
+    description: input.description,
+    image: input.imageUri || undefined,
+    category: input.category,
+    close_time: input.closeTime,
+    resolve_after_time: input.resolveAfterTime,
+    resolution:
+      input.resolution.mode === "creator"
+        ? {
+            mode: "creator",
+            authority: input.resolution.authority,
+          }
+        : {
+            mode: "pyth",
+            oracle_feed_id: input.resolution.oracleFeedId,
+            oracle_condition: input.resolution.oracleCondition,
+            oracle_target_price: input.resolution.oracleTargetPrice,
+          },
+    version: "1.0",
+  };
+}
+
+async function pinImageDataUrl(dataUrl: string, jwt: string): Promise<string> {
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  const file = new File([blob], "market-cover", { type: blob.type || "image/png" });
+  const cid = await pinFileToIPFS(file, jwt);
+  return `ipfs://${cid}`;
+}
+
+async function pinFileToIPFS(file: File, jwt: string): Promise<string> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+    },
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(`Pinata file upload failed (${response.status})`);
+  }
+  const json = (await response.json()) as { IpfsHash?: string };
+  if (!json.IpfsHash) {
+    throw new Error("Pinata file upload did not return IpfsHash");
+  }
+  return json.IpfsHash;
+}
+
+async function pinJSONToIPFS(payload: MetadataPayload, jwt: string): Promise<string> {
+  const response = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Pinata JSON upload failed (${response.status})`);
+  }
+  const json = (await response.json()) as { IpfsHash?: string };
+  if (!json.IpfsHash) {
+    throw new Error("Pinata JSON upload did not return IpfsHash");
+  }
+  return `ipfs://${json.IpfsHash}`;
+}
+
+async function computeMarketId(input: {
+  creator: string;
+  title: string;
+  closeTime: string;
+  metadataUri: string;
+}): Promise<bigint> {
+  const encoder = new TextEncoder();
+  const seed = `${input.creator}|${input.title}|${input.closeTime}|${input.metadataUri}`;
+  const hash = await sha256Bytes(encoder.encode(seed));
+  let id = 0n;
+  for (let i = 0; i < 8; i += 1) {
+    id |= BigInt(hash[i]) << BigInt(8 * i);
+  }
+  return id;
+}
+
+async function sha256Bytes(data: Uint8Array): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return new Uint8Array(digest);
+}
+
+function hexToBytes32(value: string): Uint8Array {
+  const raw = value.startsWith("0x") ? value.slice(2) : value;
+  if (!/^[0-9a-fA-F]{64}$/.test(raw)) {
+    throw new Error("Pyth feed id must be 0x + 64 hex chars");
+  }
+  return Uint8Array.from(Buffer.from(raw, "hex"));
+}
+
+function conditionToIndex(condition: "gte" | "gt" | "lt" | "lte"): number {
+  switch (condition) {
+    case "gt":
+      return 0;
+    case "gte":
+      return 1;
+    case "lt":
+      return 2;
+    case "lte":
+      return 3;
+    default:
+      return 1;
+  }
+}
+
+type InitializeMarketArgs = {
+  programId: PublicKey;
+  marketId: bigint;
+  metadataUri: string;
+  closeTime: bigint;
+  resolveAfterTime: bigint;
+  resolutionMode: number;
+  oracleFeedId: Uint8Array;
+  oracleCondition: number;
+  oracleTargetPriceInt: bigint;
+  oracleTargetExpo: number;
+  collateralMint: PublicKey;
+  creator: PublicKey;
+};
+
+async function buildInitializeMarketInstruction(args: InitializeMarketArgs): Promise<TransactionInstruction> {
+  const marketIdBytes = u64ToBytesLE(args.marketId);
+  const [marketPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("market"), Buffer.from(marketIdBytes)],
+    args.programId,
+  );
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("collateral_vault"), Buffer.from(marketIdBytes)],
+    args.programId,
+  );
+  const [yesMintPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("yes_mint"), Buffer.from(marketIdBytes)],
+    args.programId,
+  );
+  const [noMintPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("no_mint"), Buffer.from(marketIdBytes)],
+    args.programId,
+  );
+
+  const data = await encodeInitializeMarketData({
+    marketId: args.marketId,
+    metadataUri: args.metadataUri,
+    closeTime: args.closeTime,
+    resolveAfterTime: args.resolveAfterTime,
+    resolutionMode: args.resolutionMode,
+    oracleFeedId: args.oracleFeedId,
+    oracleCondition: args.oracleCondition,
+    oracleTargetPriceInt: args.oracleTargetPriceInt,
+    oracleTargetExpo: args.oracleTargetExpo,
+  });
+
+  return new TransactionInstruction({
+    programId: args.programId,
+    keys: [
+      { pubkey: marketPda, isSigner: false, isWritable: true },
+      { pubkey: vaultPda, isSigner: false, isWritable: true },
+      { pubkey: yesMintPda, isSigner: false, isWritable: true },
+      { pubkey: noMintPda, isSigner: false, isWritable: true },
+      { pubkey: args.collateralMint, isSigner: false, isWritable: false },
+      { pubkey: args.creator, isSigner: true, isWritable: true },
+      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(data),
+  });
+}
+
+async function encodeInitializeMarketData(input: {
+  marketId: bigint;
+  metadataUri: string;
+  closeTime: bigint;
+  resolveAfterTime: bigint;
+  resolutionMode: number;
+  oracleFeedId: Uint8Array;
+  oracleCondition: number;
+  oracleTargetPriceInt: bigint;
+  oracleTargetExpo: number;
+}): Promise<Uint8Array> {
+  const discriminator = await anchorDiscriminator("initialize_market");
+  const parts = [
+    discriminator,
+    u64ToBytesLE(input.marketId),
+    encodeString(input.metadataUri),
+    i64ToBytesLE(input.closeTime),
+    i64ToBytesLE(input.resolveAfterTime),
+    Uint8Array.of(input.resolutionMode),
+    input.oracleFeedId,
+    Uint8Array.of(input.oracleCondition),
+    u64ToBytesLE(input.oracleTargetPriceInt),
+    i32ToBytesLE(input.oracleTargetExpo),
+  ];
+  return concatBytes(parts);
+}
+
+async function anchorDiscriminator(name: string): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const preimage = encoder.encode(`global:${name}`);
+  const hash = await sha256Bytes(preimage);
+  return hash.slice(0, 8);
+}
+
+function encodeString(value: string): Uint8Array {
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(value);
+  return concatBytes([u32ToBytesLE(bytes.length), bytes]);
+}
+
+function u32ToBytesLE(value: number): Uint8Array {
+  const out = new Uint8Array(4);
+  out[0] = value & 0xff;
+  out[1] = (value >> 8) & 0xff;
+  out[2] = (value >> 16) & 0xff;
+  out[3] = (value >> 24) & 0xff;
+  return out;
+}
+
+function u64ToBytesLE(value: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  let v = BigInt.asUintN(64, value);
+  for (let i = 0; i < 8; i += 1) {
+    out[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return out;
+}
+
+function i64ToBytesLE(value: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  let v = BigInt.asIntN(64, value);
+  for (let i = 0; i < 8; i += 1) {
+    out[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return out;
+}
+
+function i32ToBytesLE(value: number): Uint8Array {
+  const out = new Uint8Array(4);
+  const v = value | 0;
+  out[0] = v & 0xff;
+  out[1] = (v >> 8) & 0xff;
+  out[2] = (v >> 16) & 0xff;
+  out[3] = (v >> 24) & 0xff;
+  return out;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
 }
 
 function formatPythPrice(priceInt: string, expo: number): string {
