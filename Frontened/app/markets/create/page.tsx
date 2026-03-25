@@ -699,8 +699,9 @@ export default function CreateMarketPage() {
                     console.log("Result JSON:", JSON.stringify(result, null, 2));
 
                     if (result?.signature) {
-                      console.log("Success! Signature:", result.signature);
-                      setSuccessSig(result.signature);
+                      const normalizedSignature = normalizeTransactionSignature(result.signature);
+                      console.log("Success! Signature:", normalizedSignature);
+                      setSuccessSig(normalizedSignature);
                     } else {
                       console.error("No signature in result:", result);
                       setError("Transaction sent but no signature returned");
@@ -730,6 +731,13 @@ export default function CreateMarketPage() {
       </div>
     </div>
   );
+}
+
+function normalizeTransactionSignature(signature: string | Uint8Array): string {
+  if (typeof signature === "string") {
+    return signature;
+  }
+  return Buffer.from(signature).toString("base64");
 }
 
 const Input = ({
@@ -820,17 +828,18 @@ function decimalToPythPriceInt(value: string, expo: number): string {
   return (numerator / denom).toString();
 }
 
-function getLocalWalletProvider():
-  | {
-      publicKey?: PublicKey;
-      connect?: () => Promise<void>;
-      signTransaction?: (tx: Transaction) => Promise<Transaction>;
-    }
-  | null {
+type LocalWalletProvider = {
+  publicKey?: PublicKey;
+  connect?: () => Promise<void>;
+  signTransaction?: (tx: Transaction) => Promise<Transaction>;
+  isPhantom?: boolean;
+};
+
+function getLocalWalletProvider(): LocalWalletProvider | null {
   if (typeof window === "undefined") return null;
-  const provider = (window as { solana?: { isPhantom?: boolean } }).solana;
+  const provider = (window as { solana?: LocalWalletProvider }).solana;
   if (!provider) return null;
-  return provider as typeof provider;
+  return provider;
 }
 
 function getLocalWalletAddress(): string {
@@ -952,7 +961,7 @@ async function computeMarketId(input: {
   const encoder = new TextEncoder();
   const seed = `${input.creator}|${input.title}|${input.closeTime}|${input.metadataUri}`;
   const hash = await sha256Bytes(encoder.encode(seed));
-  let id = 0n;
+  let id = BigInt(0);
   for (let i = 0; i < 8; i += 1) {
     id |= BigInt(hash[i]) << BigInt(8 * i);
   }
@@ -960,7 +969,9 @@ async function computeMarketId(input: {
 }
 
 async function sha256Bytes(data: Uint8Array): Promise<Uint8Array> {
-  const digest = await crypto.subtle.digest("SHA-256", data);
+  const normalized = new Uint8Array(data.byteLength);
+  normalized.set(data);
+  const digest = await crypto.subtle.digest("SHA-256", normalized);
   return new Uint8Array(digest);
 }
 
@@ -1103,8 +1114,8 @@ function u64ToBytesLE(value: bigint): Uint8Array {
   const out = new Uint8Array(8);
   let v = BigInt.asUintN(64, value);
   for (let i = 0; i < 8; i += 1) {
-    out[i] = Number(v & 0xffn);
-    v >>= 8n;
+    out[i] = Number(v & BigInt(0xff));
+    v >>= BigInt(8);
   }
   return out;
 }
@@ -1113,8 +1124,8 @@ function i64ToBytesLE(value: bigint): Uint8Array {
   const out = new Uint8Array(8);
   let v = BigInt.asIntN(64, value);
   for (let i = 0; i < 8; i += 1) {
-    out[i] = Number(v & 0xffn);
-    v >>= 8n;
+    out[i] = Number(v & BigInt(0xff));
+    v >>= BigInt(8);
   }
   return out;
 }

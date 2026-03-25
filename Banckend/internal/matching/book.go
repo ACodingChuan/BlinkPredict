@@ -439,29 +439,38 @@ func (ob *FixedArrayOrderBook) updateBestBid(startPrice uint8) {
 // handleTick 处理心跳命令（全盘扫描过期订单）
 func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, batch *BatchEventPayload) {
 	ob.CurrentTime = cmd.Timestamp
+	changed := false
 
 	// 全盘扫描100个价格档位
 	for p := uint8(1); p <= 99; p++ {
-		ob.sweepLevelO1(ob.Bids[p], p, SideBuy, batch)
-		ob.sweepLevelO1(ob.Asks[p], p, SideSell, batch)
+		if ob.sweepLevelO1(ob.Bids[p], p, SideBuy, batch) {
+			changed = true
+		}
+		if ob.sweepLevelO1(ob.Asks[p], p, SideSell, batch) {
+			changed = true
+		}
 	}
 
-	// 更新最优价格游标
-	ob.updateBestBid(99)
-	ob.updateBestAsk(1)
+	if changed {
+		// 只有在 tick 真正移除了过期单时，才需要重新计算最优价并广播深度变化。
+		ob.updateBestBid(99)
+		ob.updateBestAsk(1)
+	}
 }
 
 // sweepLevelO1 扫描单个档位的过期订单（遇到第一个未过期的就截断）
-func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, batch *BatchEventPayload) bool {
 	if level == nil || level.Head == nil {
-		return
+		return false
 	}
 
+	removed := false
 	curr := level.Head
 	for curr != nil {
 		next := curr.Next
 		if curr.ExpireTime > 0 && ob.CurrentTime >= curr.ExpireTime {
 			ob.removeAndRecycleMaker(curr, level, price, side, batch, StatusExpired)
+			removed = true
 			curr = next
 		} else {
 			// 截断：遇到第一个没过期的，直接闪人
@@ -469,9 +478,10 @@ func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side
 		}
 	}
 
-	if level.TotalVolume > 0 {
+	if removed {
 		batch.AddDepthEvent(side, price, level.TotalVolume)
 	}
+	return removed
 }
 
 // handleHalt 处理熔断命令

@@ -1,14 +1,15 @@
 package pusher
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"blinkpredict/banckend/internal/auth"
 	"blinkpredict/banckend/internal/config"
 	"blinkpredict/banckend/internal/protocol"
 
@@ -25,7 +26,8 @@ const (
 )
 
 type Hub struct {
-	cfg config.Config
+	cfg     config.Config
+	tickets *TicketStore
 
 	upgrader websocket.Upgrader
 
@@ -40,16 +42,12 @@ type connection struct {
 	send     chan []byte
 	marketID *uint64
 	wallet   string
-	authed   bool
 }
 
-type userAuthFrame struct {
-	PrivyToken string `json:"privy_token"`
-}
-
-func NewHub(cfg config.Config) *Hub {
+func NewHub(cfg config.Config, tickets *TicketStore) *Hub {
 	return &Hub{
-		cfg: cfg,
+		cfg:     cfg,
+		tickets: tickets,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 2048,
@@ -83,11 +81,15 @@ func (h *Hub) ServeMarketWS(w http.ResponseWriter, r *http.Request) error {
 	}
 	h.registerMarket(client, marketID)
 	go client.writePump()
-	client.readPump(false)
+	client.readPump()
 	return nil
 }
 
 func (h *Hub) ServeUserWS(w http.ResponseWriter, r *http.Request) error {
+	wallet, err := h.consumeTicket(r.Context(), r.URL.Query().Get("ticket"))
+	if err != nil {
+		return err
+	}
 	ws, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return err
@@ -97,8 +99,9 @@ func (h *Hub) ServeUserWS(w http.ResponseWriter, r *http.Request) error {
 		ws:   ws,
 		send: make(chan []byte, sendQueueSize),
 	}
+	h.registerUser(client, wallet)
 	go client.writePump()
-	client.readPump(true)
+	client.readPump()
 	return nil
 }
 
@@ -158,7 +161,6 @@ func (h *Hub) registerUser(client *connection, wallet string) {
 	}
 	room[client] = struct{}{}
 	client.wallet = wallet
-	client.authed = true
 }
 
 func (h *Hub) unregister(client *connection) {
@@ -217,18 +219,11 @@ func (c *connection) enqueue(payload []byte) {
 	}
 }
 
-func (c *connection) readPump(requiresAuth bool) {
+func (c *connection) readPump() {
 	defer func() {
 		c.hub.unregister(c)
 		_ = c.ws.Close()
 	}()
-
-	if requiresAuth {
-		if err := c.authenticate(); err != nil {
-			_ = c.ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, err.Error()))
-			return
-		}
-	}
 
 	_ = c.ws.SetReadDeadline(time.Now().Add(pongTimeout))
 	c.ws.SetPongHandler(func(string) error {
@@ -245,28 +240,18 @@ func (c *connection) readPump(requiresAuth bool) {
 	}
 }
 
-func (c *connection) authenticate() error {
-	_ = c.ws.SetReadDeadline(time.Now().Add(authTimeout))
-	_, payload, err := c.ws.ReadMessage()
+func (h *Hub) consumeTicket(ctx context.Context, ticket string) (string, error) {
+	if h.tickets == nil || !h.tickets.Enabled() {
+		return "", errors.New("websocket ticket store is not configured")
+	}
+	wallet, err := h.tickets.Consume(ctx, ticket)
 	if err != nil {
-		return err
+		return "", err
 	}
-	var frame userAuthFrame
-	if err := json.Unmarshal(payload, &frame); err != nil {
-		return err
+	if strings.TrimSpace(wallet) == "" {
+		return "", errors.New("invalid websocket ticket")
 	}
-	if frame.PrivyToken == "" {
-		return errors.New("missing privy token")
-	}
-	user, err := auth.ParseToken(frame.PrivyToken, c.hub.cfg)
-	if err != nil {
-		return err
-	}
-	if user.SolanaAddress == "" {
-		return errors.New("missing solana wallet")
-	}
-	c.hub.registerUser(c, user.SolanaAddress)
-	return nil
+	return wallet, nil
 }
 
 func (c *connection) writePump() {

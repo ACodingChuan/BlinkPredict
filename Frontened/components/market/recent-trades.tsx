@@ -8,6 +8,7 @@ export const RecentTrades = ({ marketId }: { marketId: string }) => {
   const [trades, setTrades] = useState<TradesResponse["trades"]>([]);
   const [matchingEnabled, setMatchingEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [socketState, setSocketState] = useState<"connecting" | "live" | "offline">("connecting");
 
   useEffect(() => {
     let active = true;
@@ -30,7 +31,12 @@ export const RecentTrades = ({ marketId }: { marketId: string }) => {
     const connect = () => {
       if (!active) return;
       const wsURL = buildMarketWSURL(marketId);
+      setSocketState("connecting");
       ws = new WebSocket(wsURL);
+      ws.onopen = () => {
+        if (!active) return;
+        setSocketState("live");
+      };
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data) as Partial<MarketTradeSocketMessage>;
@@ -44,9 +50,13 @@ export const RecentTrades = ({ marketId }: { marketId: string }) => {
           console.error("trade websocket parse failed", error);
         }
       };
-      ws.onerror = () => undefined;
+      ws.onerror = () => {
+        if (!active) return;
+        setSocketState("offline");
+      };
       ws.onclose = () => {
         if (!active) return;
+        setSocketState("offline");
         reconnectTimer = setTimeout(connect, 1200);
       };
     };
@@ -70,6 +80,10 @@ export const RecentTrades = ({ marketId }: { marketId: string }) => {
 
   return (
     <div className="overflow-x-auto rounded-2xl border border-zinc-200 dark:border-zinc-800">
+      <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-4 py-2 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400">
+        <span>Trade stream</span>
+        <span>{socketState === "live" ? "pusher live" : `pusher ${socketState}`}</span>
+      </div>
       <table className="w-full text-left text-sm">
         <thead className="bg-zinc-50 text-zinc-500 dark:bg-zinc-900/60 dark:text-zinc-400">
           <tr>

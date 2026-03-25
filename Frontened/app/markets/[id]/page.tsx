@@ -127,7 +127,7 @@ export default function MarketDetailPage() {
 
             <PriceChart market={market} outcome={outcome} />
             <Orderbook outcome={outcome} marketId={market.market_id} />
-            <UserMarketTabs marketId={market.market_id} />
+            <UserMarketTabs marketId={market.market_id} refreshKey={lastOrderID} />
 
             <section className="rounded-[28px] border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
               <h2 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Rules</h2>

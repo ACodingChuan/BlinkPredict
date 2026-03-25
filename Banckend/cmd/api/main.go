@@ -53,6 +53,7 @@ func main() {
 	var commandPublisher protocol.CommandPublisher = protocol.DisabledCommandPublisher{}
 	var natsClient *natsjs.Client
 	var redisClient *redis.Client
+	var wsTicketStore *pusher.TicketStore
 	var pusherHub *pusher.Hub
 	var pusherService *pusher.Service
 	var marketManager *matching.MarketManager
@@ -72,8 +73,6 @@ func main() {
 			logger.Fatalf("nats streams: %v", err)
 		}
 		commandPublisher = natsjs.NewCommandPublisher(natsClient)
-		pusherHub = pusher.NewHub(cfg)
-		pusherService = pusher.NewService(natsClient, pusherHub)
 
 		// 初始化Snowflake ID生成器（使用machineID=1）
 		if err := matching.InitGlobalSnowflake(1); err != nil {
@@ -117,6 +116,7 @@ func main() {
 		}
 		defer redisClient.Close()
 		logger.Infof("Redis read model enabled")
+		wsTicketStore = pusher.NewTicketStore(redisClient, 45*time.Second)
 		matchingEngine = matching.NewRedisQueryEngine(redisClient, pool, matchingEngine)
 
 		// 初始化市场缓存
@@ -159,6 +159,8 @@ func main() {
 	}
 	var boot *bootstrap.Coordinator
 	if natsClient != nil {
+		pusherHub = pusher.NewHub(cfg, wsTicketStore)
+		pusherService = pusher.NewService(natsClient, pusherHub)
 		pgWriter := writer.New(pool, natsClient, redisClient, "")
 		boot = bootstrap.NewCoordinator(pgWriter, marketManager, pusherService, cfg.MatcherTickInterval)
 		if err := boot.Start(ctx); err != nil {

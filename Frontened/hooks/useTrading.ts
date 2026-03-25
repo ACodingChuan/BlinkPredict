@@ -246,6 +246,10 @@ export const useTrading = () => {
         description: `command_id: ${data.command_id}`,
       });
       onAccepted?.(data);
+
+      // 刷新交易账户余额
+      await refreshTradingBalance();
+
       triggerBalanceSync();
       return true;
     } catch (error: unknown) {
@@ -262,7 +266,18 @@ export const useTrading = () => {
     }
   };
 
-  return { placeOrder, loading };
+  // 下单后同步一次本地余额缓存，避免依赖额外的 me websocket。
+  const refreshTradingBalance = async () => {
+    if (!walletAddress) return;
+
+    try {
+      await syncBalance(walletAddress);
+    } catch (error) {
+      console.error("Failed to refresh trading balance:", error);
+    }
+  };
+
+  return { placeOrder, loading, refreshTradingBalance };
 };
 function toPriceTick(price: number): number | undefined {
   if (!Number.isFinite(price)) {

@@ -27,6 +27,8 @@ const (
 	recentTradesLimit     = 100
 	priceHistoryHotWindow = 90 * 24 * time.Hour
 	priceHistoryMaxPoints = 100000
+	writerCatchUpBatch    = 64
+	writerRunBatch        = 32
 )
 
 type Writer struct {
@@ -108,7 +110,7 @@ func (w *Writer) ensureSubscription() error {
 
 func (w *Writer) catchUp(ctx context.Context) error {
 	for {
-		msgs, err := w.sub.Fetch(8, nats.MaxWait(500*time.Millisecond))
+		msgs, err := w.sub.Fetch(writerCatchUpBatch, nats.MaxWait(500*time.Millisecond))
 		if err != nil {
 			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
@@ -138,7 +140,7 @@ func (w *Writer) run(ctx context.Context) {
 		default:
 		}
 
-		msgs, err := w.sub.Fetch(1, nats.MaxWait(1500*time.Millisecond))
+		msgs, err := w.sub.Fetch(writerRunBatch, nats.MaxWait(1500*time.Millisecond))
 		if err != nil {
 			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 				continue
@@ -155,6 +157,7 @@ func (w *Writer) run(ctx context.Context) {
 }
 
 func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
+	startedAt := time.Now()
 	meta, err := msg.Metadata()
 	if err != nil {
 		logger.Warnf("metadata failed: %v", err)
@@ -164,10 +167,12 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 
 	var batch matching.BatchEventPayload
 	if err := json.Unmarshal(msg.Data, &batch); err != nil {
-		logger.Warnf("decode failed: %v", err)
+		logger.Warnf("decode failed stream_seq=%d deliveries=%d err=%v", meta.Sequence.Stream, meta.NumDelivered, err)
 		_ = msg.Term()
 		return
 	}
+	logger.Infof("writer processing stream_seq=%d deliveries=%d market=%d source_cmd_seq=%d bytes=%d",
+		meta.Sequence.Stream, meta.NumDelivered, batch.MarketID, batch.SourceCmdSeq, len(msg.Data))
 
 	evtSeq, err := toInt64(meta.Sequence.Stream)
 	if err != nil {
@@ -194,6 +199,12 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 
 	lastEvtSeq, err := w.lockCursorRow(ctx, tx, batch.MarketID)
 	if err != nil {
+		// 如果 market 不存在，直接跳过这个 batch（不要一直重试）
+		if strings.Contains(err.Error(), "does not exist in database") {
+			logger.Warnf("skipping batch for non-existent market=%d", batch.MarketID)
+			_ = msg.Ack()
+			return
+		}
 		logger.Warnf("lock cursor failed market=%d err=%v", batch.MarketID, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
@@ -213,30 +224,36 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 	}
 
 	if err := w.persistTrades(ctx, tx, &batch); err != nil {
-		logger.Warnf("persist trades failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("persist trades failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
 
 	if err := w.applyStateEvents(ctx, tx, &batch); err != nil {
-		logger.Warnf("apply state events failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("apply state events failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
 	if err := w.applyPositionDeltas(ctx, tx, &batch); err != nil {
-		logger.Warnf("apply position deltas failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("apply position deltas failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+
+	if err := w.handleOrderLocks(ctx, tx, &batch); err != nil {
+		logger.Warnf("handle order locks failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
 
 	if err := w.advanceCursor(ctx, tx, batch.MarketID, evtSeq, sourceCmdSeq); err != nil {
-		logger.Warnf("advance cursor failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("advance cursor failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		logger.Warnf("commit failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("commit failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
@@ -248,21 +265,39 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 	if err := w.publishPushMessages(pushes); err != nil {
-		logger.Warnf("push publish failed market=%d err=%v", batch.MarketID, err)
+		logger.Warnf("push publish failed stream_seq=%d market=%d err=%v", meta.Sequence.Stream, batch.MarketID, err)
 	}
 	_ = msg.Ack()
+	elapsed := time.Since(startedAt)
+	if elapsed > 250*time.Millisecond || meta.NumDelivered > 1 {
+		logger.Infof("writer acked stream_seq=%d market=%d deliveries=%d elapsed=%s trades=%d states=%d depths=%d",
+			meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, elapsed.Round(time.Millisecond), len(batch.TradeEvents), len(batch.StateEvents), len(batch.DepthEvents))
+	}
 }
 
 func (w *Writer) lockCursorRow(ctx context.Context, tx pgx.Tx, marketID uint64) (int64, error) {
-	marketIDInt, err := toInt64(marketID)
-	if err != nil {
-		return 0, err
+	// 将 market_id 转换为字符串，避免 int64 溢出
+	marketIDStr := strconv.FormatUint(marketID, 10)
+
+	// 检查 market 是否存在于数据库中
+	var marketExists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM markets WHERE market_id = $1::NUMERIC(20,0)
+		)
+	`, marketIDStr).Scan(&marketExists); err != nil {
+		return 0, fmt.Errorf("check market exists failed: %w", err)
 	}
+
+	if !marketExists {
+		return 0, fmt.Errorf("market %s does not exist in database", marketIDStr)
+	}
+
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO consumer_cursors (consumer_name, market_id, last_evt_seq, last_source_cmd_seq)
-		VALUES ($1, $2, 0, 0)
+		VALUES ($1, $2::NUMERIC(20,0), 0, 0)
 		ON CONFLICT (consumer_name, market_id) DO NOTHING
-	`, w.consumerName, marketIDInt); err != nil {
+	`, w.consumerName, marketIDStr); err != nil {
 		return 0, err
 	}
 
@@ -270,9 +305,9 @@ func (w *Writer) lockCursorRow(ctx context.Context, tx pgx.Tx, marketID uint64) 
 	if err := tx.QueryRow(ctx, `
 		SELECT last_evt_seq
 		FROM consumer_cursors
-		WHERE consumer_name = $1 AND market_id = $2
+		WHERE consumer_name = $1 AND market_id = $2::NUMERIC(20,0)
 		FOR UPDATE
-	`, w.consumerName, marketIDInt).Scan(&lastEvtSeq); err != nil {
+	`, w.consumerName, marketIDStr).Scan(&lastEvtSeq); err != nil {
 		return 0, err
 	}
 	return lastEvtSeq, nil
@@ -286,10 +321,7 @@ func (w *Writer) upsertSourceOrder(ctx context.Context, tx pgx.Tx, marketID uint
 	if err != nil {
 		return err
 	}
-	marketIDInt, err := toInt64(marketID)
-	if err != nil {
-		return err
-	}
+	marketIDStr := strconv.FormatUint(marketID, 10)
 	initialQty, err := toInt64(order.InitialQty)
 	if err != nil {
 		return err
@@ -314,14 +346,14 @@ func (w *Writer) upsertSourceOrder(ctx context.Context, tx pgx.Tx, marketID uint
 			initial_qty, initial_spend_amount, remaining_qty, expire_time,
 			status, signature, intent_hex, nonce, created_cmd_seq, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9,
+			$1, $2::NUMERIC(20,0), $3, $4, $5, $6, $7, $8, $9,
 			$10, $11, $10, $12,
 			$13, $14, $15, $16, $17, $18, $18
 		)
 		ON CONFLICT (order_id) DO NOTHING
 	`,
 		orderID,
-		marketIDInt,
+		marketIDStr,
 		order.WalletAddress,
 		sideLabel(order.OriginalAction),
 		outcomeLabel(order.OriginalOutcome),
@@ -346,10 +378,7 @@ func (w *Writer) persistTrades(ctx context.Context, tx pgx.Tx, batch *matching.B
 	if len(batch.TradeEvents) == 0 {
 		return nil
 	}
-	marketID, err := toInt64(batch.MarketID)
-	if err != nil {
-		return err
-	}
+	marketIDStr := strconv.FormatUint(batch.MarketID, 10)
 	sourceCmdSeq, err := toInt64(batch.SourceCmdSeq)
 	if err != nil {
 		return err
@@ -376,7 +405,7 @@ func (w *Writer) persistTrades(ctx context.Context, tx pgx.Tx, batch *matching.B
 				maker_signature, taker_signature,
 				maker_intent_hex, taker_intent_hex, executed_at
 			) VALUES (
-				$1, $2, $3, $4, $5,
+				$1, $2::NUMERIC(20,0), $3, $4, $5,
 				$6, $7,
 				$8, $9,
 				$10, $11,
@@ -385,7 +414,7 @@ func (w *Writer) persistTrades(ctx context.Context, tx pgx.Tx, batch *matching.B
 			ON CONFLICT (trade_id) DO NOTHING
 		`,
 			trade.TradeID,
-			marketID,
+			marketIDStr,
 			sourceCmdSeq,
 			int16(trade.MatchPrice),
 			matchQty,
@@ -574,20 +603,17 @@ func (w *Writer) applySinglePositionDelta(ctx context.Context, tx pgx.Tx, delta 
 	if delta.WalletAddress == "" {
 		return nil
 	}
-	marketIDInt, err := toInt64(delta.MarketID)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `
+	marketIDStr := strconv.FormatUint(delta.MarketID, 10)
+	_, err := tx.Exec(ctx, `
 		INSERT INTO positions (
 			market_id, wallet_address,
 			yes_free_lots, yes_locked_lots,
 			no_free_lots, no_locked_lots,
 			collateral_free_units, collateral_locked_units,
 			updated_at
-		) VALUES ($1, $2, 0, 0, 0, 0, 0, 0, NOW())
+		) VALUES ($1::NUMERIC(20,0), $2, 0, 0, 0, 0, 0, 0, NOW())
 		ON CONFLICT (market_id, wallet_address) DO NOTHING
-	`, marketIDInt, delta.WalletAddress)
+	`, marketIDStr, delta.WalletAddress)
 	if err != nil {
 		return err
 	}
@@ -601,23 +627,20 @@ func (w *Writer) applySinglePositionDelta(ctx context.Context, tx pgx.Tx, delta 
 			collateral_free_units = collateral_free_units + $5,
 			collateral_locked_units = collateral_locked_units + $6,
 			updated_at = NOW()
-		WHERE market_id = $7 AND wallet_address = $8
-	`, delta.YesFreeLotsDelta, delta.YesLockedLotsDelta, delta.NoFreeLotsDelta, delta.NoLockedLotsDelta, delta.CollateralFreeDelta, delta.CollateralLockedDelta, marketIDInt, delta.WalletAddress)
+		WHERE market_id = $7::NUMERIC(20,0) AND wallet_address = $8
+	`, delta.YesFreeLotsDelta, delta.YesLockedLotsDelta, delta.NoFreeLotsDelta, delta.NoLockedLotsDelta, delta.CollateralFreeDelta, delta.CollateralLockedDelta, marketIDStr, delta.WalletAddress)
 	return err
 }
 
 func (w *Writer) advanceCursor(ctx context.Context, tx pgx.Tx, marketID uint64, evtSeq, sourceCmdSeq int64) error {
-	marketIDInt, err := toInt64(marketID)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `
+	marketIDStr := strconv.FormatUint(marketID, 10)
+	_, err := tx.Exec(ctx, `
 		UPDATE consumer_cursors
 		SET last_evt_seq = $1,
 			last_source_cmd_seq = $2,
 			updated_at = NOW()
-		WHERE consumer_name = $3 AND market_id = $4
-	`, evtSeq, sourceCmdSeq, w.consumerName, marketIDInt)
+		WHERE consumer_name = $3 AND market_id = $4::NUMERIC(20,0)
+	`, evtSeq, sourceCmdSeq, w.consumerName, marketIDStr)
 	return err
 }
 
@@ -733,10 +756,9 @@ func (w *Writer) rebuildActiveOrders(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
-		marketID, _ := strconv.ParseUint(marketIDStr, 10, 64)
 		w.writeOpenOrderToRedis(ctx, pipe, openOrderProjection{
 			OrderID:            orderID,
-			MarketID:           int64(marketID),
+			MarketID:           marketIDStr,
 			WalletAddress:      walletAddress,
 			OriginalAction:     originalAction,
 			OriginalOutcome:    originalOutcome,
@@ -927,7 +949,7 @@ func (w *Writer) updateRedisReadModels(ctx context.Context, batch *matching.Batc
 	if batch.SourceOrder != nil {
 		w.writeOpenOrderToRedis(ctx, pipe, openOrderProjection{
 			OrderID:            mustInt64(batch.SourceOrder.OrderID),
-			MarketID:           mustInt64(batch.MarketID),
+			MarketID:           strconv.FormatUint(batch.MarketID, 10),
 			WalletAddress:      batch.SourceOrder.WalletAddress,
 			OriginalAction:     sideLabel(batch.SourceOrder.OriginalAction),
 			OriginalOutcome:    outcomeLabel(batch.SourceOrder.OriginalOutcome),
@@ -991,7 +1013,7 @@ func (w *Writer) updateRedisReadModels(ctx context.Context, batch *matching.Batc
 
 type openOrderProjection struct {
 	OrderID            int64
-	MarketID           int64
+	MarketID           string
 	WalletAddress      string
 	OriginalAction     string
 	OriginalOutcome    string
@@ -1086,6 +1108,7 @@ func (w *Writer) syncPositionRedis(ctx context.Context, batch *matching.BatchEve
 	if w.rdb == nil || w.pool == nil {
 		return nil
 	}
+	marketIDStr := strconv.FormatUint(batch.MarketID, 10)
 	rows, err := w.pool.Query(ctx, `
 		SELECT market_id, wallet_address,
 		       yes_free_lots, yes_locked_lots,
@@ -1093,8 +1116,8 @@ func (w *Writer) syncPositionRedis(ctx context.Context, batch *matching.BatchEve
 		       collateral_free_units, collateral_locked_units,
 		       EXTRACT(EPOCH FROM updated_at)::BIGINT
 		FROM positions
-		WHERE market_id = $1
-	`, int64(batch.MarketID))
+		WHERE market_id = $1::NUMERIC(20,0)
+	`, marketIDStr)
 	if err != nil {
 		return err
 	}
@@ -1332,10 +1355,14 @@ func initialLockDelta(marketID uint64, meta orderMeta, initialQty uint64, initia
 	delta := positionDelta{MarketID: marketID, WalletAddress: meta.WalletAddress}
 	switch meta.OriginalAction {
 	case "buy":
-		required := int64(initialSpend)
+		// 限价买入单的余额已经在 Gateway 层通过 Redis Lua 脚本锁定
+		// Writer 不应该再次锁定，否则会导致双重锁定（余额变成负数）
 		if meta.OrderType == matching.OrderTypeLimit {
-			required = int64(reservedUnitsForLots(initialQty, meta.OriginalPriceTick))
+			// 返回空的 delta，不做任何锁定操作
+			return delta
 		}
+		// 市价买入单：需要锁定（或者直接扣除）
+		required := int64(initialSpend)
 		delta.CollateralFreeDelta -= required
 		delta.CollateralLockedDelta += required
 	case "sell":
@@ -1425,4 +1452,283 @@ func toInt64(v uint64) (int64, error) {
 
 func mustInt64(v uint64) int64 {
 	return int64(v)
+}
+
+// handleOrderLocks 处理订单锁定状态变化
+// 根据订单状态（Filled, Canceled, Expired, PartiallyFilled）处理锁定余额的释放或消费
+func (w *Writer) handleOrderLocks(ctx context.Context, tx pgx.Tx, batch *matching.BatchEventPayload) error {
+	if len(batch.StateEvents) == 0 {
+		return nil
+	}
+
+	for _, state := range batch.StateEvents {
+		if err := w.processOrderLockByState(ctx, tx, state, batch.MarketID); err != nil {
+			return fmt.Errorf("process order lock failed order_id=%d: %w", state.OrderID, err)
+		}
+	}
+
+	return nil
+}
+
+// processOrderLockByState 根据订单状态处理锁定
+func (w *Writer) processOrderLockByState(ctx context.Context, tx pgx.Tx, state matching.OrderStateEvent, marketID uint64) error {
+	// 只处理需要余额操作的订单状态
+	switch state.Status {
+	case matching.StatusFilled:
+		// 完全成交：消费锁定余额
+		return w.consumeLock(ctx, state.OrderID, state.WalletAddress, marketID)
+	case matching.StatusPartiallyFilled:
+		// 部分成交：部分消费锁定余额
+		return w.partialConsumeLock(ctx, tx, state)
+	case matching.StatusCanceled, matching.StatusExpired, matching.StatusRejected:
+		// 取消/过期/拒绝：释放锁定余额
+		return w.releaseLock(ctx, state.OrderID, state.WalletAddress, marketID)
+	default:
+		// StatusNew 不需要特殊处理
+		return nil
+	}
+}
+
+// consumeLock 消费锁定余额（订单完全成交）
+// 将 locked_units 转换为实际成交的 collateral，差额退回到 free_units
+func (w *Writer) consumeLock(ctx context.Context, orderID uint64, walletAddress string, marketID uint64) error {
+	if w.rdb == nil {
+		return nil // Redis 未配置，跳过
+	}
+
+	// 从数据库获取锁定记录
+	lockData, err := w.loadOrderLockFromDB(ctx, orderID)
+	if err != nil {
+		// 锁定记录不存在，可能不是限价买入订单，跳过
+		return nil
+	}
+
+	if lockData.Status != "pending" && lockData.Status != "active" {
+		// 已经处理过，跳过
+		return nil
+	}
+
+	// 获取订单信息以计算实际成交金额
+	orderInfo, err := w.loadOrderForLock(ctx, orderID)
+	if err != nil {
+		return fmt.Errorf("load order info failed: %w", err)
+	}
+
+	// 计算实际成交金额
+	actualAmount := w.calculateActualCollateral(orderInfo, lockData.LockedAmount)
+
+	// 更新 Redis：locked_units -> 0, free_units += refund
+	refundAmount := lockData.LockedAmount - actualAmount
+	if refundAmount > 0 {
+		if _, _, err := w.releaseBalanceAtomic(ctx, walletAddress, refundAmount); err != nil {
+			logger.Warnf("release balance failed order=%d: %v", orderID, err)
+		}
+	}
+
+	// 更新锁定状态为 consumed
+	if err := w.updateOrderLockStatus(ctx, orderID, "consumed"); err != nil {
+		logger.Warnf("update lock status failed order=%d: %v", orderID, err)
+	}
+
+	return nil
+}
+
+// partialConsumeLock 部分消费锁定余额（订单部分成交）
+func (w *Writer) partialConsumeLock(ctx context.Context, tx pgx.Tx, state matching.OrderStateEvent) error {
+	if w.rdb == nil {
+		return nil
+	}
+
+	// 从数据库获取锁定记录
+	lockData, err := w.loadOrderLockFromDB(ctx, state.OrderID)
+	if err != nil {
+		return nil // 不是限价买入订单
+	}
+
+	if lockData.Status != "pending" && lockData.Status != "active" {
+		return nil // 已经处理过
+	}
+
+	// 获取订单信息
+	orderInfo, err := w.loadOrderForLock(ctx, state.OrderID)
+	if err != nil {
+		return fmt.Errorf("load order info failed: %w", err)
+	}
+
+	// 计算已成交数量
+	filledQty := orderInfo.InitialQty - state.RemainingQty
+	if filledQty == 0 {
+		return nil // 没有成交
+	}
+
+	// 计算已消费金额
+	consumedAmount := w.calculateConsumedAmount(orderInfo, filledQty, lockData.LockedAmount)
+
+	// 更新锁定：减少 locked_units，增加 free_units（退回部分）
+	refundAmount := lockData.LockedAmount - consumedAmount - (int64(state.RemainingQty) * int64(orderInfo.OriginalPriceTick) / 100)
+	if refundAmount > 0 {
+		if _, _, err := w.releaseBalanceAtomic(ctx, state.WalletAddress, refundAmount); err != nil {
+			logger.Warnf("release balance failed order=%d: %v", state.OrderID, err)
+		}
+	}
+
+	// 更新锁定状态
+	if err := w.updateOrderLockStatus(ctx, state.OrderID, "active"); err != nil {
+		logger.Warnf("update lock status failed order=%d: %v", state.OrderID, err)
+	}
+
+	return nil
+}
+
+// releaseLock 释放锁定余额（订单取消/过期/拒绝）
+func (w *Writer) releaseLock(ctx context.Context, orderID uint64, walletAddress string, marketID uint64) error {
+	if w.rdb == nil {
+		return nil
+	}
+
+	// 从数据库获取锁定记录
+	lockData, err := w.loadOrderLockFromDB(ctx, orderID)
+	if err != nil {
+		return nil // 不是限价买入订单
+	}
+
+	if lockData.Status != "pending" && lockData.Status != "active" {
+		return nil // 已经处理过
+	}
+
+	// 释放全部锁定金额
+	if _, _, err := w.releaseBalanceAtomic(ctx, walletAddress, lockData.LockedAmount); err != nil {
+		logger.Warnf("release balance failed order=%d: %v", orderID, err)
+		return err
+	}
+
+	// 更新锁定状态为 released
+	if err := w.updateOrderLockStatus(ctx, orderID, "released"); err != nil {
+		logger.Warnf("update lock status failed order=%d: %v", orderID, err)
+	}
+
+	return nil
+}
+
+// releaseBalanceAtomic 释放余额到 Redis
+func (w *Writer) releaseBalanceAtomic(ctx context.Context, walletAddress string, releaseAmount int64) (bool, int64, error) {
+	if w.rdb == nil {
+		return false, 0, errors.New("redis client not configured")
+	}
+
+	cacheKey := fmt.Sprintf("wallet-account:%s", walletAddress)
+	updatedAt := strconv.FormatInt(time.Now().UTC().Unix(), 10)
+
+	pipe := w.rdb.Pipeline()
+	pipe.HIncrBy(ctx, cacheKey, "collateral_locked_units", -releaseAmount)
+	pipe.HIncrBy(ctx, cacheKey, "collateral_free_units", releaseAmount)
+	pipe.HSet(ctx, cacheKey, "updated_at", updatedAt)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return false, 0, fmt.Errorf("redis pipeline exec failed: %w", err)
+	}
+
+	freeUnits, err := w.rdb.HGet(ctx, cacheKey, "collateral_free_units").Int64()
+	if err != nil {
+		return true, 0, nil
+	}
+
+	return true, freeUnits, nil
+}
+
+// loadOrderLockFromDB 从数据库加载订单锁定记录
+type orderLockRecord struct {
+	OrderID       uint64
+	WalletAddress string
+	MarketID      uint64
+	LockedAmount  int64
+	Status        string
+	CreatedAt     time.Time
+}
+
+func (w *Writer) loadOrderLockFromDB(ctx context.Context, orderID uint64) (*orderLockRecord, error) {
+	if w.pool == nil {
+		return nil, errors.New("database pool not configured")
+	}
+
+	row := w.pool.QueryRow(ctx, `
+		SELECT order_id, wallet_address, market_id, locked_amount, status, created_at
+		FROM order_locks
+		WHERE order_id = $1
+	`, int64(orderID))
+
+	var record orderLockRecord
+	err := row.Scan(&record.OrderID, &record.WalletAddress, &record.MarketID, &record.LockedAmount, &record.Status, &record.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	return &record, nil
+}
+
+// loadOrderForLock 加载订单信息用于锁定计算
+type orderLockInfo struct {
+	OrderID           uint64
+	OriginalAction    string
+	OriginalOutcome   string
+	OriginalPriceTick uint8
+	OrderType         uint8
+	InitialQty        uint64
+	RemainingQty      uint64
+}
+
+func (w *Writer) loadOrderForLock(ctx context.Context, orderID uint64) (*orderLockInfo, error) {
+	if w.pool == nil {
+		return nil, errors.New("database pool not configured")
+	}
+
+	row := w.pool.QueryRow(ctx, `
+		SELECT order_id, original_action, original_outcome, original_price_tick,
+		       order_type, initial_qty, remaining_qty
+		FROM orders
+		WHERE order_id = $1
+	`, int64(orderID))
+
+	var info orderLockInfo
+	err := row.Scan(&info.OrderID, &info.OriginalAction, &info.OriginalOutcome,
+		&info.OriginalPriceTick, &info.OrderType, &info.InitialQty, &info.RemainingQty)
+	if err != nil {
+		return nil, err
+	}
+
+	return &info, nil
+}
+
+// calculateActualCollateral 计算实际成交的抵押品金额
+func (w *Writer) calculateActualCollateral(order *orderLockInfo, lockedAmount int64) int64 {
+	// 对于限价买入单，实际成交金额可能小于锁定金额
+	// 这里简化处理，假设实际成交金额等于锁定金额
+	// 实际应该根据成交价格和数量计算
+	return lockedAmount
+}
+
+// calculateConsumedAmount 计算部分成交的消费金额
+func (w *Writer) calculateConsumedAmount(order *orderLockInfo, filledQty uint64, lockedAmount int64) int64 {
+	// 按比例计算：consumed = locked * (filled / initial)
+	if order.InitialQty == 0 {
+		return 0
+	}
+
+	return int64(uint64(lockedAmount) * filledQty / order.InitialQty)
+}
+
+// updateOrderLockStatus 更新订单锁定状态
+func (w *Writer) updateOrderLockStatus(ctx context.Context, orderID uint64, status string) error {
+	if w.pool == nil {
+		return errors.New("database pool not configured")
+	}
+
+	_, err := w.pool.Exec(ctx, `
+		UPDATE order_locks
+		SET status = $1, updated_at = NOW()
+		WHERE order_id = $2
+	`, status, int64(orderID))
+
+	return err
 }

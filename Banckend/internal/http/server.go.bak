@@ -144,7 +144,6 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/orders/merge", s.handleMerge)
 		r.Post("/api/claims", s.handleClaim)
 		r.Post("/api/orders", s.handlePlaceOrder)
-		r.Post("/api/ws-ticket", s.handleCreateWSTicket)
 		r.Delete("/api/orders/{orderId}", s.handleCancelOrder)
 	})
 
@@ -1002,7 +1001,7 @@ func (s *Server) fetchOutcomeLotsFromRPC(ctx context.Context, market markets.Mar
 	}
 	balance, err := s.rpcClient.GetTokenAccountBalance(ctx, ata, rpc.CommitmentProcessed)
 	if err != nil {
-		if isMissingTokenAccountError(err) {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
 			return 0, nil
 		}
 		return 0, err
@@ -1241,7 +1240,6 @@ func (s *Server) persistPositionSnapshot(ctx context.Context, marketID uint64, w
 	if s.dbPool == nil {
 		return nil
 	}
-	marketIDStr := strconv.FormatUint(marketID, 10)
 	_, err := s.dbPool.Exec(ctx, `
 		INSERT INTO positions (
 			market_id, wallet_address,
@@ -1249,7 +1247,7 @@ func (s *Server) persistPositionSnapshot(ctx context.Context, marketID uint64, w
 			no_free_lots, no_locked_lots,
 			collateral_free_units, collateral_locked_units,
 			updated_at
-		) VALUES ($1::NUMERIC(20,0), $2, $3, $4, $5, $6, $7, $8, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 		ON CONFLICT (market_id, wallet_address) DO UPDATE SET
 			yes_free_lots = EXCLUDED.yes_free_lots,
 			yes_locked_lots = EXCLUDED.yes_locked_lots,
@@ -1258,7 +1256,7 @@ func (s *Server) persistPositionSnapshot(ctx context.Context, marketID uint64, w
 			collateral_free_units = EXCLUDED.collateral_free_units,
 			collateral_locked_units = EXCLUDED.collateral_locked_units,
 			updated_at = NOW()
-		`, marketIDStr, walletAddress,
+	`, marketID, walletAddress,
 		next.YesFreeLots, next.YesLockedLots,
 		next.NoFreeLots, next.NoLockedLots,
 		next.CollateralFreeUnits, next.CollateralLockedUnits,
@@ -1323,7 +1321,7 @@ func (s *Server) fetchVUSDCUnitsFromRPC(ctx context.Context, walletAddress strin
 	}
 	balance, err := s.rpcClient.GetTokenAccountBalance(ctx, ata, rpc.CommitmentProcessed)
 	if err != nil {
-		if isMissingTokenAccountError(err) {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
 			return 0, nil
 		}
 		return 0, err
@@ -1372,14 +1370,6 @@ func findAssociatedTokenAddress(wallet, mint, tokenProgramID gsolana.PublicKey) 
 		return gsolana.PublicKey{}, err
 	}
 	return ata, nil
-}
-
-func isMissingTokenAccountError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "not found") || strings.Contains(message, "could not find account")
 }
 
 // handleCancelOrder godoc
@@ -1631,28 +1621,6 @@ func (s *Server) handleUserOrdersWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-}
-
-func (s *Server) handleCreateWSTicket(w http.ResponseWriter, r *http.Request) {
-	if s.redisClient == nil {
-		writeError(w, http.StatusNotImplemented, "websocket tickets require redis")
-		return
-	}
-	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, "")
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	store := pusher.NewTicketStore(s.redisClient, 45*time.Second)
-	ticket, expiresAt, err := store.Issue(r.Context(), walletAddress)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to issue websocket ticket")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ticket":     ticket,
-		"expires_at": expiresAt.Format(time.RFC3339),
-	})
 }
 
 // buildPlaceOrderCommand 旧版本的订单命令构建函数
