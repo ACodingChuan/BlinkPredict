@@ -11,6 +11,7 @@ import (
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/logging"
 	"blinkpredict/banckend/internal/protocol"
+	"blinkpredict/banckend/internal/walletshard"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
@@ -18,24 +19,23 @@ import (
 
 var logger = logging.New("matcher")
 
-// MarketManager 负责监听路由和管理所有市场Actor
 type MarketManager struct {
-	client *natsjs.Client
-	pool   *pgxpool.Pool
-	mu     sync.RWMutex
-	actors map[uint64]*MarketActor
+	client  *natsjs.Client
+	pool    *pgxpool.Pool
+	wallets *walletshard.Manager
+	mu      sync.RWMutex
+	actors  map[uint64]*MarketActor
 }
 
-// NewMarketManager 创建市场管理器
 func NewMarketManager(client *natsjs.Client, pool *pgxpool.Pool) *MarketManager {
 	return &MarketManager{
-		client: client,
-		pool:   pool,
-		actors: make(map[uint64]*MarketActor),
+		client:  client,
+		pool:    pool,
+		wallets: walletshard.New(pool, 128),
+		actors:  make(map[uint64]*MarketActor),
 	}
 }
 
-// GetOrCreateMarket 获取或创建市场Actor（动态寻址）
 func (m *MarketManager) GetOrCreateMarket(marketID uint64) *MarketActor {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -66,63 +66,66 @@ func (m *MarketManager) listActors() []*MarketActor {
 	return actors
 }
 
-// StartConsumer 启动NATS消费者（防撑爆与人质劫持）
 func (m *MarketManager) StartConsumer(ctx context.Context) error {
-	// 订阅命令流 (Queue Group 保证单机处理)
-	sub, err := m.client.JetStream().QueueSubscribe("cmd.order.place", "matcher_group", func(msg *nats.Msg) {
+	sub, err := m.client.JetStream().QueueSubscribe(protocol.SubjectPlaceOrder, "matcher_group", func(msg *nats.Msg) {
 		wrapper, err := m.parseCommandFromJSON(msg.Data)
 		if err != nil {
 			logger.Warnf("failed to parse command: %v", err)
 			msg.Nak()
 			return
 		}
-
-		// 绑定NATS消息到wrapper
 		wrapper.Msg = msg
-		if meta, err := msg.Metadata(); err == nil {
+		if meta, metaErr := msg.Metadata(); metaErr == nil {
 			wrapper.SourceCmdSeq = meta.Sequence.Stream
+		}
+		placeCmd, ok := wrapper.Cmd.(*PlaceOrderCommand)
+		if !ok {
+			msg.Term()
+			return
+		}
+
+		assetKind, reserveUnits := reserveRequirement(placeCmd)
+		if _, err := m.wallets.TryReserveOpenOrder(ctx, placeCmd.WalletAddress, placeCmd.OrderID, placeCmd.MarketID, assetKind, reserveUnits); err != nil {
+			batch := rejectedBatch(placeCmd, wrapper.SourceCmdSeq, assetKind, reserveUnits)
+			if pubErr := m.publishBatch(batch); pubErr != nil {
+				logger.Warnf("failed to publish rejected batch: %v", pubErr)
+				msg.Nak()
+				return
+			}
+			msg.Ack()
+			return
 		}
 
 		actor := m.GetOrCreateMarket(wrapper.Cmd.GetMarketID())
-
-		// 【防线：背压限流机制】
 		select {
 		case actor.CmdChan <- wrapper:
-			// 成功投递到内存信箱，但绝对不在这里ACK
 		default:
+			_, _ = m.wallets.ReleaseOpenReserve(ctx, placeCmd.WalletAddress, placeCmd.OrderID)
 			logger.Warnf("backpressure market=%d channel full, rejecting message", actor.MarketID)
-			msg.Nak() // 告诉NATS我吃不下了，一会再发
+			msg.Nak()
 		}
 	}, nats.Durable("matcher_consumer"))
 	if err != nil {
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
 
-	logger.Infof("Matcher consumer started on subject: cmd.order.place")
-
+	logger.Infof("Matcher consumer started on subject: %s", protocol.SubjectPlaceOrder)
 	<-ctx.Done()
 	sub.Unsubscribe()
 	return nil
 }
 
-// runMatcherEngine 引擎主循环：安全ACK与幂等防重放
 func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 	logger.Infof("Market %d matcher engine started", actor.MarketID)
-
 	for wrapper := range actor.CmdChan {
 		currentSeq := wrapper.SourceCmdSeq
-
-		// 【防线：幂等性双花拦截】
 		if currentSeq > 0 && currentSeq <= actor.Book.LastProcessedSeq {
-			logger.Infof("idempotency shield ignoring seq=%d last_processed=%d",
-				currentSeq, actor.Book.LastProcessedSeq)
 			if wrapper.Msg != nil {
 				wrapper.Msg.Ack()
 			}
 			continue
 		}
 
-		// 创建批量事件
 		batch := &BatchEventPayload{
 			MarketID:     actor.MarketID,
 			SourceCmdSeq: currentSeq,
@@ -132,9 +135,11 @@ func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 			DepthEvents:  make([]L2DepthEvent, 0, 4),
 		}
 		if cmd, ok := wrapper.Cmd.(*PlaceOrderCommand); ok {
+			assetKind, reserveUnits := reserveRequirement(cmd)
 			batch.SourceOrder = &FullOrderData{
 				OrderID:            cmd.OrderID,
 				WalletAddress:      cmd.WalletAddress,
+				AssetKind:          assetKind,
 				OriginalAction:     cmd.OriginalAction,
 				OriginalOutcome:    cmd.OriginalOutcome,
 				OriginalPriceTick:  cmd.OriginalPriceTick,
@@ -143,6 +148,7 @@ func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 				PriceTick:          cmd.PriceTick,
 				InitialQty:         cmd.QtyLots,
 				InitialSpendAmount: cmd.SpendAmount,
+				ReservedUnits:      reserveUnits,
 				ExpireTime:         cmd.ExpireTime,
 				Signature:          cmd.Signature,
 				IntentBytesHex:     cmd.IntentBytesHex,
@@ -151,19 +157,21 @@ func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 			}
 		}
 
-		// 1. 核心推演
 		actor.Book.ProcessCommand(wrapper.Cmd, batch)
-
-		// 2. 广播事件流
-		if err := m.publishBatch(batch); err != nil {
-			logger.Warnf("failed to publish event stream: %v", err)
+		if err := m.applyWalletSideEffects(context.Background(), batch); err != nil {
+			logger.Warnf("wallet side effects failed market=%d err=%v", actor.MarketID, err)
 			if wrapper.Msg != nil {
-				wrapper.Msg.Nak() // 发布失败，连带命令一起退回重来
+				wrapper.Msg.Nak()
 			}
 			continue
 		}
-
-		// 3. 【终极安全闭环】：事件已固化，更新游标，正式释放人质
+		if err := m.publishBatch(batch); err != nil {
+			logger.Warnf("failed to publish event stream: %v", err)
+			if wrapper.Msg != nil {
+				wrapper.Msg.Nak()
+			}
+			continue
+		}
 		if currentSeq > 0 {
 			actor.Book.LastProcessedSeq = currentSeq
 		}
@@ -173,43 +181,28 @@ func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 	}
 }
 
-// publishBatch 发布批量事件到NATS事件流
 func (m *MarketManager) publishBatch(batch *BatchEventPayload) error {
 	if len(batch.TradeEvents) == 0 && len(batch.StateEvents) == 0 && len(batch.DepthEvents) == 0 {
-		return nil // 无副作用，空耗
+		return nil
 	}
-
 	data, err := json.Marshal(batch)
 	if err != nil {
 		return fmt.Errorf("failed to marshal batch: %w", err)
 	}
-
-	// 发布到事件流: evt.trades.{market_id}
 	subject := fmt.Sprintf("evt.trades.%d", batch.MarketID)
 	_, err = m.client.JetStream().Publish(subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish to %s: %w", subject, err)
 	}
-
 	return nil
 }
 
-// parseCommandFromJSON 从JSON反序列化命令
 func (m *MarketManager) parseCommandFromJSON(data []byte) (*CommandWrapper, error) {
-	// 解析protocol.CommandEnvelope
 	var env protocol.CommandEnvelope[protocol.PlaceOrderCommand]
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, fmt.Errorf("failed to parse command envelope: %w", err)
 	}
-
-	// 转换为matching.PlaceOrderCommand
-	cmd := ConvertProtocolToPlaceOrderCommand(env.Payload)
-
-	wrapper := &CommandWrapper{
-		Cmd: cmd,
-	}
-
-	return wrapper, nil
+	return &CommandWrapper{Cmd: ConvertProtocolToPlaceOrderCommand(env.Payload)}, nil
 }
 
 func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
@@ -221,19 +214,19 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 			o.order_id,
 			o.market_id,
 			o.wallet_address,
+			o.asset_kind,
 			o.side,
 			o.order_type,
 			o.price_tick,
-			o.initial_spend_amount,
+			o.spend_amount,
 			o.remaining_qty,
 			o.expire_time,
 			o.signature,
-			o.intent_hex,
 			o.nonce,
 			EXTRACT(EPOCH FROM mk.close_time)::BIGINT AS close_time
 		FROM orders o
 		JOIN markets mk ON mk.market_id = o.market_id
-		WHERE o.status IN (1, 2)
+		WHERE o.status IN ('live', 'partially_filled')
 		ORDER BY o.market_id ASC, o.side ASC, o.price_tick ASC, o.created_cmd_seq ASC
 	`)
 	if err != nil {
@@ -248,21 +241,18 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 			orderID       int64
 			marketIDStr   string
 			walletAddress string
-			side          int16
-			orderType     int16
+			assetKind     string
+			side          string
+			orderType     string
 			priceTick     int16
-			initialSpend  int64
+			spendAmount   int64
 			remainingQty  int64
 			expireTime    int64
 			signature     string
-			intentHex     string
 			nonce         int64
 			closeTime     int64
 		)
-		if err := rows.Scan(
-			&orderID, &marketIDStr, &walletAddress, &side, &orderType, &priceTick,
-			&initialSpend, &remainingQty, &expireTime, &signature, &intentHex, &nonce, &closeTime,
-		); err != nil {
+		if err := rows.Scan(&orderID, &marketIDStr, &walletAddress, &assetKind, &side, &orderType, &priceTick, &spendAmount, &remainingQty, &expireTime, &signature, &nonce, &closeTime); err != nil {
 			return err
 		}
 		marketIDU, _ := strconv.ParseUint(marketIDStr, 10, 64)
@@ -275,16 +265,19 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 		order := AcquireOrder()
 		order.OrderID = uint64(orderID)
 		order.WalletAddress = walletAddress
-		order.Side = uint8(side)
-		order.OrderType = uint8(orderType)
+		order.Side = parseSide(side)
+		order.OrderType = parseOrderType(orderType)
 		order.PriceTick = uint8(priceTick)
-		order.RemainingSpend = uint64(initialSpend)
+		order.RemainingSpend = uint64(spendAmount)
 		order.RemainingQty = uint64(remainingQty)
 		order.ExpireTime = expireTime
 		order.Signature = signature
-		order.IntentBytesHex = intentHex
 		order.Nonce = uint64(nonce)
 		actor.Book.RestoreOrder(order)
+		reserveUnits := recoveredReserveUnits(assetKind, uint64(remainingQty), uint8(priceTick), uint64(spendAmount), order.OrderType)
+		if err := m.wallets.ReserveRecoveredOrder(ctx, walletAddress, uint64(orderID), marketIDU, assetKind, reserveUnits); err != nil {
+			return err
+		}
 	}
 	if rows.Err() != nil {
 		return rows.Err()
@@ -328,13 +321,7 @@ func (m *MarketManager) StartTickLoop(ctx context.Context, interval time.Duratio
 			case t := <-ticker.C:
 				for _, actor := range m.listActors() {
 					select {
-					case actor.CmdChan <- &CommandWrapper{
-						Cmd: &TickCommand{
-							MarketID:  actor.MarketID,
-							Timestamp: t.UTC().Unix(),
-						},
-						SourceCmdSeq: 0,
-					}:
+					case actor.CmdChan <- &CommandWrapper{Cmd: &TickCommand{MarketID: actor.MarketID, Timestamp: t.UTC().Unix()}, SourceCmdSeq: 0}:
 					default:
 						logger.Warnf("tick backpressure market=%d", actor.MarketID)
 					}
@@ -344,18 +331,128 @@ func (m *MarketManager) StartTickLoop(ctx context.Context, interval time.Duratio
 	}()
 }
 
-// ==========================================
-// TODO: 以下方法为预留接口
-// ==========================================
-
-// MarketMeta 市场元数据
-type MarketMeta struct {
-	CloseTime int64
+func reserveRequirement(cmd *PlaceOrderCommand) (string, uint64) {
+	if cmd.OriginalAction == SideBuy {
+		if cmd.OrderType == OrderTypeMarket {
+			return walletshard.AssetCollateral, cmd.SpendAmount
+		}
+		return walletshard.AssetCollateral, (cmd.QtyLots * uint64(cmd.OriginalPriceTick)) / 100
+	}
+	if cmd.OriginalOutcome == 0 {
+		return walletshard.AssetYes, cmd.QtyLots
+	}
+	return walletshard.AssetNo, cmd.QtyLots
 }
 
-// fetchMarketMetadata 从Redis/DB冷读取市场元数据（TODO）
-// func (m *MarketManager) fetchMarketMetadata(marketID uint64) MarketMeta {
-// 	// 实际生产中调用 Redis: HGET market_info:{marketID} close_time
-// 	// 或者从PostgreSQL的markets表读取
-// 	return MarketMeta{CloseTime: 0}
-// }
+func rejectedBatch(cmd *PlaceOrderCommand, sourceCmdSeq uint64, assetKind string, reservedUnits uint64) *BatchEventPayload {
+	batch := &BatchEventPayload{
+		MarketID:     cmd.MarketID,
+		SourceCmdSeq: sourceCmdSeq,
+		Timestamp:    cmd.Timestamp,
+		TradeEvents:  make([]TradeEvent, 0, 1),
+		StateEvents:  make([]OrderStateEvent, 0, 1),
+		DepthEvents:  make([]L2DepthEvent, 0),
+	}
+	batch.SourceOrder = &FullOrderData{
+		OrderID:            cmd.OrderID,
+		WalletAddress:      cmd.WalletAddress,
+		AssetKind:          assetKind,
+		OriginalAction:     cmd.OriginalAction,
+		OriginalOutcome:    cmd.OriginalOutcome,
+		OriginalPriceTick:  cmd.OriginalPriceTick,
+		Side:               cmd.Side,
+		OrderType:          cmd.OrderType,
+		PriceTick:          cmd.PriceTick,
+		InitialQty:         cmd.QtyLots,
+		InitialSpendAmount: cmd.SpendAmount,
+		ReservedUnits:      reservedUnits,
+		ExpireTime:         cmd.ExpireTime,
+		Signature:          cmd.Signature,
+		IntentBytesHex:     cmd.IntentBytesHex,
+		Nonce:              cmd.Nonce,
+		CreatedCmdSeq:      sourceCmdSeq,
+	}
+	batch.AddStateEvent(cmd.OrderID, cmd.WalletAddress, StatusRejected, cmd.QtyLots, cmd.SpendAmount)
+	return batch
+}
+
+func reservationSnapshotToData(snapshot *walletshard.ReservationSnapshot) ReservationData {
+	return ReservationData{
+		OrderID:                snapshot.OrderID,
+		WalletAddress:          snapshot.WalletAddress,
+		AssetKind:              snapshot.AssetKind,
+		MarketID:               snapshot.MarketID,
+		OriginalReservedUnits:  snapshot.OriginalReservedUnits,
+		OpenReservedUnits:      snapshot.OpenReservedUnits,
+		PendingSettlementUnits: snapshot.PendingSettlementUnits,
+		ReleasedUnits:          snapshot.ReleasedUnits,
+		FinalizedUnits:         snapshot.FinalizedUnits,
+		RolledBackUnits:        snapshot.RolledBackUnits,
+	}
+}
+
+func (m *MarketManager) applyWalletSideEffects(ctx context.Context, batch *BatchEventPayload) error {
+	if m.wallets == nil {
+		return nil
+	}
+	seen := map[uint64]struct{}{}
+	for _, trade := range batch.TradeEvents {
+		pairs := []struct {
+			orderID uint64
+			wallet  string
+		}{
+			{orderID: trade.MakerOrderID, wallet: trade.MakerPubKey},
+			{orderID: trade.TakerOrderID, wallet: trade.TakerPubKey},
+		}
+		for _, pair := range pairs {
+			snapshot, err := m.wallets.ApplyTrade(ctx, pair.wallet, pair.orderID, batch.MarketID, trade.MatchQty)
+			if err != nil {
+				return err
+			}
+			if snapshot != nil {
+				seen[pair.orderID] = struct{}{}
+				batch.Reservations = append(batch.Reservations, reservationSnapshotToData(snapshot))
+			}
+		}
+	}
+	for _, state := range batch.StateEvents {
+		if state.Status != StatusCanceled && state.Status != StatusExpired && state.Status != StatusRejected {
+			continue
+		}
+		snapshot, err := m.wallets.ReleaseOpenReserve(ctx, state.WalletAddress, state.OrderID)
+		if err != nil {
+			return err
+		}
+		if snapshot != nil {
+			if _, ok := seen[state.OrderID]; ok {
+				continue
+			}
+			batch.Reservations = append(batch.Reservations, reservationSnapshotToData(snapshot))
+		}
+	}
+	return nil
+}
+
+func parseSide(v string) uint8 {
+	if v == "sell" {
+		return SideSell
+	}
+	return SideBuy
+}
+
+func parseOrderType(v string) uint8 {
+	if v == "market" {
+		return OrderTypeMarket
+	}
+	return OrderTypeLimit
+}
+
+func recoveredReserveUnits(assetKind string, remainingQty uint64, priceTick uint8, spendAmount uint64, orderType uint8) uint64 {
+	if assetKind == walletshard.AssetCollateral {
+		if orderType == OrderTypeMarket {
+			return spendAmount
+		}
+		return (remainingQty * uint64(priceTick)) / 100
+	}
+	return remainingQty
+}

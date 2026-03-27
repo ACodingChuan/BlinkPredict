@@ -190,6 +190,7 @@ type CommandWrapper struct {
 type FullOrderData struct {
 	OrderID            uint64 `json:"order_id"`
 	WalletAddress      string `json:"wallet_address"`
+	AssetKind          string `json:"asset_kind,omitempty"`
 	OriginalAction     uint8  `json:"original_action"`
 	OriginalOutcome    uint8  `json:"original_outcome"`
 	OriginalPriceTick  uint8  `json:"original_price_tick"`
@@ -198,6 +199,7 @@ type FullOrderData struct {
 	PriceTick          uint8  `json:"price_tick"`
 	InitialQty         uint64 `json:"initial_qty"`
 	InitialSpendAmount uint64 `json:"initial_spend_amount"`
+	ReservedUnits      uint64 `json:"reserved_units,omitempty"`
 	ExpireTime         int64  `json:"expire_time"`
 	Signature          string `json:"signature"`
 	IntentBytesHex     string `json:"intent_hex"`
@@ -214,6 +216,20 @@ type BatchEventPayload struct {
 	TradeEvents  []TradeEvent      `json:"trade_events"`
 	StateEvents  []OrderStateEvent `json:"state_events"`
 	DepthEvents  []L2DepthEvent    `json:"depth_events"`
+	Reservations []ReservationData `json:"reservations,omitempty"`
+}
+
+type ReservationData struct {
+	OrderID                uint64 `json:"order_id"`
+	WalletAddress          string `json:"wallet_address"`
+	AssetKind              string `json:"asset_kind"`
+	MarketID               uint64 `json:"market_id"`
+	OriginalReservedUnits  uint64 `json:"original_reserved_units"`
+	OpenReservedUnits      uint64 `json:"open_reserved_units"`
+	PendingSettlementUnits uint64 `json:"pending_settlement_units"`
+	ReleasedUnits          uint64 `json:"released_units"`
+	FinalizedUnits         uint64 `json:"finalized_units"`
+	RolledBackUnits        uint64 `json:"rolled_back_units"`
 }
 
 // AddTradeEvent 添加交易事件

@@ -781,38 +781,6 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 对于限价买入订单，在发布命令前锁定余额
-	lockAmount := int64(0)
-	if strings.EqualFold(req.OrderType, "limit") && strings.EqualFold(req.OriginalAction, "buy") {
-		requiredUnits, err := requiredCollateralUnits(req)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		lockAmount = int64(requiredUnits)
-
-		// 使用 Redis Lua 脚本原子性锁定余额
-		if s.redisClient != nil {
-			success, lockedAmount, err := s.lockBalanceAtomic(r.Context(), walletAddress, lockAmount)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to lock balance: "+err.Error())
-				return
-			}
-			if !success {
-				writeError(w, http.StatusConflict, fmt.Sprintf("insufficient balance: available=%d, required=%d", lockedAmount, lockAmount))
-				return
-			}
-
-			// 持久化锁定记录到数据库
-			if err := s.persistOrderLock(r.Context(), orderID, walletAddress, req.MarketID, lockAmount); err != nil {
-				// 回滚 Redis 锁定
-				_, _, _ = s.releaseBalanceAtomic(r.Context(), walletAddress, lockAmount)
-				writeError(w, http.StatusInternalServerError, "failed to persist order lock: "+err.Error())
-				return
-			}
-		}
-	}
-
 	// 幂等 key 处理 (优先从 header 取，其次用 nonce 作为 idempotency key)
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idempotencyKey == "" {
@@ -844,12 +812,6 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 			code = "command_bus_not_configured"
 		}
 
-		// 发布失败时，释放已锁定的余额
-		if lockAmount > 0 {
-			_, _, _ = s.releaseBalanceAtomic(r.Context(), walletAddress, lockAmount)
-			_ = s.deleteOrderLock(r.Context(), orderID)
-		}
-
 		writeJSON(w, status, map[string]any{"code": code, "message": message})
 		return
 	}
@@ -872,22 +834,7 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	if !market.CloseTime.IsZero() && time.Now().UTC().After(market.CloseTime) {
 		return errors.New("market already closed")
 	}
-
 	originalAction := strings.ToLower(strings.TrimSpace(req.OriginalAction))
-	position, err := s.getOrInitPositionSnapshot(ctx, market, walletAddress)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn().Err(err).Str("wallet", walletAddress).Msg("gateway position precheck skipped")
-		}
-		position = positionSnapshot{}
-	}
-	account, accountErr := s.getOrInitWalletAccountSnapshot(ctx, walletAddress)
-	if accountErr != nil {
-		if s.logger != nil {
-			s.logger.Warn().Err(accountErr).Str("wallet", walletAddress).Msg("gateway wallet account precheck skipped")
-		}
-		account = walletAccountSnapshot{}
-	}
 
 	if strings.EqualFold(req.OrderType, "market") {
 		book := s.matching.GetOrderbook(ctx, req.MarketID)
@@ -900,15 +847,14 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	}
 
 	if originalAction == "sell" {
-		if err != nil {
-			return nil
-		}
-		availableLots := position.YesFreeLots
-		if strings.EqualFold(req.OriginalOutcome, "no") {
-			availableLots = position.NoFreeLots
-		}
-		if availableLots < req.QtyLots {
-			return errInsufficientFunds
+		if position, err := s.getPositionSnapshot(ctx, market.MarketID, walletAddress); err == nil {
+			availableLots := position.YesFreeLots
+			if strings.EqualFold(req.OriginalOutcome, "no") {
+				availableLots = position.NoFreeLots
+			}
+			if availableLots < req.QtyLots {
+				return errInsufficientFunds
+			}
 		}
 		return nil
 	}
@@ -920,24 +866,12 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	if requiredUnits == 0 {
 		return nil
 	}
-
-	if err == nil {
+	if account, err := s.getWalletAccountSnapshot(ctx, walletAddress); err == nil {
 		if account.CollateralFreeUnits < requiredUnits {
 			return errInsufficientFunds
 		}
-		return nil
 	}
 
-	availableUnits, balanceErr := s.getCachedVUSDCUnits(ctx, walletAddress)
-	if balanceErr != nil {
-		if s.logger != nil {
-			s.logger.Warn().Err(balanceErr).Str("wallet", walletAddress).Msg("gateway collateral fallback precheck skipped")
-		}
-		return nil
-	}
-	if availableUnits < requiredUnits {
-		return errInsufficientFunds
-	}
 	return nil
 }
 

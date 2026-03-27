@@ -3,9 +3,12 @@ package pusher
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"time"
 
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/logging"
+	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/protocol"
 
 	"github.com/nats-io/nats.go"
@@ -31,9 +34,7 @@ func (s *Service) Start(ctx context.Context) error {
 		subject string
 		handler nats.MsgHandler
 	}{
-		{subject: "push.market.*.depth", handler: s.handleMarketDepth},
-		{subject: "push.market.*.trade", handler: s.handleMarketTrade},
-		{subject: "push.user.*.order", handler: s.handleUserOrder},
+		{subject: "evt.trades.*", handler: s.handleRealtimeBatch},
 	}
 	for _, subscription := range subscriptions {
 		sub, err := s.client.Conn().Subscribe(subscription.subject, subscription.handler)
@@ -51,35 +52,95 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) handleMarketDepth(msg *nats.Msg) {
-	var payload protocol.MarketDepthPush
-	if err := json.Unmarshal(msg.Data, &payload); err != nil {
-		logger.Warnf("decode market depth failed: %v", err)
+func (s *Service) handleRealtimeBatch(msg *nats.Msg) {
+	var batch matching.BatchEventPayload
+	if err := json.Unmarshal(msg.Data, &batch); err != nil {
+		logger.Warnf("decode realtime batch failed: %v", err)
 		return
 	}
-	if err := s.hub.PublishMarketDepth(payload); err != nil {
-		logger.Warnf("publish market depth failed: %v", err)
+	updatedAt := matchingTimestamp(batch.Timestamp)
+	if len(batch.DepthEvents) > 0 {
+		levels := make([]protocol.MarketDepthLevel, 0, len(batch.DepthEvents))
+		for _, event := range batch.DepthEvents {
+			levels = append(levels, protocol.MarketDepthLevel{
+				Side:        event.Side,
+				PriceTick:   event.PriceTick,
+				TotalVolume: event.TotalVolume,
+			})
+		}
+		payload := protocol.MarketDepthPush{
+			MarketID:     jsonUint(batch.MarketID),
+			UpdatedAt:    updatedAt,
+			SourceCmdSeq: jsonUint(batch.SourceCmdSeq),
+			Levels:       levels,
+		}
+		if err := s.hub.PublishMarketDepth(payload); err != nil {
+			logger.Warnf("publish market depth failed: %v", err)
+		}
+	}
+	for _, trade := range batch.TradeEvents {
+		payload := protocol.MarketTradePush{
+			MarketID:           jsonUint(batch.MarketID),
+			TradeID:            trade.TradeID,
+			MakerOrderID:       jsonUint(trade.MakerOrderID),
+			TakerOrderID:       jsonUint(trade.TakerOrderID),
+			MakerWalletAddress: trade.MakerPubKey,
+			TakerWalletAddress: trade.TakerPubKey,
+			PriceTick:          jsonUint(uint64(trade.MatchPrice)),
+			MatchQty:           jsonUint(trade.MatchQty),
+			ExecutedAt:         updatedAt,
+		}
+		if err := s.hub.PublishMarketTrade(payload); err != nil {
+			logger.Warnf("publish market trade failed: %v", err)
+		}
+	}
+	for _, state := range batch.StateEvents {
+		if state.WalletAddress == "" {
+			continue
+		}
+		payload := protocol.UserOrderPush{
+			MarketID:      jsonUint(batch.MarketID),
+			WalletAddress: state.WalletAddress,
+			Order: protocol.UserOrderPatch{
+				ID:           jsonUint(state.OrderID),
+				Quantity:     jsonUint(state.RemainingQty),
+				Status:       state.Status,
+				RefundAmount: jsonUint(state.RefundAmount),
+				UpdatedAt:    updatedAt,
+			},
+		}
+		if batch.SourceOrder != nil && batch.SourceOrder.OrderID == state.OrderID {
+			payload.Order.Side = matchingSideLabel(batch.SourceOrder.OriginalAction)
+			payload.Order.Outcome = matchingOutcomeLabel(batch.SourceOrder.OriginalOutcome)
+			payload.Order.Price = jsonUint(uint64(batch.SourceOrder.OriginalPriceTick))
+		}
+		if err := s.hub.PublishUserOrder(payload); err != nil {
+			logger.Warnf("publish user order failed: %v", err)
+		}
 	}
 }
 
-func (s *Service) handleMarketTrade(msg *nats.Msg) {
-	var payload protocol.MarketTradePush
-	if err := json.Unmarshal(msg.Data, &payload); err != nil {
-		logger.Warnf("decode market trade failed: %v", err)
-		return
-	}
-	if err := s.hub.PublishMarketTrade(payload); err != nil {
-		logger.Warnf("publish market trade failed: %v", err)
-	}
+func jsonUint(v uint64) string {
+	return strconv.FormatUint(v, 10)
 }
 
-func (s *Service) handleUserOrder(msg *nats.Msg) {
-	var payload protocol.UserOrderPush
-	if err := json.Unmarshal(msg.Data, &payload); err != nil {
-		logger.Warnf("decode user order failed: %v", err)
-		return
+func matchingTimestamp(ts int64) string {
+	if ts <= 0 {
+		return ""
 	}
-	if err := s.hub.PublishUserOrder(payload); err != nil {
-		logger.Warnf("publish user order failed: %v", err)
+	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
+}
+
+func matchingSideLabel(side uint8) string {
+	if side == matching.SideSell {
+		return "sell"
 	}
+	return "buy"
+}
+
+func matchingOutcomeLabel(outcome uint8) string {
+	if outcome == 1 {
+		return "no"
+	}
+	return "yes"
 }
