@@ -100,7 +100,7 @@ func (w *Writer) ensureSubscription() error {
 	if w.sub != nil {
 		return nil
 	}
-	sub, err := w.client.PullSubscribe(protocol.SubjectBatchTrades+".*", w.consumerName)
+	sub, err := w.client.PullSubscribe(protocol.SubjectMatchBatchV2+".*", w.consumerName)
 	if err != nil {
 		return fmt.Errorf("writer subscribe: %w", err)
 	}
@@ -165,12 +165,18 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	var batch matching.BatchEventPayload
-	if err := json.Unmarshal(msg.Data, &batch); err != nil {
+	var event matching.MatchBatchEventV2
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
 		logger.Warnf("decode failed stream_seq=%d deliveries=%d err=%v", meta.Sequence.Stream, meta.NumDelivered, err)
 		_ = msg.Term()
 		return
 	}
+	if event.SchemaVersion != 0 && event.SchemaVersion != 1 {
+		logger.Warnf("unsupported schema version stream_seq=%d schema=%d", meta.Sequence.Stream, event.SchemaVersion)
+		_ = msg.Term()
+		return
+	}
+	batch := legacyBatchFromV2(event)
 	logger.Infof("writer processing stream_seq=%d deliveries=%d market=%d source_cmd_seq=%d bytes=%d",
 		meta.Sequence.Stream, meta.NumDelivered, batch.MarketID, batch.SourceCmdSeq, len(msg.Data))
 
@@ -215,12 +221,10 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	if batch.SourceOrder != nil {
-		if err := w.upsertSourceOrder(ctx, tx, batch.MarketID, batch.Timestamp, batch.SourceOrder); err != nil {
-			logger.Warnf("upsert source order failed market=%d order=%d err=%v", batch.MarketID, batch.SourceOrder.OrderID, err)
-			_ = msg.NakWithDelay(time.Second)
-			return
-		}
+	if err := w.upsertBatchOrders(ctx, tx, &batch); err != nil {
+		logger.Warnf("upsert batch orders failed market=%d err=%v", batch.MarketID, err)
+		_ = msg.NakWithDelay(time.Second)
+		return
 	}
 
 	if err := w.persistTrades(ctx, tx, &batch); err != nil {
@@ -258,14 +262,11 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	pushes, err := w.updateRedisReadModels(ctx, &batch)
+	_, err = w.updateRedisReadModels(ctx, &batch)
 	if err != nil {
 		logger.Warnf("redis sync failed market=%d err=%v", batch.MarketID, err)
 		_ = msg.Ack()
 		return
-	}
-	if err := w.publishPushMessages(pushes); err != nil {
-		logger.Warnf("push publish failed stream_seq=%d market=%d err=%v", meta.Sequence.Stream, batch.MarketID, err)
 	}
 	_ = msg.Ack()
 	elapsed := time.Since(startedAt)
@@ -372,6 +373,17 @@ func (w *Writer) upsertSourceOrder(ctx context.Context, tx pgx.Tx, marketID uint
 		eventTime,
 	)
 	return err
+}
+
+func (w *Writer) upsertBatchOrders(ctx context.Context, tx pgx.Tx, batch *matching.BatchEventPayload) error {
+	orders := sourceOrdersForBatch(batch)
+	for i := range orders {
+		order := orders[i]
+		if err := w.upsertSourceOrder(ctx, tx, batch.MarketID, batch.Timestamp, &order); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *Writer) persistTrades(ctx context.Context, tx pgx.Tx, batch *matching.BatchEventPayload) error {
@@ -497,9 +509,9 @@ func (w *Writer) buildPositionDeltas(ctx context.Context, tx pgx.Tx, batch *matc
 		existing.CollateralLockedDelta += delta.CollateralLockedDelta
 	}
 
-	if batch.SourceOrder != nil {
-		meta := metaFromSourceOrder(batch.SourceOrder)
-		add(initialLockDelta(batch.MarketID, meta, batch.SourceOrder.InitialQty, batch.SourceOrder.InitialSpendAmount))
+	for _, sourceOrder := range sourceOrdersForBatch(batch) {
+		meta := metaFromSourceOrder(&sourceOrder)
+		add(initialLockDelta(batch.MarketID, meta, sourceOrder.InitialQty, sourceOrder.InitialSpendAmount))
 	}
 
 	for _, trade := range batch.TradeEvents {
@@ -946,29 +958,32 @@ func (w *Writer) updateRedisReadModels(ctx context.Context, batch *matching.Batc
 		}
 	}
 
-	if batch.SourceOrder != nil {
+	for _, sourceOrder := range sourceOrdersForBatch(batch) {
 		w.writeOpenOrderToRedis(ctx, pipe, openOrderProjection{
-			OrderID:            mustInt64(batch.SourceOrder.OrderID),
-			MarketID:           strconv.FormatUint(batch.MarketID, 10),
-			WalletAddress:      batch.SourceOrder.WalletAddress,
-			OriginalAction:     sideLabel(batch.SourceOrder.OriginalAction),
-			OriginalOutcome:    outcomeLabel(batch.SourceOrder.OriginalOutcome),
-			OriginalPriceTick:  int(batch.SourceOrder.OriginalPriceTick),
-			Side:               int(batch.SourceOrder.Side),
-			OrderType:          int(batch.SourceOrder.OrderType),
-			PriceTick:          int(batch.SourceOrder.PriceTick),
-			InitialQty:         mustInt64(batch.SourceOrder.InitialQty),
-			InitialSpendAmount: mustInt64(batch.SourceOrder.InitialSpendAmount),
-			RemainingQty:       mustInt64(batch.SourceOrder.InitialQty),
-			ExpireTime:         batch.SourceOrder.ExpireTime,
-			Status:             int(matching.StatusNew),
-			CreatedCmdSeq:      mustInt64(batch.SourceOrder.CreatedCmdSeq),
-			UpdatedAtUnix:      batch.Timestamp,
+			OrderID:              mustInt64(sourceOrder.OrderID),
+			MarketID:             strconv.FormatUint(batch.MarketID, 10),
+			WalletAddress:        sourceOrder.WalletAddress,
+			OriginalAction:       sideLabel(sourceOrder.OriginalAction),
+			OriginalOutcome:      outcomeLabel(sourceOrder.OriginalOutcome),
+			OriginalPriceTick:    int(sourceOrder.OriginalPriceTick),
+			NormalizedSide:       sideLabel(sourceOrder.Side),
+			NormalizedPriceTick:  int(sourceOrder.PriceTick),
+			Side:                 int(sourceOrder.Side),
+			OrderType:            int(sourceOrder.OrderType),
+			PriceTick:            int(sourceOrder.PriceTick),
+			InitialQty:           mustInt64(sourceOrder.InitialQty),
+			InitialSpendAmount:   mustInt64(sourceOrder.InitialSpendAmount),
+			RemainingQty:         mustInt64(sourceOrder.InitialQty),
+			RemainingSpendAmount: mustInt64(sourceOrder.InitialSpendAmount),
+			ExpireTime:           sourceOrder.ExpireTime,
+			Status:               int(matching.StatusNew),
+			CreatedCmdSeq:        mustInt64(sourceOrder.CreatedCmdSeq),
+			UpdatedAtUnix:        batch.Timestamp,
 		})
 	}
 
 	for _, state := range batch.StateEvents {
-		w.applyStateToRedis(ctx, pipe, batch.MarketID, batch.Timestamp, batch.SourceOrder, state)
+		w.applyStateToRedis(ctx, pipe, batch.MarketID, batch.Timestamp, batch, state)
 	}
 
 	if len(batch.TradeEvents) > 0 {
@@ -1012,22 +1027,25 @@ func (w *Writer) updateRedisReadModels(ctx context.Context, batch *matching.Batc
 }
 
 type openOrderProjection struct {
-	OrderID            int64
-	MarketID           string
-	WalletAddress      string
-	OriginalAction     string
-	OriginalOutcome    string
-	OriginalPriceTick  int
-	Side               int
-	OrderType          int
-	PriceTick          int
-	InitialQty         int64
-	InitialSpendAmount int64
-	RemainingQty       int64
-	ExpireTime         int64
-	Status             int
-	CreatedCmdSeq      int64
-	UpdatedAtUnix      int64
+	OrderID              int64
+	MarketID             string
+	WalletAddress        string
+	OriginalAction       string
+	OriginalOutcome      string
+	OriginalPriceTick    int
+	NormalizedSide       string
+	NormalizedPriceTick  int
+	Side                 int
+	OrderType            int
+	PriceTick            int
+	InitialQty           int64
+	InitialSpendAmount   int64
+	RemainingQty         int64
+	RemainingSpendAmount int64
+	ExpireTime           int64
+	Status               int
+	CreatedCmdSeq        int64
+	UpdatedAtUnix        int64
 }
 
 type positionProjection struct {
@@ -1050,34 +1068,44 @@ func (w *Writer) writeOpenOrderToRedis(ctx context.Context, pipe redis.Pipeliner
 		Member: orderIDStr,
 	})
 	pipe.HSet(ctx, orderInfoKey, map[string]any{
-		"market_id":            order.MarketID,
-		"wallet_address":       order.WalletAddress,
-		"original_action":      order.OriginalAction,
-		"original_outcome":     order.OriginalOutcome,
-		"original_price_tick":  order.OriginalPriceTick,
-		"side":                 order.Side,
-		"order_type":           order.OrderType,
-		"price_tick":           order.PriceTick,
-		"initial_qty":          order.InitialQty,
-		"initial_spend_amount": order.InitialSpendAmount,
-		"remaining_qty":        order.RemainingQty,
-		"expire_time":          order.ExpireTime,
-		"status":               order.Status,
-		"created_cmd_seq":      order.CreatedCmdSeq,
-		"updated_at":           order.UpdatedAtUnix,
+		"market_id":              order.MarketID,
+		"wallet_address":         order.WalletAddress,
+		"original_action":        order.OriginalAction,
+		"original_outcome":       order.OriginalOutcome,
+		"original_price_tick":    order.OriginalPriceTick,
+		"normalized_side":        order.NormalizedSide,
+		"normalized_price_tick":  order.NormalizedPriceTick,
+		"side":                   order.Side,
+		"order_type":             order.OrderType,
+		"price_tick":             order.PriceTick,
+		"initial_qty":            order.InitialQty,
+		"initial_qty_lots":       order.InitialQty,
+		"initial_spend_amount":   order.InitialSpendAmount,
+		"remaining_qty":          order.RemainingQty,
+		"remaining_qty_lots":     order.RemainingQty,
+		"remaining_spend_amount": order.RemainingSpendAmount,
+		"expire_time":            order.ExpireTime,
+		"status":                 order.Status,
+		"status_text":            orderStatusLabel(uint8(order.Status)),
+		"created_cmd_seq":        order.CreatedCmdSeq,
+		"updated_at":             order.UpdatedAtUnix,
 	})
 	pipe.Persist(ctx, orderInfoKey)
 }
 
-func (w *Writer) applyStateToRedis(ctx context.Context, pipe redis.Pipeliner, marketID uint64, timestamp int64, sourceOrder *matching.FullOrderData, state matching.OrderStateEvent) {
+func (w *Writer) applyStateToRedis(ctx context.Context, pipe redis.Pipeliner, marketID uint64, timestamp int64, batch *matching.BatchEventPayload, state matching.OrderStateEvent) {
 	orderIDStr := strconv.FormatUint(state.OrderID, 10)
 	orderInfoKey := fmt.Sprintf("order:info:%s", orderIDStr)
 	walletAddress := ""
 	createdCmdSeq := float64(0)
-	if sourceOrder != nil && sourceOrder.OrderID == state.OrderID {
-		walletAddress = sourceOrder.WalletAddress
-		createdCmdSeq = float64(sourceOrder.CreatedCmdSeq)
-	} else {
+	for _, sourceOrder := range sourceOrdersForBatch(batch) {
+		if sourceOrder.OrderID == state.OrderID {
+			walletAddress = sourceOrder.WalletAddress
+			createdCmdSeq = float64(sourceOrder.CreatedCmdSeq)
+			break
+		}
+	}
+	if walletAddress == "" {
 		info, err := w.rdb.HGetAll(ctx, orderInfoKey).Result()
 		if err != nil || len(info) == 0 {
 			return
@@ -1090,10 +1118,13 @@ func (w *Writer) applyStateToRedis(ctx context.Context, pipe redis.Pipeliner, ma
 	}
 	userOrdersKey := fmt.Sprintf("user:orders:%s", walletAddress)
 	pipe.HSet(ctx, orderInfoKey, map[string]any{
-		"market_id":     marketID,
-		"remaining_qty": state.RemainingQty,
-		"status":        state.Status,
-		"updated_at":    timestamp,
+		"market_id":              marketID,
+		"remaining_qty":          state.RemainingQty,
+		"remaining_qty_lots":     state.RemainingQty,
+		"remaining_spend_amount": state.RemainingSpendAmount,
+		"status":                 state.Status,
+		"status_text":            orderStatusLabel(state.Status),
+		"updated_at":             timestamp,
 	})
 	if state.Status == matching.StatusNew || state.Status == matching.StatusPartiallyFilled {
 		pipe.ZAdd(ctx, userOrdersKey, redis.Z{Score: createdCmdSeq, Member: orderIDStr})
@@ -1351,18 +1382,178 @@ func metaFromSourceOrder(order *matching.FullOrderData) orderMeta {
 	}
 }
 
+func sourceOrdersForBatch(batch *matching.BatchEventPayload) []matching.FullOrderData {
+	if batch == nil {
+		return nil
+	}
+	if len(batch.SourceOrders) > 0 {
+		return batch.SourceOrders
+	}
+	if batch.SourceOrder == nil {
+		return nil
+	}
+	return []matching.FullOrderData{*batch.SourceOrder}
+}
+
+func legacyBatchFromV2(event matching.MatchBatchEventV2) matching.BatchEventPayload {
+	batch := matching.BatchEventPayload{
+		MarketID:     event.MarketID,
+		SourceCmdSeq: event.SourceCmdSeqMax,
+		Timestamp:    event.ProducedAt,
+		TradeEvents:  make([]matching.TradeEvent, 0, len(event.Fills)),
+		StateEvents:  make([]matching.OrderStateEvent, 0, len(event.OrderUpdates)),
+		DepthEvents:  make([]matching.L2DepthEvent, 0, len(event.DepthUpdates)),
+		SourceOrders: make([]matching.FullOrderData, 0, len(event.Orders)),
+	}
+
+	orderByIndex := make(map[uint16]matching.MatchedOrderV2, len(event.Orders))
+	createdCmdSeq := event.SourceCmdSeqMin
+	if createdCmdSeq == 0 {
+		createdCmdSeq = event.SourceCmdSeqMax
+	}
+
+	for _, order := range event.Orders {
+		orderByIndex[order.OrderIndex] = order
+		sourceOrder := matching.FullOrderData{
+			OrderID:            order.OrderID,
+			WalletAddress:      order.Execution.WalletAddress,
+			OriginalAction:     sideCode(order.Execution.OriginalAction),
+			OriginalOutcome:    outcomeCode(order.Execution.OriginalOutcome),
+			OriginalPriceTick:  order.Execution.OriginalPriceTick,
+			Side:               sideCode(order.Execution.NormalizedSide),
+			OrderType:          orderTypeCode(order.Execution.OrderType),
+			PriceTick:          order.Execution.NormalizedPriceTick,
+			InitialQty:         order.Execution.QtyLots,
+			InitialSpendAmount: order.Execution.SpendAmount,
+			ExpireTime:         order.Execution.ExpireTime,
+			Signature:          order.Settlement.Signature,
+			IntentBytesHex:     order.Settlement.IntentBytesHex,
+			Nonce:              order.Execution.Nonce,
+			CreatedCmdSeq:      createdCmdSeq,
+		}
+		batch.SourceOrders = append(batch.SourceOrders, sourceOrder)
+	}
+	if len(batch.SourceOrders) > 0 {
+		batch.SourceOrder = &batch.SourceOrders[0]
+	}
+
+	for _, fill := range event.Fills {
+		maker, makerOK := orderByIndex[fill.MakerOrderIndex]
+		taker, takerOK := orderByIndex[fill.TakerOrderIndex]
+		if !makerOK || !takerOK {
+			continue
+		}
+		batch.TradeEvents = append(batch.TradeEvents, matching.TradeEvent{
+			TradeID:        event.EventID + "-" + strconv.FormatUint(uint64(fill.FillIndex), 10),
+			MatchPrice:     uint8(fill.FillPrice),
+			MatchQty:       fill.FillAmount,
+			MakerOrderID:   maker.OrderID,
+			MakerPubKey:    maker.Execution.WalletAddress,
+			MakerSignature: maker.Settlement.Signature,
+			MakerIntentHex: maker.Settlement.IntentBytesHex,
+			TakerOrderID:   taker.OrderID,
+			TakerPubKey:    taker.Execution.WalletAddress,
+			TakerSignature: taker.Settlement.Signature,
+			TakerIntentHex: taker.Settlement.IntentBytesHex,
+		})
+	}
+
+	for _, update := range event.OrderUpdates {
+		order, ok := orderByIndex[update.OrderIndex]
+		if !ok {
+			continue
+		}
+		batch.StateEvents = append(batch.StateEvents, matching.OrderStateEvent{
+			OrderID:              order.OrderID,
+			WalletAddress:        order.Execution.WalletAddress,
+			Status:               orderStatusCode(update.Status),
+			RemainingQty:         update.RemainingQtyLots,
+			RemainingSpendAmount: update.RemainingSpendAmount,
+			RefundAmount:         update.RefundAmount,
+		})
+	}
+
+	for _, depth := range event.DepthUpdates {
+		batch.DepthEvents = append(batch.DepthEvents, matching.L2DepthEvent{
+			Side:        depthSideCode(depth.Side),
+			PriceTick:   depth.PriceTick,
+			TotalVolume: depth.TotalVolume,
+		})
+	}
+
+	return batch
+}
+
+func sideCode(label string) uint8 {
+	if strings.EqualFold(label, "sell") || strings.EqualFold(label, "ask") {
+		return matching.SideSell
+	}
+	return matching.SideBuy
+}
+
+func depthSideCode(label string) uint8 {
+	if strings.EqualFold(label, "ask") {
+		return matching.SideSell
+	}
+	return matching.SideBuy
+}
+
+func outcomeCode(label string) uint8 {
+	if strings.EqualFold(label, "no") {
+		return 1
+	}
+	return 0
+}
+
+func orderTypeCode(label string) uint8 {
+	if strings.EqualFold(label, "market") {
+		return matching.OrderTypeMarket
+	}
+	return matching.OrderTypeLimit
+}
+
+func orderStatusCode(label string) uint8 {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "partially_filled":
+		return matching.StatusPartiallyFilled
+	case "filled":
+		return matching.StatusFilled
+	case "canceled":
+		return matching.StatusCanceled
+	case "expired":
+		return matching.StatusExpired
+	case "rejected":
+		return matching.StatusRejected
+	default:
+		return matching.StatusNew
+	}
+}
+
+func orderStatusLabel(status uint8) string {
+	switch status {
+	case matching.StatusPartiallyFilled:
+		return "partially_filled"
+	case matching.StatusFilled:
+		return "filled"
+	case matching.StatusCanceled:
+		return "canceled"
+	case matching.StatusExpired:
+		return "expired"
+	case matching.StatusRejected:
+		return "rejected"
+	default:
+		return "open"
+	}
+}
+
 func initialLockDelta(marketID uint64, meta orderMeta, initialQty uint64, initialSpend uint64) positionDelta {
 	delta := positionDelta{MarketID: marketID, WalletAddress: meta.WalletAddress}
 	switch meta.OriginalAction {
 	case "buy":
-		// 限价买入单的余额已经在 Gateway 层通过 Redis Lua 脚本锁定
-		// Writer 不应该再次锁定，否则会导致双重锁定（余额变成负数）
-		if meta.OrderType == matching.OrderTypeLimit {
-			// 返回空的 delta，不做任何锁定操作
-			return delta
-		}
-		// 市价买入单：需要锁定（或者直接扣除）
 		required := int64(initialSpend)
+		if meta.OrderType == matching.OrderTypeLimit {
+			required = int64(reservedUnitsForLots(initialQty, meta.OriginalPriceTick))
+		}
 		delta.CollateralFreeDelta -= required
 		delta.CollateralLockedDelta += required
 	case "sell":
@@ -1436,7 +1627,10 @@ func actualCollateralForTrade(meta orderMeta, qty uint64, normalizedMatchPrice u
 }
 
 func reservedUnitsForLots(qtyLots uint64, priceTick uint8) uint64 {
-	return (qtyLots * uint64(priceTick)) / 100
+	if qtyLots == 0 || priceTick == 0 {
+		return 0
+	}
+	return (qtyLots*uint64(priceTick) + 99) / 100
 }
 
 func timestampToTime(ts int64) time.Time {
@@ -1565,7 +1759,7 @@ func (w *Writer) partialConsumeLock(ctx context.Context, tx pgx.Tx, state matchi
 	consumedAmount := w.calculateConsumedAmount(orderInfo, filledQty, lockData.LockedAmount)
 
 	// 更新锁定：减少 locked_units，增加 free_units（退回部分）
-	refundAmount := lockData.LockedAmount - consumedAmount - (int64(state.RemainingQty) * int64(orderInfo.OriginalPriceTick) / 100)
+	refundAmount := lockData.LockedAmount - consumedAmount - int64(reservedUnitsForLots(state.RemainingQty, orderInfo.OriginalPriceTick))
 	if refundAmount > 0 {
 		if _, _, err := w.releaseBalanceAtomic(ctx, state.WalletAddress, refundAmount); err != nil {
 			logger.Warnf("release balance failed order=%d: %v", state.OrderID, err)

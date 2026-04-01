@@ -81,7 +81,9 @@ func (q *QueryEngine) GetOpenOrders(ctx context.Context, walletAddress string, m
 	for _, order := range actor.Book.Orders {
 		if order.WalletAddress == walletAddress {
 			orders = append(orders, OpenOrder{
-				ID: fmt.Sprintf("%d", order.OrderID),
+				ID:       fmt.Sprintf("%d", order.OrderID),
+				Quantity: fmt.Sprintf("%d", order.RemainingQty),
+				Status:   "open",
 			})
 		}
 	}

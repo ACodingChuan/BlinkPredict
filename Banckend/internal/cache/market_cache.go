@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,10 +13,10 @@ import (
 
 const (
 	// Redis keys
-	KeyMarketDetail    = "market:%d"              // market:123
-	KeyMarketsAll       = "markets:all"             // 所有市场
-	KeyMarketsOpen      = "markets:open"            // 开放中市场
-	KeyMarketsResolved  = "markets:resolved"       // 已解决市场
+	KeyMarketDetail    = "market:%d"        // market:123
+	KeyMarketsAll      = "markets:all"      // 所有市场
+	KeyMarketsOpen     = "markets:open"     // 开放中市场
+	KeyMarketsResolved = "markets:resolved" // 已解决市场
 
 	// TTL 常量
 	TTLMarketDetail = 24 * time.Hour // 市场详情缓存 24 小时
@@ -38,29 +39,31 @@ func NewMarketCache(redisClient *redis.Client, logger *zerolog.Logger) *MarketCa
 
 // MarketData Redis 中存储的市场数据结构
 type MarketData struct {
-	ID                string `json:"id"`
-	MarketID          uint64 `json:"market_id"`
-	MarketPDA         string `json:"market_pda"`
-	MetadataURL       string `json:"metadata_url"`
-	CollateralMint    string `json:"collateral_mint"`
-	CollateralVault   string `json:"collateral_vault"`
-	YesMint           string `json:"yes_mint"`
-	NoMint            string `json:"no_mint"`
-	Title             string `json:"title"`
-	Description       string `json:"description"`
-	Category          string `json:"category"`
-	ImageURL          string `json:"image_url"`
-	Status            string `json:"status"`
-	Outcome           string `json:"outcome"`
-	ResolutionMode    string `json:"resolution_mode"`
-	ResolutionAuthority string `json:"resolution_authority"`
-	OracleFeed        string `json:"oracle_feed"`
-	OracleCondition   string `json:"oracle_condition"`
-	OracleTargetPrice int64  `json:"oracle_target_price"`
-	CloseTime         int64  `json:"close_time"`
-	OracleObservationTime int64 `json:"oracle_observation_time"`
-	CreatedAt         int64  `json:"created_at"`
-	UpdatedAt         int64  `json:"updated_at"`
+	ID                   string `json:"id"`
+	MarketID             uint64 `json:"market_id"`
+	MarketPDA            string `json:"market_pda"`
+	MetadataCID          string `json:"metadata_cid"`
+	MetadataURL          string `json:"metadata_url"`
+	CollateralMint       string `json:"collateral_mint"`
+	Title                string `json:"title"`
+	Description          string `json:"description"`
+	Category             string `json:"category"`
+	ImageURL             string `json:"image_url"`
+	Status               string `json:"status"`
+	Outcome              string `json:"outcome"`
+	ResolutionMode       string `json:"resolution_mode"`
+	ResolutionAuthority  string `json:"resolution_authority"`
+	OracleFeed           string `json:"oracle_feed"`
+	OracleCondition      string `json:"oracle_condition"`
+	OracleTargetPrice    int64  `json:"oracle_target_price"`
+	OracleTargetExpo     int32  `json:"oracle_target_expo"`
+	CloseTime            int64  `json:"close_time"`
+	ResolveAfterTime     int64  `json:"resolve_after_time"`
+	ClaimDeadlineTime    int64  `json:"claim_deadline_time"`
+	CreatorUnclaimedFee  int64  `json:"creator_unclaimed_fee"`
+	PlatformUnclaimedFee int64  `json:"platform_unclaimed_fee"`
+	CreatedAt            int64  `json:"created_at"`
+	UpdatedAt            int64  `json:"updated_at"`
 }
 
 // SetMarket 设置市场详情缓存
@@ -75,29 +78,31 @@ func (c *MarketCache) SetMarket(ctx context.Context, market MarketData) error {
 
 	// 将数据转换为 map
 	data := map[string]interface{}{
-		"id":                      market.ID,
-		"market_id":               market.MarketID,
-		"market_pda":              market.MarketPDA,
-		"metadata_url":            market.MetadataURL,
-		"collateral_mint":         market.CollateralMint,
-		"collateral_vault":        market.CollateralVault,
-		"yes_mint":                market.YesMint,
-		"no_mint":                 market.NoMint,
-		"title":                   market.Title,
-		"description":             market.Description,
-		"category":                market.Category,
-		"image_url":               market.ImageURL,
-		"status":                  market.Status,
-		"outcome":                 market.Outcome,
-		"resolution_mode":         market.ResolutionMode,
-		"resolution_authority":    market.ResolutionAuthority,
-		"oracle_feed":             market.OracleFeed,
-		"oracle_condition":        market.OracleCondition,
-		"oracle_target_price":     market.OracleTargetPrice,
-		"close_time":              market.CloseTime,
-		"oracle_observation_time": market.OracleObservationTime,
-		"created_at":              market.CreatedAt,
-		"updated_at":              market.UpdatedAt,
+		"id":                     market.ID,
+		"market_id":              market.MarketID,
+		"market_pda":             market.MarketPDA,
+		"metadata_cid":           market.MetadataCID,
+		"metadata_url":           market.MetadataURL,
+		"collateral_mint":        market.CollateralMint,
+		"title":                  market.Title,
+		"description":            market.Description,
+		"category":               market.Category,
+		"image_url":              market.ImageURL,
+		"status":                 market.Status,
+		"outcome":                market.Outcome,
+		"resolution_mode":        market.ResolutionMode,
+		"resolution_authority":   market.ResolutionAuthority,
+		"oracle_feed":            market.OracleFeed,
+		"oracle_condition":       market.OracleCondition,
+		"oracle_target_price":    market.OracleTargetPrice,
+		"oracle_target_expo":     market.OracleTargetExpo,
+		"close_time":             market.CloseTime,
+		"resolve_after_time":     market.ResolveAfterTime,
+		"claim_deadline_time":    market.ClaimDeadlineTime,
+		"creator_unclaimed_fee":  market.CreatorUnclaimedFee,
+		"platform_unclaimed_fee": market.PlatformUnclaimedFee,
+		"created_at":             market.CreatedAt,
+		"updated_at":             market.UpdatedAt,
 	}
 
 	// 使用 HMSET 存储所有字段
@@ -339,16 +344,16 @@ func (c *MarketCache) parseMarketData(data map[string]string) (*MarketData, erro
 		market.ID = id
 	}
 	if marketIDStr, ok := data["market_id"]; ok {
-		fmt.Sscanf(marketIDStr, "%d", &market.MarketID)
+		if parsed, err := strconv.ParseUint(marketIDStr, 10, 64); err == nil {
+			market.MarketID = parsed
+		}
 	}
 
 	// 可选字段解析
 	market.MarketPDA = data["market_pda"]
+	market.MetadataCID = data["metadata_cid"]
 	market.MetadataURL = data["metadata_url"]
 	market.CollateralMint = data["collateral_mint"]
-	market.CollateralVault = data["collateral_vault"]
-	market.YesMint = data["yes_mint"]
-	market.NoMint = data["no_mint"]
 	market.Title = data["title"]
 	market.Description = data["description"]
 	market.Category = data["category"]
@@ -364,11 +369,23 @@ func (c *MarketCache) parseMarketData(data map[string]string) (*MarketData, erro
 	if closeTime, ok := data["close_time"]; ok {
 		fmt.Sscanf(closeTime, "%d", &market.CloseTime)
 	}
-	if observationTime, ok := data["oracle_observation_time"]; ok {
-		fmt.Sscanf(observationTime, "%d", &market.OracleObservationTime)
+	if resolveAfterTime, ok := data["resolve_after_time"]; ok {
+		fmt.Sscanf(resolveAfterTime, "%d", &market.ResolveAfterTime)
+	}
+	if claimDeadlineTime, ok := data["claim_deadline_time"]; ok {
+		fmt.Sscanf(claimDeadlineTime, "%d", &market.ClaimDeadlineTime)
 	}
 	if targetPrice, ok := data["oracle_target_price"]; ok {
 		fmt.Sscanf(targetPrice, "%d", &market.OracleTargetPrice)
+	}
+	if targetExpo, ok := data["oracle_target_expo"]; ok {
+		fmt.Sscanf(targetExpo, "%d", &market.OracleTargetExpo)
+	}
+	if creatorUnclaimedFee, ok := data["creator_unclaimed_fee"]; ok {
+		fmt.Sscanf(creatorUnclaimedFee, "%d", &market.CreatorUnclaimedFee)
+	}
+	if platformUnclaimedFee, ok := data["platform_unclaimed_fee"]; ok {
+		fmt.Sscanf(platformUnclaimedFee, "%d", &market.PlatformUnclaimedFee)
 	}
 	if createdAt, ok := data["created_at"]; ok {
 		fmt.Sscanf(createdAt, "%d", &market.CreatedAt)

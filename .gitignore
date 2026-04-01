@@ -11,7 +11,8 @@
 !Contract/**
 !Frontened/
 !Frontened/**
-
+!spec/
+!spec/**
 # Environment files / secrets (keep examples)
 **/.env
 **/.env.*

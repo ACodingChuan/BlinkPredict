@@ -6,44 +6,35 @@ import (
 
 var bookLogger = logging.New("matcher-book")
 
-// ==========================================
-// 价格档位与订单簿结构
-// ==========================================
-
-// PriceLevel 价格档位（双向链表）
 type PriceLevel struct {
 	TotalVolume uint64
 	Head        *MemoryOrder
 	Tail        *MemoryOrder
 }
 
-// FixedArrayOrderBook 固定数组订单簿（零锁单线程状态机）
 type FixedArrayOrderBook struct {
 	MarketID         uint64
 	CurrentTime      int64
-	CloseTime        int64  // TODO: 从Redis/DB获取市场关闭时间，暂不使用
-	IsActive         bool   // 熔断开关
-	LastProcessedSeq uint64 // 幂等防线：防NATS重放
+	CloseTime        int64
+	IsActive         bool
+	LastProcessedSeq uint64
 
-	Bids   [100]*PriceLevel        // 买单：索引1-99，0不使用
-	Asks   [100]*PriceLevel        // 卖单：索引1-99，0不使用
-	Orders map[uint64]*MemoryOrder // 快速查找索引
+	Bids   [100]*PriceLevel
+	Asks   [100]*PriceLevel
+	Orders map[uint64]*MemoryOrder
 
 	BestBidPrice uint8
 	BestAskPrice uint8
 }
 
-// NewFixedArrayOrderBook 创建订单簿
 func NewFixedArrayOrderBook(marketID uint64) *FixedArrayOrderBook {
 	return &FixedArrayOrderBook{
-		MarketID:  marketID,
-		CloseTime: 0, // TODO: 从Redis/DB获取，后期实现
-		IsActive:  true,
-		Orders:    make(map[uint64]*MemoryOrder),
+		MarketID: marketID,
+		IsActive: true,
+		Orders:   make(map[uint64]*MemoryOrder),
 	}
 }
 
-// RestoreOrder 将已持久化的活跃订单恢复回订单簿，不产生事件。
 func (ob *FixedArrayOrderBook) RestoreOrder(order *MemoryOrder) {
 	var sideArr *[100]*PriceLevel
 	if order.Side == SideBuy {
@@ -51,13 +42,11 @@ func (ob *FixedArrayOrderBook) RestoreOrder(order *MemoryOrder) {
 	} else {
 		sideArr = &ob.Asks
 	}
-
 	level := sideArr[order.PriceTick]
 	if level == nil {
 		level = &PriceLevel{}
 		sideArr[order.PriceTick] = level
 	}
-
 	if level.Tail == nil {
 		level.Head = order
 		level.Tail = order
@@ -66,10 +55,8 @@ func (ob *FixedArrayOrderBook) RestoreOrder(order *MemoryOrder) {
 		order.Prev = level.Tail
 		level.Tail = order
 	}
-
 	level.TotalVolume += order.RemainingQty
 	ob.Orders[order.OrderID] = order
-
 	if order.Side == SideBuy && order.PriceTick > ob.BestBidPrice {
 		ob.BestBidPrice = order.PriceTick
 	}
@@ -78,81 +65,57 @@ func (ob *FixedArrayOrderBook) RestoreOrder(order *MemoryOrder) {
 	}
 }
 
-// ==========================================
-// 主路由分支
-// ==========================================
-
-// ProcessCommand 处理命令的主入口
-func (ob *FixedArrayOrderBook) ProcessCommand(cmd Command, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) ProcessCommand(cmd Command, wallet *SharedWalletManager, batch *pendingBatch) {
 	ob.CurrentTime = cmd.GetTimestamp()
-
 	switch c := cmd.(type) {
 	case *PlaceOrderCommand:
-		ob.handlePlaceOrder(c, batch)
+		ob.handlePlaceOrder(c, wallet, batch)
 	case *TickCommand:
-		ob.handleTick(c, batch)
+		ob.handleTick(c, wallet, batch)
 	case *HaltMarketCommand:
 		ob.handleHalt(c, batch)
 	}
 }
 
-// ==========================================
-// 订单撮合总控
-// ==========================================
-
-// handlePlaceOrder 处理下单命令
-func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, batch *BatchEventPayload) {
-	// 【防线 1：静态时间墙】TODO: 后期启用CloseTime检查
-	// if ob.CloseTime > 0 && ob.CurrentTime >= ob.CloseTime {
-	// 	batch.AddStateEvent(cmd.OrderID, cmd.WalletAddress, StatusRejected, cmd.QtyLots, cmd.SpendAmount)
-	// 	return
-	// }
-
-	// 【防线 2：动态熔断开关】
+func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, wallet *SharedWalletManager, batch *pendingBatch) {
 	if !ob.IsActive {
-		batch.AddStateEvent(cmd.OrderID, cmd.WalletAddress, StatusRejected, cmd.QtyLots, cmd.SpendAmount)
+		batch.addOrderUpdateForCommand(cmd, "rejected", cmd.QtyLots, cmd.SpendAmount, 0, "market_halted")
+		return
+	}
+	if err := wallet.ReserveOrder(cmd); err != nil {
+		batch.addOrderUpdateForCommand(cmd, "rejected", cmd.QtyLots, cmd.SpendAmount, 0, "insufficient_balance")
 		return
 	}
 
-	// 创建Taker订单
 	taker := AcquireOrder()
 	taker.InitFromCmd(cmd)
 
-	// 根据方向执行撮合
 	if taker.Side == SideBuy {
-		ob.matchAsks(taker, batch)
+		ob.matchAsks(taker, wallet, batch)
 	} else {
-		ob.matchBids(taker, batch)
+		ob.matchBids(taker, wallet, batch)
 	}
 
-	// 残骸处理
 	if taker.IsFilled() {
-		batch.AddStateEvent(taker.OrderID, taker.WalletAddress, StatusFilled, 0, 0)
+		batch.addOrderUpdateForOrder(taker, "filled", 0, 0, 0, "")
 		ReleaseOrder(taker)
-	} else {
-		if taker.OrderType == OrderTypeMarket {
-			// 市价单剩余部分取消
-			refund := taker.RemainingSpend
-			batch.AddStateEvent(taker.OrderID, taker.WalletAddress, StatusCanceled, taker.RemainingQty, refund)
-			ReleaseOrder(taker)
-		} else {
-			// 限价单加入订单簿
-			ob.addOrderToBook(taker, batch)
-		}
+		return
 	}
+
+	if taker.OrderType == OrderTypeMarket {
+		refund := taker.RemainingSpend
+		wallet.ReleaseOrder(taker, refund)
+		batch.addOrderUpdateForOrder(taker, "canceled", taker.RemainingQty, taker.RemainingSpend, refund, "market_unfilled")
+		ReleaseOrder(taker)
+		return
+	}
+
+	ob.addOrderToBook(taker, batch)
 }
 
-// ==========================================
-// 激进吃单循环 (Buy撞击Asks)
-// ==========================================
-
-// matchAsks 买单吃卖单
-func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, wallet *SharedWalletManager, batch *pendingBatch) {
 	targetPrice := ob.BestAskPrice
-
-	// 如果没有初始最优价，从最低价开始搜索
 	if targetPrice == 0 {
-		// 找到第一个有订单的卖单档位
 		for p := uint8(1); p <= 99; p++ {
 			if ob.Asks[p] != nil && ob.Asks[p].TotalVolume > 0 {
 				targetPrice = p
@@ -171,42 +134,31 @@ func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, batch *BatchEventPa
 		maker := level.Head
 		for maker != nil && !taker.IsFilled() {
 			nextMaker := maker.Next
-
-			// 【排雷：惰性删除过期单】
 			if maker.ExpireTime > 0 && ob.CurrentTime >= maker.ExpireTime {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, StatusExpired)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "expired", "expired")
 				maker = nextMaker
 				continue
 			}
-
-			// 【STP：自成交防范拦截】
 			if maker.WalletAddress == taker.WalletAddress {
-				// 取消盘口老单，退回 Maker 资产
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, StatusCanceled)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "canceled", "self_trade_prevention")
 				maker = nextMaker
 				continue
 			}
-
-			// 核心份额与粉尘计算
 			var matchQty uint64
-			if taker.OrderType == OrderTypeMarket && taker.Side == SideBuy {
-				// 市价买入：qty_lots 的最小精度是 0.01 share，spend_amount 的最小精度是 $0.01，
-				// 因此成本公式必须是 qty_lots * price_tick / 100。
-				costToClear := costForLots(maker.RemainingQty, targetPrice)
+			if taker.OrderType == OrderTypeMarket && taker.OriginalAction == SideBuy {
+				costToClear := spendForOrderLots(taker, maker.RemainingQty, targetPrice)
 				if taker.RemainingSpend >= costToClear {
 					matchQty = maker.RemainingQty
 					taker.RemainingSpend -= costToClear
 				} else {
-					matchQty = lotsForSpend(taker.RemainingSpend, targetPrice)
+					matchQty = lotsForOrderSpend(taker, taker.RemainingSpend, targetPrice)
 					if matchQty == 0 {
-						// 致命粉尘，强行打断
 						taker.RemainingSpend = 0
 						break
 					}
-					taker.RemainingSpend -= costForLots(matchQty, targetPrice)
+					taker.RemainingSpend -= spendForOrderLots(taker, matchQty, targetPrice)
 				}
 			} else {
-				// 限价单/市价卖出：基于QtyLots计算
 				if taker.RemainingQty < maker.RemainingQty {
 					matchQty = taker.RemainingQty
 				} else {
@@ -215,32 +167,28 @@ func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, batch *BatchEventPa
 				taker.RemainingQty -= matchQty
 			}
 
-			// 扣减与发票开具
 			maker.RemainingQty -= matchQty
 			level.TotalVolume -= matchQty
-			batch.AddTradeEvent(maker, taker, targetPrice, matchQty)
+			wallet.ApplyLocalFill(maker, taker, matchQty, targetPrice, classifyMatchType(maker, taker))
+			batch.addFill(maker, taker, targetPrice, matchQty)
 
 			if maker.RemainingQty == 0 {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, StatusFilled)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "filled", "")
 			} else {
-				batch.AddStateEvent(maker.OrderID, maker.WalletAddress, StatusPartiallyFilled, maker.RemainingQty, 0)
+				batch.addOrderUpdateForOrder(maker, "partially_filled", maker.RemainingQty, maker.RemainingSpend, 0, "")
 			}
-
 			maker = nextMaker
 		}
-
-		// 发送深度事件
-		batch.AddDepthEvent(SideSell, targetPrice, level.TotalVolume)
+		batch.addDepthUpdate(SideSell, targetPrice, level.TotalVolume)
 		if level.Head == nil {
 			targetPrice++
 		}
 	}
-
 	ob.updateBestAsk(targetPrice)
 }
 
 func costForLots(qtyLots uint64, priceTick uint8) uint64 {
-	return (qtyLots * uint64(priceTick)) / 100
+	return ceilMulDiv(qtyLots, uint64(priceTick), 100)
 }
 
 func lotsForSpend(spendAmount uint64, priceTick uint8) uint64 {
@@ -250,20 +198,15 @@ func lotsForSpend(spendAmount uint64, priceTick uint8) uint64 {
 	return (spendAmount * 100) / uint64(priceTick)
 }
 
-// ==========================================
-// 对称吃单循环 (Sell撞击Bids)
-// ==========================================
-
-// matchBids 卖单吃买单（完整对称逻辑）
-func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, wallet *SharedWalletManager, batch *pendingBatch) {
 	targetPrice := ob.BestBidPrice
-
-	// 如果没有初始最优价，从最高价开始搜索
 	if targetPrice == 0 {
-		// 找到第一个有订单的买单档位
 		for p := uint8(99); p >= 1; p-- {
 			if ob.Bids[p] != nil && ob.Bids[p].TotalVolume > 0 {
 				targetPrice = p
+				break
+			}
+			if p == 1 {
 				break
 			}
 		}
@@ -278,50 +221,54 @@ func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, batch *BatchEventPa
 			targetPrice--
 			continue
 		}
-
 		maker := level.Head
 		for maker != nil && !taker.IsFilled() {
 			nextMaker := maker.Next
-
-			// 【排雷：惰性删除过期单】
 			if maker.ExpireTime > 0 && ob.CurrentTime >= maker.ExpireTime {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, StatusExpired)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "expired", "expired")
 				maker = nextMaker
 				continue
 			}
-
-			// 【STP：自成交防范拦截】
 			if maker.WalletAddress == taker.WalletAddress {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, StatusCanceled)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "canceled", "self_trade_prevention")
 				maker = nextMaker
 				continue
 			}
-
-			// 核心份额计算
 			var matchQty uint64
-			if taker.RemainingQty < maker.RemainingQty {
-				matchQty = taker.RemainingQty
+			if taker.OrderType == OrderTypeMarket && taker.OriginalAction == SideBuy {
+				costToClear := spendForOrderLots(taker, maker.RemainingQty, targetPrice)
+				if taker.RemainingSpend >= costToClear {
+					matchQty = maker.RemainingQty
+					taker.RemainingSpend -= costToClear
+				} else {
+					matchQty = lotsForOrderSpend(taker, taker.RemainingSpend, targetPrice)
+					if matchQty == 0 {
+						taker.RemainingSpend = 0
+						break
+					}
+					taker.RemainingSpend -= spendForOrderLots(taker, matchQty, targetPrice)
+				}
 			} else {
-				matchQty = maker.RemainingQty
+				if taker.RemainingQty < maker.RemainingQty {
+					matchQty = taker.RemainingQty
+				} else {
+					matchQty = maker.RemainingQty
+				}
+				taker.RemainingQty -= matchQty
 			}
-			taker.RemainingQty -= matchQty
-
-			// 扣减与发票开具
 			maker.RemainingQty -= matchQty
 			level.TotalVolume -= matchQty
-			batch.AddTradeEvent(maker, taker, targetPrice, matchQty)
+			wallet.ApplyLocalFill(maker, taker, matchQty, targetPrice, classifyMatchType(maker, taker))
+			batch.addFill(maker, taker, targetPrice, matchQty)
 
 			if maker.RemainingQty == 0 {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, StatusFilled)
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "filled", "")
 			} else {
-				batch.AddStateEvent(maker.OrderID, maker.WalletAddress, StatusPartiallyFilled, maker.RemainingQty, 0)
+				batch.addOrderUpdateForOrder(maker, "partially_filled", maker.RemainingQty, maker.RemainingSpend, 0, "")
 			}
-
 			maker = nextMaker
 		}
-
-		// 发送深度事件
-		batch.AddDepthEvent(SideBuy, targetPrice, level.TotalVolume)
+		batch.addDepthUpdate(SideBuy, targetPrice, level.TotalVolume)
 		if level.Head == nil {
 			if targetPrice == 1 {
 				break
@@ -329,57 +276,53 @@ func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, batch *BatchEventPa
 			targetPrice--
 		}
 	}
-
 	ob.updateBestBid(targetPrice)
 }
 
-// ==========================================
-// O(1) 链表操作
-// ==========================================
+func spendForOrderLots(order *MemoryOrder, qtyLots uint64, normalizedPrice uint8) uint64 {
+	return actualUnitsForOrder(order, qtyLots, normalizedPrice)
+}
 
-// removeAndRecycleMaker O(1)从链表移除并回收订单
-func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *PriceLevel, price uint8, side uint8, batch *BatchEventPayload, status uint8) {
-	// 从双向链表移除
+func lotsForOrderSpend(order *MemoryOrder, spendAmount uint64, normalizedPrice uint8) uint64 {
+	effectivePrice := normalizedPrice
+	if order.OriginalOutcome == 1 {
+		effectivePrice = 100 - normalizedPrice
+	}
+	return lotsForSpend(spendAmount, effectivePrice)
+}
+
+func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *PriceLevel, price uint8, side uint8, wallet *SharedWalletManager, batch *pendingBatch, status, reason string) {
 	if maker.Prev != nil {
 		maker.Prev.Next = maker.Next
 	} else {
 		level.Head = maker.Next
 	}
-
 	if maker.Next != nil {
 		maker.Next.Prev = maker.Prev
 	} else {
 		level.Tail = maker.Prev
 	}
-
-	// 更新档位总量
 	level.TotalVolume -= maker.RemainingQty
 	delete(ob.Orders, maker.OrderID)
-
-	// 生成状态事件
-	batch.AddStateEvent(maker.OrderID, maker.WalletAddress, status, maker.RemainingQty, 0)
-
-	// 回收内存
+	if status == "canceled" || status == "expired" || status == "rejected" {
+		wallet.ReleaseOrder(maker, 0)
+	}
+	batch.addOrderUpdateForOrder(maker, status, maker.RemainingQty, maker.RemainingSpend, 0, reason)
 	ReleaseOrder(maker)
 }
 
-// addOrderToBook 添加订单到订单簿
-func (ob *FixedArrayOrderBook) addOrderToBook(order *MemoryOrder, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) addOrderToBook(order *MemoryOrder, batch *pendingBatch) {
 	var sideArr *[100]*PriceLevel
 	if order.Side == SideBuy {
 		sideArr = &ob.Bids
 	} else {
 		sideArr = &ob.Asks
 	}
-
-	// 获取或创建档位
 	level := sideArr[order.PriceTick]
 	if level == nil {
 		level = &PriceLevel{}
 		sideArr[order.PriceTick] = level
 	}
-
-	// 添加到链表尾部（FIFO）
 	if level.Tail == nil {
 		level.Head = order
 		level.Tail = order
@@ -388,16 +331,10 @@ func (ob *FixedArrayOrderBook) addOrderToBook(order *MemoryOrder, batch *BatchEv
 		order.Prev = level.Tail
 		level.Tail = order
 	}
-
-	// 更新总量
 	level.TotalVolume += order.RemainingQty
 	ob.Orders[order.OrderID] = order
-
-	// 生成事件
-	batch.AddStateEvent(order.OrderID, order.WalletAddress, StatusNew, order.RemainingQty, 0)
-	batch.AddDepthEvent(order.Side, order.PriceTick, level.TotalVolume)
-
-	// 更新最优价格游标
+	batch.addOrderUpdateForOrder(order, "new", order.RemainingQty, order.RemainingSpend, 0, "")
+	batch.addDepthUpdate(order.Side, order.PriceTick, level.TotalVolume)
 	if order.Side == SideBuy && order.PriceTick > ob.BestBidPrice {
 		ob.BestBidPrice = order.PriceTick
 	}
@@ -406,11 +343,6 @@ func (ob *FixedArrayOrderBook) addOrderToBook(order *MemoryOrder, batch *BatchEv
 	}
 }
 
-// ==========================================
-// 最优价格游标更新
-// ==========================================
-
-// updateBestAsk 更新最优卖价
 func (ob *FixedArrayOrderBook) updateBestAsk(startPrice uint8) {
 	ob.BestAskPrice = 0
 	for p := startPrice; p <= 99; p++ {
@@ -418,10 +350,12 @@ func (ob *FixedArrayOrderBook) updateBestAsk(startPrice uint8) {
 			ob.BestAskPrice = p
 			break
 		}
+		if p == 99 {
+			break
+		}
 	}
 }
 
-// updateBestBid 更新最优买价
 func (ob *FixedArrayOrderBook) updateBestBid(startPrice uint8) {
 	ob.BestBidPrice = 0
 	for p := startPrice; p >= 1; p-- {
@@ -429,66 +363,54 @@ func (ob *FixedArrayOrderBook) updateBestBid(startPrice uint8) {
 			ob.BestBidPrice = p
 			break
 		}
+		if p == 1 {
+			break
+		}
 	}
 }
 
-// ==========================================
-// 心跳扫雷与熔断开关
-// ==========================================
-
-// handleTick 处理心跳命令（全盘扫描过期订单）
-func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, wallet *SharedWalletManager, batch *pendingBatch) {
 	ob.CurrentTime = cmd.Timestamp
 	changed := false
-
-	// 全盘扫描100个价格档位
 	for p := uint8(1); p <= 99; p++ {
-		if ob.sweepLevelO1(ob.Bids[p], p, SideBuy, batch) {
+		if ob.sweepLevelO1(ob.Bids[p], p, SideBuy, wallet, batch) {
 			changed = true
 		}
-		if ob.sweepLevelO1(ob.Asks[p], p, SideSell, batch) {
+		if ob.sweepLevelO1(ob.Asks[p], p, SideSell, wallet, batch) {
 			changed = true
 		}
 	}
-
 	if changed {
-		// 只有在 tick 真正移除了过期单时，才需要重新计算最优价并广播深度变化。
 		ob.updateBestBid(99)
 		ob.updateBestAsk(1)
 	}
 }
 
-// sweepLevelO1 扫描单个档位的过期订单（遇到第一个未过期的就截断）
-func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, batch *BatchEventPayload) bool {
+func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, wallet *SharedWalletManager, batch *pendingBatch) bool {
 	if level == nil || level.Head == nil {
 		return false
 	}
-
 	removed := false
 	curr := level.Head
 	for curr != nil {
 		next := curr.Next
 		if curr.ExpireTime > 0 && ob.CurrentTime >= curr.ExpireTime {
-			ob.removeAndRecycleMaker(curr, level, price, side, batch, StatusExpired)
+			ob.removeAndRecycleMaker(curr, level, price, side, wallet, batch, "expired", "expired")
 			removed = true
 			curr = next
 		} else {
-			// 截断：遇到第一个没过期的，直接闪人
 			break
 		}
 	}
-
 	if removed {
-		batch.AddDepthEvent(side, price, level.TotalVolume)
+		batch.addDepthUpdate(side, price, level.TotalVolume)
 	}
 	return removed
 }
 
-// handleHalt 处理熔断命令
-func (ob *FixedArrayOrderBook) handleHalt(cmd *HaltMarketCommand, batch *BatchEventPayload) {
+func (ob *FixedArrayOrderBook) handleHalt(cmd *HaltMarketCommand, _ *pendingBatch) {
 	if ob.IsActive {
 		ob.IsActive = false
-		bookLogger.Warnf("market %d halted", ob.MarketID)
-		// TODO: 可选：遍历挂单全部撤销
+		bookLogger.Warnf("market %d halted at %d", ob.MarketID, cmd.Timestamp)
 	}
 }

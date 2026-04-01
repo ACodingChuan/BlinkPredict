@@ -24,25 +24,23 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 func (r *PostgresRepository) Save(ctx context.Context, market Market) error {
 	const q = `
 INSERT INTO markets (
-    id, market_id, market_pda, metadata_url, collateral_mint, collateral_vault, yes_mint, no_mint,
+    id, market_id, market_pda, metadata_cid, metadata_url, collateral_mint,
     title, description, category, image_url, status, outcome, resolution_mode,
-    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_observation_time,
-    close_time, resolved_at, created_at, updated_at
+    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_target_expo,
+    close_time, resolve_after_time, claim_deadline_time, creator_unclaimed_fee, platform_unclaimed_fee, resolved_at, created_at, updated_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8,
-    $9, $10, $11, $12, $13, $14, $15,
-    $16, $17, $18, $19, $20,
-    $21, $22, $23, $24
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10, $11, $12, $13,
+    $14, $15, $16, $17, $18,
+    $19, $20, $21, $22, $23, $24, $25, $26
 )`
 	_, err := r.pool.Exec(ctx, q,
 		market.ID,
 		strconv.FormatUint(market.MarketID, 10),
 		market.MarketPDA,
+		market.MetadataCID,
 		market.MetadataURL,
 		market.CollateralMint,
-		market.CollateralVault,
-		market.YesMint,
-		market.NoMint,
 		market.Title,
 		market.Description,
 		market.Category,
@@ -54,8 +52,12 @@ INSERT INTO markets (
 		market.Resolution.OracleFeed,
 		string(market.Resolution.OracleCondition),
 		int64(market.Resolution.OracleTarget),
-		nullableTime(market.Resolution.ObservationTime),
+		market.Resolution.OracleTargetExpo,
 		market.CloseTime,
+		market.ResolveAfterTime,
+		market.ClaimDeadlineTime,
+		market.CreatorUnclaimedFee,
+		market.PlatformUnclaimedFee,
 		market.ResolvedAt,
 		market.CreatedAt,
 		market.UpdatedAt,
@@ -69,10 +71,10 @@ INSERT INTO markets (
 func (r *PostgresRepository) List(ctx context.Context) ([]Market, error) {
 	const q = `
 SELECT
-    id, market_id, market_pda, metadata_url, collateral_mint, collateral_vault, yes_mint, no_mint,
+    id, market_id, market_pda, metadata_cid, metadata_url, collateral_mint,
     title, description, category, image_url, status, outcome, resolution_mode,
-    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_observation_time,
-    close_time, resolved_at, created_at, updated_at
+    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_target_expo,
+    close_time, resolve_after_time, claim_deadline_time, creator_unclaimed_fee, platform_unclaimed_fee, resolved_at, created_at, updated_at
 FROM markets
 ORDER BY created_at DESC`
 
@@ -99,10 +101,10 @@ ORDER BY created_at DESC`
 func (r *PostgresRepository) Get(ctx context.Context, marketID uint64) (Market, error) {
 	const q = `
 SELECT
-    id, market_id, market_pda, metadata_url, collateral_mint, collateral_vault, yes_mint, no_mint,
+    id, market_id, market_pda, metadata_cid, metadata_url, collateral_mint,
     title, description, category, image_url, status, outcome, resolution_mode,
-    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_observation_time,
-    close_time, resolved_at, created_at, updated_at
+    resolution_authority, oracle_feed, oracle_condition, oracle_target_price, oracle_target_expo,
+    close_time, resolve_after_time, claim_deadline_time, creator_unclaimed_fee, platform_unclaimed_fee, resolved_at, created_at, updated_at
 FROM markets
 WHERE market_id = $1`
 	row := r.pool.QueryRow(ctx, q, strconv.FormatUint(marketID, 10))
@@ -123,26 +125,32 @@ SET
     title = $1,
     description = $2,
     category = $3,
-    image_url = $4,
-    metadata_url = $5,
-    collateral_mint = $6,
-    status = $7,
-    outcome = $8,
-    resolution_mode = $9,
-    resolution_authority = $10,
-    oracle_feed = $11,
-    oracle_condition = $12,
-    oracle_target_price = $13,
-    oracle_observation_time = $14,
-    close_time = $15,
-    resolved_at = $16,
-    updated_at = $17
-WHERE market_id = $18`
+	image_url = $4,
+	metadata_cid = $5,
+	metadata_url = $6,
+	collateral_mint = $7,
+	status = $8,
+    outcome = $9,
+    resolution_mode = $10,
+    resolution_authority = $11,
+    oracle_feed = $12,
+    oracle_condition = $13,
+    oracle_target_price = $14,
+    oracle_target_expo = $15,
+    close_time = $16,
+    resolve_after_time = $17,
+    claim_deadline_time = $18,
+    creator_unclaimed_fee = $19,
+    platform_unclaimed_fee = $20,
+    resolved_at = $21,
+    updated_at = $22
+WHERE market_id = $23`
 	tag, err := r.pool.Exec(ctx, q,
 		market.Title,
 		market.Description,
 		market.Category,
 		market.ImageURL,
+		market.MetadataCID,
 		market.MetadataURL,
 		market.CollateralMint,
 		string(market.Status),
@@ -152,8 +160,12 @@ WHERE market_id = $18`
 		market.Resolution.OracleFeed,
 		string(market.Resolution.OracleCondition),
 		int64(market.Resolution.OracleTarget),
-		nullableTime(market.Resolution.ObservationTime),
+		market.Resolution.OracleTargetExpo,
 		market.CloseTime,
+		market.ResolveAfterTime,
+		market.ClaimDeadlineTime,
+		market.CreatorUnclaimedFee,
+		market.PlatformUnclaimedFee,
 		market.ResolvedAt,
 		market.UpdatedAt,
 		strconv.FormatUint(market.MarketID, 10),
@@ -171,27 +183,29 @@ func scanMarket(row interface {
 	Scan(dest ...any) error
 }) (Market, error) {
 	var (
-		market                Market
-		marketIDStr           string
-		status                string
-		outcome               string
-		resolutionMode        string
-		oracleCondition       string
-		oracleTargetPrice     int64
-		oracleObservationTime pgtype.Timestamptz
-		resolvedAt            pgtype.Timestamptz
-		resolutionAuthority   string
-		oracleFeed            string
+		market               Market
+		marketIDStr          string
+		status               string
+		outcome              string
+		resolutionMode       string
+		oracleCondition      string
+		oracleTargetPrice    int64
+		oracleTargetExpo     int32
+		resolveAfterTime     time.Time
+		claimDeadlineTime    pgtype.Timestamptz
+		creatorUnclaimedFee  int64
+		platformUnclaimedFee int64
+		resolvedAt           pgtype.Timestamptz
+		resolutionAuthority  string
+		oracleFeed           string
 	)
 	if err := row.Scan(
 		&market.ID,
 		&marketIDStr,
 		&market.MarketPDA,
+		&market.MetadataCID,
 		&market.MetadataURL,
 		&market.CollateralMint,
-		&market.CollateralVault,
-		&market.YesMint,
-		&market.NoMint,
 		&market.Title,
 		&market.Description,
 		&market.Category,
@@ -203,8 +217,12 @@ func scanMarket(row interface {
 		&oracleFeed,
 		&oracleCondition,
 		&oracleTargetPrice,
-		&oracleObservationTime,
+		&oracleTargetExpo,
 		&market.CloseTime,
+		&resolveAfterTime,
+		&claimDeadlineTime,
+		&creatorUnclaimedFee,
+		&platformUnclaimedFee,
 		&resolvedAt,
 		&market.CreatedAt,
 		&market.UpdatedAt,
@@ -220,17 +238,21 @@ func scanMarket(row interface {
 	market.Status = parseStatus(status)
 	market.Outcome = parseOutcome(outcome)
 	market.Resolution = ResolutionConfig{
-		Mode:            parseResolutionMode(resolutionMode),
-		Authority:       resolutionAuthority,
-		OracleFeed:      oracleFeed,
-		OracleCondition: parseOracleCondition(oracleCondition),
+		Mode:             parseResolutionMode(resolutionMode),
+		Authority:        resolutionAuthority,
+		OracleFeed:       oracleFeed,
+		OracleCondition:  parseOracleCondition(oracleCondition),
+		OracleTargetExpo: oracleTargetExpo,
 	}
 	if oracleTargetPrice > 0 {
 		market.Resolution.OracleTarget = uint64(oracleTargetPrice)
 	}
-	if oracleObservationTime.Valid {
-		market.Resolution.ObservationTime = oracleObservationTime.Time
+	market.ResolveAfterTime = resolveAfterTime
+	if claimDeadlineTime.Valid {
+		market.ClaimDeadlineTime = claimDeadlineTime.Time
 	}
+	market.CreatorUnclaimedFee = creatorUnclaimedFee
+	market.PlatformUnclaimedFee = platformUnclaimedFee
 	if resolvedAt.Valid {
 		t := resolvedAt.Time
 		market.ResolvedAt = &t

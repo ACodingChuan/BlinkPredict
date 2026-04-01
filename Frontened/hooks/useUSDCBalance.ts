@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { usePrivy } from "@privy-io/react-auth";
+import { useCallback, useEffect, useState } from "react";
+import { usePrivy } from "@/lib/auth-client";
 import api from "@/app/utils/axiosInstance";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
 
@@ -15,30 +15,28 @@ export const useUSDCBalance = () => {
   const [tradingAvailable, setTradingAvailable] = useState("0.00");
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    const load = async () => {
-      if (!walletAddress) return;
+  const fetchBalance = useCallback(async () => {
+    if (!walletAddress || !authenticated) return;
+    const token = await getAccessToken();
+    if (!token) return;
+    try {
+      const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setTradingTotal(formatUnits(data.collateral_total_units));
+      setTradingAvailable(formatUnits(data.collateral_free_units));
+    } catch {
       setTradingTotal("0.00");
       setTradingAvailable("0.00");
-
-      // 只从 API 获取交易账户余额
-      if (authenticated) {
-        const token = await getAccessToken();
-        if (token) {
-          try {
-            const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
-              headers: { "privy-id-token": token },
-            });
-            setTradingTotal(formatUnits(data.collateral_total_units));
-            setTradingAvailable(formatUnits(data.collateral_free_units));
-          } catch {
-            // Keep trading balances at 0.00 until the system account is initialized.
-          }
-        }
-      }
-    };
-    void load();
+    }
   }, [authenticated, getAccessToken, walletAddress]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void fetchBalance();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [fetchBalance]);
 
   return {
     balance: tradingAvailable,
@@ -46,39 +44,11 @@ export const useUSDCBalance = () => {
     loading,
     walletAddress,
     refetch: async () => {
-      if (!walletAddress || !authenticated) return;
       setLoading(true);
-      const token = await getAccessToken();
-      if (!token) {
-        setLoading(false);
-        return;
-      }
-      try {
-        const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
-          headers: { "privy-id-token": token },
-        });
-        setTradingTotal(formatUnits(data.collateral_total_units));
-        setTradingAvailable(formatUnits(data.collateral_free_units));
-      } catch {
-        // noop
-      } finally {
-        setLoading(false);
-      }
+      await fetchBalance();
+      setLoading(false);
     },
-    syncAfterMutation: async () => {
-      if (!walletAddress || !authenticated) return;
-      const token = await getAccessToken();
-      if (!token) return;
-      try {
-        const { data } = await api.get<WalletAccountResponse>("/wallet-account", {
-          headers: { "privy-id-token": token },
-        });
-        setTradingTotal(formatUnits(data.collateral_total_units));
-        setTradingAvailable(formatUnits(data.collateral_free_units));
-      } catch {
-        // noop
-      }
-    }
+    syncAfterMutation: fetchBalance,
   };
 };
 

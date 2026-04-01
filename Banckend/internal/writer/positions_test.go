@@ -71,3 +71,18 @@ func TestUnlockDeltaForBuyNoReleasesOriginalCollateral(t *testing.T) {
 		t.Fatalf("unexpected unlock delta: %+v", delta)
 	}
 }
+
+func TestInitialLockDeltaRoundsCollateralUpForCentiShares(t *testing.T) {
+	meta := orderMeta{
+		WalletAddress:     "walletC",
+		OriginalAction:    "buy",
+		OriginalOutcome:   "yes",
+		OriginalPriceTick: 60,
+		OrderType:         matching.OrderTypeLimit,
+	}
+
+	delta := initialLockDelta(1001, meta, 101, 0) // 1.01 shares @ 60c => ceil(60.6c) = 61
+	if delta.CollateralFreeDelta != -61 || delta.CollateralLockedDelta != 61 {
+		t.Fatalf("unexpected rounded lock delta: %+v", delta)
+	}
+}

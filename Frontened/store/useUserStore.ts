@@ -1,6 +1,5 @@
 import { create } from "zustand";
 
-
 export type LinkedWallet = {
   id: string;
   address: string;
@@ -9,20 +8,12 @@ export type LinkedWallet = {
   type: "wallet";
 };
 
-export type LinkedGoogle = {
-  name: string;
-  email: string;
-  type: "google_oauth";
-  isAdmin: boolean;
-};
-
-export type LinkedAccount = LinkedWallet | LinkedGoogle;
+export type LinkedAccount = LinkedWallet;
 
 export interface User {
   id: string;
   linkedAccounts: LinkedAccount[];
 }
-
 
 interface UserStore {
   user: User | null;

@@ -6,9 +6,8 @@ import api from "@/app/utils/axiosInstance";
 import { MarketsResponse, Market } from "@/types/market";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMenu } from "@/components/user-menu";
-import { usePrivy } from "@privy-io/react-auth";
+import { usePrivy } from "@/lib/auth-client";
 import { useUSDCBalance } from "@/hooks/useUSDCBalance";
-import { getSolanaWalletAddress } from "@/lib/privy";
 import { toast } from "sonner";
 
 export default function HomePage() {
@@ -31,7 +30,7 @@ export default function HomePage() {
         setLoading(false);
       }
     };
-    load().catch(console.error);
+    void load();
   }, []);
 
   const items = useMemo(() => markets, [markets]);
@@ -53,7 +52,7 @@ export default function HomePage() {
                 <UserMenu />
               </div>
             ) : (
-              <button className="rounded-full bg-zinc-900 px-4 py-2 text-sm font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900" onClick={login}>Connect</button>
+              <button className="rounded-full bg-zinc-900 px-4 py-2 text-sm font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900" onClick={() => void login()}>Connect</button>
             )}
           </div>
         </div>
@@ -78,15 +77,10 @@ export default function HomePage() {
                         toast.error("Not authenticated", { description: "Please login again." });
                         return;
                       }
-                      const walletAddress = getSolanaWalletAddress(user as { wallet?: { address?: string; chainType?: string; chain_type?: string }; linkedAccounts?: { type?: string; address?: string; chainType?: string; chain_type?: string }[] } | null);
-                      if (!walletAddress) {
-                        toast.error("No Solana wallet", { description: "Please connect/link a Solana wallet first." });
-                        return;
-                      }
                       const { data } = await api.post(
                         "/faucet/claim",
-                        { wallet_address: walletAddress },
-                        { headers: { "privy-id-token": token } },
+                        { wallet_address: user.walletAddress },
+                        { headers: { Authorization: `Bearer ${token}` } },
                       );
                       toast.success("Faucet submitted", { description: data.signature });
                       void syncAfterMutation();
@@ -149,9 +143,15 @@ export default function HomePage() {
                   <ResolutionBadge market={market} />
                 </div>
                 <p className="mt-4 line-clamp-3 text-sm text-zinc-600 dark:text-zinc-300">{market.description || "No resolution notes yet."}</p>
-                <div className="mt-6 flex items-center justify-between border-t border-zinc-200 pt-4 text-sm text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
-                  <span>Ends {new Date(market.close_time).toLocaleDateString()}</span>
-                  <span className="capitalize">{market.status}</span>
+                <div className="mt-6 space-y-2 border-t border-zinc-200 pt-4 text-sm text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+                  <div className="flex items-center justify-between">
+                    <span>Ends {new Date(market.close_time).toLocaleDateString()}</span>
+                    <span className="capitalize">{market.status}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Claim by</span>
+                    <span>{market.claim_deadline_time ? new Date(market.claim_deadline_time).toLocaleDateString() : "N/A"}</span>
+                  </div>
                 </div>
               </Link>
             ))}

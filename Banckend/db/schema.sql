@@ -100,6 +100,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_requests_chain_signature
     ON deposit_requests (chain_signature)
     WHERE chain_signature IS NOT NULL AND chain_signature <> '';
 
+CREATE TABLE IF NOT EXISTS webhook_receipts (
+    event_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    signature TEXT,
+    slot BIGINT NOT NULL DEFAULT 0,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    payload_json JSONB NOT NULL DEFAULT '{}'::JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_receipts_provider_event_received
+    ON webhook_receipts (provider, event_type, received_at DESC);
+
 CREATE TABLE IF NOT EXISTS orders (
     order_id BIGINT PRIMARY KEY,
     market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
@@ -175,3 +188,18 @@ CREATE TABLE IF NOT EXISTS positions (
 
 CREATE INDEX IF NOT EXISTS idx_positions_wallet
     ON positions (wallet_address);
+
+CREATE TABLE IF NOT EXISTS user_position_accounts (
+    market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
+    wallet_address VARCHAR(44) NOT NULL,
+    user_position_pda VARCHAR(44) NOT NULL,
+    created_by_relayer VARCHAR(44),
+    created_tx_sig TEXT,
+    first_confirmed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (market_id, wallet_address),
+    UNIQUE (user_position_pda)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_position_accounts_wallet
+    ON user_position_accounts (wallet_address);

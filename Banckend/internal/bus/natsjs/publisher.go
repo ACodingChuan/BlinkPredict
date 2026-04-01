@@ -23,7 +23,7 @@ func NewEventPublisher(client *Client) *EventPublisher {
 }
 
 func (p *CommandPublisher) PublishPlaceOrder(ctx context.Context, env protocol.CommandEnvelope[protocol.PlaceOrderCommand]) error {
-	return p.client.publishJSON(ctx, protocol.SubjectPlaceOrder, env.ID, env)
+	return p.client.publishJSON(ctx, protocol.SubjectPlaceOrder, env.IdempotencyKey, env)
 }
 
 func (p *CommandPublisher) PublishCancelOrder(ctx context.Context, env protocol.CommandEnvelope[protocol.CancelOrderCommand]) error {

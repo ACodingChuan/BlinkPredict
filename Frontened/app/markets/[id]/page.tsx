@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { usePrivy } from "@privy-io/react-auth";
+import { usePrivy } from "@/lib/auth-client";
 import { toast } from "sonner";
 import api from "@/app/utils/axiosInstance";
 import { Orderbook } from "@/components/market/orderbook";
@@ -83,7 +83,8 @@ export default function MarketDetailPage() {
   }, [metadata?.image, metadata?.image_url, market?.image_url]);
 
   const closeTime = market?.close_time || metadata?.close_time || "";
-  const settleTime = metadata?.resolve_after_time || metadata?.settle_time || market?.resolution?.oracle_observation_time || "";
+  const settleTime = market?.resolve_after_time || metadata?.resolve_after_time || metadata?.settle_time || "";
+  const claimDeadlineTime = market?.claim_deadline_time || metadata?.claim_deadline_time || "";
   const description = buildDescription(market, metadata);
 
   if (loading) return <div className="mx-auto max-w-6xl px-4 py-10">Loading market...</div>;
@@ -104,8 +105,9 @@ export default function MarketDetailPage() {
                 <div className="mt-4 flex flex-wrap gap-x-6 gap-y-2 text-sm text-zinc-500 dark:text-zinc-400">
                   <span>Close: {formatTime(closeTime)}</span>
                   <span>Settle: {settleTime ? formatTime(settleTime) : "Follows market rules"}</span>
+                  <span>Claim by: {claimDeadlineTime ? formatTime(claimDeadlineTime) : "N/A"}</span>
                   <span>Mode: {market.resolution.mode === "pyth" ? "Pyth Oracle" : "Creator Resolved"}</span>
-                  <span>Collateral: {market.collateral_mint.slice(0, 8)}...{market.collateral_mint.slice(-6)}</span>
+                  <span>Collateral: {market.collateral_mint ? `${market.collateral_mint.slice(0, 8)}...${market.collateral_mint.slice(-6)}` : "N/A"}</span>
                 </div>
               </div>
 
@@ -132,6 +134,35 @@ export default function MarketDetailPage() {
             <section className="rounded-[28px] border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
               <h2 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Rules</h2>
               <p className="mt-3 whitespace-pre-wrap text-base leading-7 text-zinc-700 dark:text-zinc-200">{description}</p>
+              <dl className="mt-6 grid gap-3 rounded-2xl bg-zinc-50 p-4 text-sm dark:bg-zinc-950/60 sm:grid-cols-2">
+                <div>
+                  <dt className="text-zinc-500 dark:text-zinc-400">Metadata CID</dt>
+                  <dd className="mt-1 break-all font-mono text-zinc-900 dark:text-zinc-100">{market.metadata_cid || "N/A"}</dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500 dark:text-zinc-400">Claim deadline</dt>
+                  <dd className="mt-1 text-zinc-900 dark:text-zinc-100">{claimDeadlineTime ? formatTime(claimDeadlineTime) : "N/A"}</dd>
+                </div>
+                {market.resolution.mode === "creator" ? (
+                  <div>
+                    <dt className="text-zinc-500 dark:text-zinc-400">Resolution authority</dt>
+                    <dd className="mt-1 break-all font-mono text-zinc-900 dark:text-zinc-100">{market.resolution.authority || "N/A"}</dd>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <dt className="text-zinc-500 dark:text-zinc-400">Oracle feed</dt>
+                      <dd className="mt-1 break-all font-mono text-zinc-900 dark:text-zinc-100">{market.resolution.oracle_feed || "N/A"}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-zinc-500 dark:text-zinc-400">Oracle rule</dt>
+                      <dd className="mt-1 text-zinc-900 dark:text-zinc-100">
+                        {(market.resolution.oracle_condition || "").toUpperCase()} {market.resolution.oracle_target_price ?? "N/A"}
+                      </dd>
+                    </div>
+                  </>
+                )}
+              </dl>
             </section>
           </div>
 
@@ -300,7 +331,7 @@ export default function MarketDetailPage() {
                       try {
                         await api.delete(`/orders/${lastOrderID}`, {
                           params: { market_id: market.market_id },
-                          headers: { "privy-id-token": token },
+                          headers: { Authorization: `Bearer ${token}` },
                         });
                         toast.success("Cancel command accepted", { description: lastOrderID });
                       } catch (error: unknown) {

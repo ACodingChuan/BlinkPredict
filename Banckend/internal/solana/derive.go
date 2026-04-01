@@ -15,9 +15,61 @@ type DerivedAddresses struct {
 	NoMint          solana.PublicKey
 }
 
-func DeriveAddresses(programID solana.PublicKey, marketID uint64) (DerivedAddresses, error) {
+func u64LE(value uint64) []byte {
 	seed := make([]byte, 8)
-	binary.LittleEndian.PutUint64(seed, marketID)
+	binary.LittleEndian.PutUint64(seed, value)
+	return seed
+}
+
+func DeriveMarketPDA(programID solana.PublicKey, marketID uint64) (solana.PublicKey, error) {
+	seed := u64LE(marketID)
+	market, _, err := solana.FindProgramAddress([][]byte{[]byte("market"), seed}, programID)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("derive market pda: %w", err)
+	}
+	return market, nil
+}
+
+func DeriveConfigPDA(programID solana.PublicKey) (solana.PublicKey, error) {
+	config, _, err := solana.FindProgramAddress([][]byte{[]byte("config")}, programID)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("derive config pda: %w", err)
+	}
+	return config, nil
+}
+
+func DeriveUserLedgerPDA(programID, user solana.PublicKey) (solana.PublicKey, error) {
+	ledger, _, err := solana.FindProgramAddress([][]byte{[]byte("user_ledger"), user.Bytes()}, programID)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("derive user ledger pda: %w", err)
+	}
+	return ledger, nil
+}
+
+func DeriveUserPositionPDA(programID, user, market solana.PublicKey) (solana.PublicKey, error) {
+	position, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("position"), user.Bytes(), market.Bytes()},
+		programID,
+	)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("derive user position pda: %w", err)
+	}
+	return position, nil
+}
+
+func DeriveOrderStatePDA(programID, user, market solana.PublicKey, nonce uint64) (solana.PublicKey, error) {
+	orderState, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("order"), user.Bytes(), market.Bytes(), u64LE(nonce)},
+		programID,
+	)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("derive order state pda: %w", err)
+	}
+	return orderState, nil
+}
+
+func DeriveAddresses(programID solana.PublicKey, marketID uint64) (DerivedAddresses, error) {
+	seed := u64LE(marketID)
 
 	market, _, err := solana.FindProgramAddress([][]byte{[]byte("market"), seed}, programID)
 	if err != nil {

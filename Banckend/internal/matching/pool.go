@@ -11,6 +11,10 @@ import (
 // MemoryOrder 是侵入式双向链表的节点，也是纯内存业务载体
 type MemoryOrder struct {
 	OrderID           uint64
+	CommandID         string
+	TraceID           string
+	IdempotencyKey    string
+	MarketPDA         string
 	WalletAddress     string
 	OriginalAction    uint8
 	OriginalOutcome   uint8
@@ -21,6 +25,7 @@ type MemoryOrder struct {
 	RemainingQty      uint64
 	RemainingSpend    uint64
 	ExpireTime        int64
+	Timestamp         int64
 	Signature         string
 	IntentBytesHex    string
 	Nonce             uint64 // 防碰撞nonce
@@ -31,7 +36,7 @@ type MemoryOrder struct {
 
 // IsFilled 判断订单是否已完全成交
 func (o *MemoryOrder) IsFilled() bool {
-	if o.OrderType == OrderTypeMarket && o.Side == SideBuy {
+	if o.OrderType == OrderTypeMarket && o.OriginalAction == SideBuy {
 		return o.RemainingSpend == 0
 	}
 	return o.RemainingQty == 0
@@ -40,6 +45,10 @@ func (o *MemoryOrder) IsFilled() bool {
 // InitFromCmd 从命令初始化订单
 func (o *MemoryOrder) InitFromCmd(cmd *PlaceOrderCommand) {
 	o.OrderID = cmd.OrderID
+	o.CommandID = cmd.CommandID
+	o.TraceID = cmd.TraceID
+	o.IdempotencyKey = cmd.IdempotencyKey
+	o.MarketPDA = cmd.MarketPDA
 	o.WalletAddress = cmd.WalletAddress
 	o.OriginalAction = cmd.OriginalAction
 	o.OriginalOutcome = cmd.OriginalOutcome
@@ -50,6 +59,7 @@ func (o *MemoryOrder) InitFromCmd(cmd *PlaceOrderCommand) {
 	o.RemainingQty = cmd.QtyLots
 	o.RemainingSpend = cmd.SpendAmount
 	o.ExpireTime = cmd.ExpireTime
+	o.Timestamp = cmd.Timestamp
 	o.Signature = cmd.Signature
 	o.IntentBytesHex = cmd.IntentBytesHex
 	o.Nonce = cmd.Nonce

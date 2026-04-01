@@ -174,6 +174,10 @@ func (r *RedisQueryEngine) GetOpenOrders(ctx context.Context, walletAddress stri
 			price = info["price_tick"]
 		}
 		quantity := info["remaining_qty"]
+		status := info["status_text"]
+		if status == "" {
+			status = "open"
+		}
 		outcome := info["original_outcome"]
 		if outcome == "" {
 			outcome = "yes"
@@ -184,6 +188,7 @@ func (r *RedisQueryEngine) GetOpenOrders(ctx context.Context, walletAddress stri
 			Outcome:  outcome,
 			Price:    price,
 			Quantity: quantity,
+			Status:   status,
 		})
 	}
 	if len(orders) == 0 {

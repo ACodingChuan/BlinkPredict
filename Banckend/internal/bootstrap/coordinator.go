@@ -8,6 +8,7 @@ import (
 	"blinkpredict/banckend/internal/logging"
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/pusher"
+	"blinkpredict/banckend/internal/settlement"
 	"blinkpredict/banckend/internal/writer"
 )
 
@@ -17,6 +18,7 @@ type Coordinator struct {
 	writer          *writer.Writer
 	matcher         *matching.MarketManager
 	pusher          *pusher.Service
+	settlement      *settlement.Service
 	writerState     atomic.Int32
 	matcherState    atomic.Int32
 	pusherState     atomic.Int32
@@ -36,11 +38,12 @@ const (
 	StateFailed     ModuleState = "failed"
 )
 
-func NewCoordinator(writer *writer.Writer, matcher *matching.MarketManager, pusher *pusher.Service, tickInterval time.Duration) *Coordinator {
+func NewCoordinator(writer *writer.Writer, matcher *matching.MarketManager, pusher *pusher.Service, settlementSvc *settlement.Service, tickInterval time.Duration) *Coordinator {
 	return &Coordinator{
 		writer:       writer,
 		matcher:      matcher,
 		pusher:       pusher,
+		settlement:   settlementSvc,
 		tickInterval: tickInterval,
 	}
 }
@@ -83,6 +86,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 			return err
 		}
 		c.pusherState.Store(int32(StateReadyIndex()))
+	}
+	if c.settlement != nil {
+		c.settlementState.Store(int32(StateStartingIndex()))
+		logger.Infof("starting settlement service")
+		if err := c.settlement.Start(ctx); err != nil {
+			c.settlementState.Store(int32(StateFailedIndex()))
+			return err
+		}
+		c.settlementState.Store(int32(StateReadyIndex()))
 	}
 	c.writeReady.Store(true)
 	logger.Infof("bootstrap ready; write traffic enabled")

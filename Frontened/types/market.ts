@@ -9,6 +9,7 @@ export interface ResolutionConfig {
   oracle_feed?: string;
   oracle_condition?: OracleCondition;
   oracle_target_price?: number;
+  oracle_target_expo?: number;
   oracle_observation_time?: string;
 }
 
@@ -16,19 +17,19 @@ export interface Market {
   id: string;
   market_id: string;
   market_pda: string;
+  metadata_cid?: string;
   metadata_url: string;
-  collateral_mint: string;
-  collateral_vault: string;
-  yes_mint: string;
-  no_mint: string;
+  collateral_mint?: string;
   title: string;
   description: string;
-  category: string;
+  category?: string;
   image_url: string;
   status: MarketStatus;
   outcome: MarketOutcome;
   resolution: ResolutionConfig;
   close_time: string;
+  resolve_after_time?: string;
+  claim_deadline_time?: string;
   resolved_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -50,6 +51,7 @@ export interface MarketMetadataDoc {
   close_time?: string;
   settle_time?: string;
   resolve_after_time?: string;
+  claim_deadline_time?: string;
   rules?: string | string[];
   resolution?: {
     mode?: string;
@@ -57,6 +59,7 @@ export interface MarketMetadataDoc {
     oracle_feed_id?: string;
     oracle_condition?: string;
     oracle_target_price?: string;
+    oracle_target_expo?: string;
   };
 }
 
@@ -81,6 +84,7 @@ export interface OpenOrderItem {
   outcome?: string;
   price?: string;
   quantity?: string;
+  status?: string;
 }
 
 export interface OpenOrdersResponse {
@@ -121,36 +125,53 @@ export interface OrderbookSnapshot {
   matching_enabled: boolean;
 }
 
+export interface WSDepthLevel {
+  side: "bid" | "ask";
+  price_tick: number;
+  total_volume: number;
+}
+
 export interface MarketDepthSocketMessage {
+  type: "market.depth.delta";
   market_id: string;
-  updated_at: string;
-  source_cmd_seq?: string;
-  levels: Array<{ side: number; price_tick: number; total_volume: number }>;
+  ts: string;
+  payload: {
+    levels: WSDepthLevel[];
+  };
 }
 
 export interface MarketTradeSocketMessage {
+  type: "market.trade.executed";
   market_id: string;
-  trade_id: string;
-  maker_order_id: string;
-  taker_order_id: string;
-  maker_wallet_address: string;
-  taker_wallet_address: string;
-  price_tick: string;
-  match_qty: string;
-  executed_at: string;
+  ts: string;
+  payload: {
+    trade_id: string;
+    maker_order_id: string;
+    taker_order_id: string;
+    maker_wallet_address?: string;
+    taker_wallet_address?: string;
+    price_tick: string;
+    fill_amount: string;
+    match_type: string;
+    executed_at: string;
+  };
 }
 
+export type UserOrderStatus = "open" | "partially_filled" | "filled" | "canceled" | "expired" | "rejected";
+
 export interface UserOrderSocketMessage {
+  type: "user.order.updated";
   market_id: string;
-  wallet_address: string;
-  order: {
-    id: string;
-    side?: string;
-    outcome?: string;
-    price?: string;
-    quantity?: string;
-    status: number;
+  ts: string;
+  payload: {
+    order_id: string;
+    status: UserOrderStatus;
+    remaining_qty_lots: string;
+    remaining_spend_amount: string;
     refund_amount?: string;
     updated_at: string;
+    original_action?: string;
+    original_outcome?: string;
+    original_price_tick?: string;
   };
 }

@@ -25,6 +25,7 @@ import (
 	"blinkpredict/banckend/internal/orders"
 	"blinkpredict/banckend/internal/protocol"
 	"blinkpredict/banckend/internal/pusher"
+	"blinkpredict/banckend/internal/settlement"
 	"blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
@@ -33,13 +34,11 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/sony/sonyflake"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
-	"golang.org/x/crypto/sha3"
 )
 
 const orderIntentVersion = "blinkpredict.order.v1"
@@ -72,6 +71,7 @@ type Server struct {
 	webhookHandler        *webhooks.HeliusHandler
 	alchemyWebhookHandler *webhooks.AlchemyHandler
 	logger                *zerolog.Logger
+	sessions              *auth.SessionManager
 }
 
 func New(cfg config.Config, repo markets.Repository, engine matching.Engine, listener indexer.Listener, writeGate interface {
@@ -84,6 +84,7 @@ func New(cfg config.Config, repo markets.Repository, engine matching.Engine, lis
 	if cmdPublisher == nil {
 		cmdPublisher = protocol.DisabledCommandPublisher{}
 	}
+	sessions, _ := auth.NewSessionManager(cfg)
 	// 初始化 Sonyflake 雪花ID生成器
 	sf := sonyflake.NewSonyflake(sonyflake.Settings{})
 	return &Server{
@@ -91,28 +92,28 @@ func New(cfg config.Config, repo markets.Repository, engine matching.Engine, lis
 		writeGate: writeGate, txRequests: txStore, faucet: faucetSvc, commands: cmdPublisher,
 		pusherHub: pusherHub, sonyflake: sf, marketCache: marketCache, redisClient: redisClient, dbPool: dbPool,
 		rpcClient:      rpc.New(cfg.SolanaRPCURL),
-		webhookHandler: webhookHandler, alchemyWebhookHandler: alchemyHandler, logger: logger,
+		webhookHandler: webhookHandler, alchemyWebhookHandler: alchemyHandler, logger: logger, sessions: sessions,
 	}
 }
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 
-	// CORS for the Next.js dev server (http://localhost:3000). We must allow preflight
-	// OPTIONS for custom headers like "privy-id-token", otherwise the browser blocks the request.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000"},
 		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "privy-id-token", "Idempotency-Key"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "Idempotency-Key", "X-Trace-Id"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: false,
 		MaxAge:           300,
 	}))
 
-	r.Use(auth.Middleware(s.cfg))
+	r.Use(auth.Middleware(s.cfg, s.sessions))
 
 	r.Get("/api/health", s.handleHealth)
 	r.Get("/api/ready", s.handleReady)
+	r.Post("/api/auth/challenge", s.handleAuthChallenge)
+	r.Post("/api/auth/login", s.handleAuthLogin)
 	r.Get("/api/openapi.json", s.handleOpenAPISpec)
 	r.Get("/api/docs", s.handleOpenAPIDocs)
 	r.Get("/swagger/*", httpSwagger.Handler(
@@ -127,6 +128,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/trades/{marketId}", s.handleTrades)
 	r.Get("/api/price-history/{marketId}", s.handlePriceHistory)
 	r.Get("/ws/markets/{marketId}", s.handleMarketOrderbookWS)
+	r.Get("/ws/orders", s.handleUserOrdersWS)
 	r.Get("/ws/users/me", s.handleUserOrdersWS)
 
 	// Helius Webhook (不需要认证)
@@ -178,17 +180,6 @@ func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
 		walletAddress = strings.TrimSpace(req.WalletAddress)
 	}
 	if walletAddress == "" {
-		rawToken := authTokenFromRequest(r)
-		if rawToken != "" {
-			resolved, err := s.resolveSolanaAddressFromPrivy(r.Context(), rawToken, r.Header.Get("Origin"))
-			if err != nil {
-				writeError(w, http.StatusUnauthorized, "unable to resolve wallet from privy token: "+err.Error())
-				return
-			}
-			walletAddress = resolved
-		}
-	}
-	if walletAddress == "" {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
@@ -232,83 +223,57 @@ func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func authTokenFromRequest(r *http.Request) string {
-	if token := strings.TrimSpace(r.Header.Get("privy-id-token")); token != "" {
-		return token
+func (s *Server) handleAuthChallenge(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		writeError(w, http.StatusNotImplemented, "auth session manager is not configured")
+		return
 	}
-	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		return strings.TrimSpace(authHeader[len("Bearer "):])
+	var req struct {
+		WalletAddress string `json:"wallet_address"`
 	}
-	return ""
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	challenge, err := s.sessions.CreateChallenge(req.WalletAddress)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"challenge_id": challenge.ID,
+		"message":      challenge.Message,
+		"expires_at":   challenge.ExpiresAt.Format(time.RFC3339),
+	})
 }
 
-func (s *Server) resolveSolanaAddressFromPrivy(ctx context.Context, token string, origin string) (string, error) {
-	appID := strings.TrimSpace(s.cfg.PrivyAppID)
-	if appID == "" {
-		appID = parsePrivyAppIDFromToken(token)
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		writeError(w, http.StatusNotImplemented, "auth session manager is not configured")
+		return
 	}
-	if appID == "" {
-		return "", errors.New("missing privy app id")
+	var req struct {
+		WalletAddress string `json:"wallet_address"`
+		ChallengeID   string `json:"challenge_id"`
+		Signature     string `json:"signature"`
 	}
-
-	if strings.TrimSpace(origin) == "" {
-		origin = "http://localhost:3000"
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://auth.privy.io/api/v1/users/me", nil)
+	user, token, expiresAt, err := s.sessions.VerifyChallenge(req.ChallengeID, req.WalletAddress, req.Signature)
 	if err != nil {
-		return "", err
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("privy-app-id", appID)
-	req.Header.Set("Origin", origin)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("privy /users/me status=%d", resp.StatusCode)
-	}
-
-	var payload struct {
-		User struct {
-			LinkedAccounts []struct {
-				Type      string `json:"type"`
-				Address   string `json:"address"`
-				ChainType string `json:"chain_type"`
-			} `json:"linked_accounts"`
-		} `json:"user"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	for _, account := range payload.User.LinkedAccounts {
-		if strings.EqualFold(account.Type, "wallet") && strings.EqualFold(account.ChainType, "solana") && account.Address != "" {
-			return account.Address, nil
-		}
-	}
-	return "", errors.New("no solana wallet in privy profile")
-}
-
-func parsePrivyAppIDFromToken(raw string) string {
-	parts := strings.Split(raw, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-	var decoded struct {
-		AppID string `json:"aid"`
-	}
-	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(decoded.AppID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth_token": token,
+		"expires_at": expiresAt.Format(time.RFC3339),
+		"user": map[string]any{
+			"walletAddress": user.SolanaAddress,
+			"isAdmin":       user.IsAdmin,
+		},
+	})
 }
 
 // handleHealth godoc
@@ -391,59 +356,63 @@ func (s *Server) handleListMarkets(w http.ResponseWriter, r *http.Request) {
 
 func marketToMarketData(m markets.Market) cache.MarketData {
 	return cache.MarketData{
-		ID:                    m.ID,
-		MarketID:              m.MarketID,
-		MarketPDA:             m.MarketPDA,
-		MetadataURL:           m.MetadataURL,
-		CollateralMint:        m.CollateralMint,
-		CollateralVault:       m.CollateralVault,
-		YesMint:               m.YesMint,
-		NoMint:                m.NoMint,
-		Title:                 m.Title,
-		Description:           m.Description,
-		Category:              m.Category,
-		ImageURL:              m.ImageURL,
-		Status:                string(m.Status),
-		Outcome:               string(m.Outcome),
-		ResolutionMode:        string(m.Resolution.Mode),
-		ResolutionAuthority:   m.Resolution.Authority,
-		OracleFeed:            m.Resolution.OracleFeed,
-		OracleCondition:       string(m.Resolution.OracleCondition),
-		OracleTargetPrice:     int64(m.Resolution.OracleTarget),
-		CloseTime:             m.CloseTime.Unix(),
-		OracleObservationTime: m.Resolution.ObservationTime.Unix(),
-		CreatedAt:             m.CreatedAt.Unix(),
-		UpdatedAt:             m.UpdatedAt.Unix(),
+		ID:                   m.ID,
+		MarketID:             m.MarketID,
+		MarketPDA:            m.MarketPDA,
+		MetadataCID:          m.MetadataCID,
+		MetadataURL:          m.MetadataURL,
+		CollateralMint:       m.CollateralMint,
+		Title:                m.Title,
+		Description:          m.Description,
+		Category:             m.Category,
+		ImageURL:             m.ImageURL,
+		Status:               string(m.Status),
+		Outcome:              string(m.Outcome),
+		ResolutionMode:       string(m.Resolution.Mode),
+		ResolutionAuthority:  m.Resolution.Authority,
+		OracleFeed:           m.Resolution.OracleFeed,
+		OracleCondition:      string(m.Resolution.OracleCondition),
+		OracleTargetPrice:    int64(m.Resolution.OracleTarget),
+		OracleTargetExpo:     m.Resolution.OracleTargetExpo,
+		CloseTime:            m.CloseTime.Unix(),
+		ResolveAfterTime:     m.ResolveAfterTime.Unix(),
+		ClaimDeadlineTime:    m.ClaimDeadlineTime.Unix(),
+		CreatorUnclaimedFee:  m.CreatorUnclaimedFee,
+		PlatformUnclaimedFee: m.PlatformUnclaimedFee,
+		CreatedAt:            m.CreatedAt.Unix(),
+		UpdatedAt:            m.UpdatedAt.Unix(),
 	}
 }
 
 func marketDataToMarket(md *cache.MarketData) markets.Market {
 	return markets.Market{
-		ID:              md.ID,
-		MarketID:        md.MarketID,
-		MarketPDA:       md.MarketPDA,
-		MetadataURL:     md.MetadataURL,
-		CollateralMint:  md.CollateralMint,
-		CollateralVault: md.CollateralVault,
-		YesMint:         md.YesMint,
-		NoMint:          md.NoMint,
-		Title:           md.Title,
-		Description:     md.Description,
-		Category:        md.Category,
-		ImageURL:        md.ImageURL,
-		Status:          markets.MarketStatus(md.Status),
-		Outcome:         markets.MarketOutcome(md.Outcome),
+		ID:             md.ID,
+		MarketID:       md.MarketID,
+		MarketPDA:      md.MarketPDA,
+		MetadataCID:    md.MetadataCID,
+		MetadataURL:    md.MetadataURL,
+		CollateralMint: md.CollateralMint,
+		Title:          md.Title,
+		Description:    md.Description,
+		Category:       md.Category,
+		ImageURL:       md.ImageURL,
+		Status:         markets.MarketStatus(md.Status),
+		Outcome:        markets.MarketOutcome(md.Outcome),
 		Resolution: markets.ResolutionConfig{
-			Mode:            markets.ResolutionMode(md.ResolutionMode),
-			Authority:       md.ResolutionAuthority,
-			OracleFeed:      md.OracleFeed,
-			OracleCondition: markets.OracleCondition(md.OracleCondition),
-			OracleTarget:    uint64(md.OracleTargetPrice),
-			ObservationTime: time.Unix(md.OracleObservationTime, 0),
+			Mode:             markets.ResolutionMode(md.ResolutionMode),
+			Authority:        md.ResolutionAuthority,
+			OracleFeed:       md.OracleFeed,
+			OracleCondition:  markets.OracleCondition(md.OracleCondition),
+			OracleTarget:     uint64(md.OracleTargetPrice),
+			OracleTargetExpo: md.OracleTargetExpo,
 		},
-		CloseTime: time.Unix(md.CloseTime, 0),
-		CreatedAt: time.Unix(md.CreatedAt, 0),
-		UpdatedAt: time.Unix(md.UpdatedAt, 0),
+		CloseTime:            time.Unix(md.CloseTime, 0),
+		ResolveAfterTime:     time.Unix(md.ResolveAfterTime, 0),
+		ClaimDeadlineTime:    time.Unix(md.ClaimDeadlineTime, 0),
+		CreatorUnclaimedFee:  md.CreatorUnclaimedFee,
+		PlatformUnclaimedFee: md.PlatformUnclaimedFee,
+		CreatedAt:            time.Unix(md.CreatedAt, 0),
+		UpdatedAt:            time.Unix(md.UpdatedAt, 0),
 	}
 }
 
@@ -479,7 +448,7 @@ func (s *Server) handleGetMarket(w http.ResponseWriter, r *http.Request) {
 // @Tags Markets
 // @Accept json
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Param body body markets.CreateMarketRequest true "Create market payload"
 // @Success 201 {object} marketResponse
 // @Failure 400 {object} errorResponse
@@ -496,8 +465,8 @@ func (s *Server) handleCreateMarket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	programID := gsolana.MustPublicKeyFromBase58(s.cfg.ProgramID)
-	marketID := solana.StableMarketID(req.Title + req.MetadataURL + time.Now().UTC().String())
-	derived, err := solana.DeriveAddresses(programID, marketID)
+	marketID := solana.StableMarketID(req.Title + req.MetadataCID + req.CloseTime.UTC().String())
+	marketPDA, err := solana.DeriveMarketPDA(programID, marketID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -508,25 +477,30 @@ func (s *Server) handleCreateMarket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
+	entityID, err := s.nextSnowflakeID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate market entity ID")
+		return
+	}
 	market := markets.Market{
-		ID:              uuid.NewString(),
-		MarketID:        marketID,
-		MarketPDA:       derived.MarketPDA.String(),
-		MetadataURL:     req.MetadataURL,
-		CollateralMint:  collateralMint,
-		CollateralVault: derived.CollateralVault.String(),
-		YesMint:         derived.YesMint.String(),
-		NoMint:          derived.NoMint.String(),
-		Title:           req.Title,
-		Description:     req.Description,
-		Category:        req.Category,
-		ImageURL:        req.ImageURL,
-		Status:          markets.MarketStatusOpen,
-		Outcome:         markets.MarketOutcomeUndecided,
-		Resolution:      req.Resolution,
-		CloseTime:       req.CloseTime,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ID:                entityID,
+		MarketID:          marketID,
+		MarketPDA:         marketPDA.String(),
+		MetadataCID:       req.MetadataCID,
+		MetadataURL:       req.MetadataURL,
+		CollateralMint:    collateralMint,
+		Title:             req.Title,
+		Description:       req.Description,
+		Category:          req.Category,
+		ImageURL:          req.ImageURL,
+		Status:            markets.MarketStatusOpen,
+		Outcome:           markets.MarketOutcomeUndecided,
+		Resolution:        req.Resolution,
+		CloseTime:         req.CloseTime,
+		ResolveAfterTime:  req.ResolveAfterTime,
+		ClaimDeadlineTime: req.ClaimDeadlineTime,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if err := s.markets.Save(r.Context(), market); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -708,7 +682,7 @@ func applyTokenAction(kind string, current positionSnapshot, account walletAccou
 // @Tags Orders
 // @Accept json
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Param body body orders.PlaceOrderRequest true "Place order payload"
 // @Success 202 {object} placeOrderAcceptedResponse
 // @Failure 400 {object} errorResponse
@@ -726,29 +700,31 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, req.WalletAddress)
+	walletHint := req.WalletAddress
+	if walletHint == "" {
+		walletHint = req.User
+	}
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, walletHint)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// 新的 Borsh 验证逻辑
-	intent, intentBytes, err := validateBorshOrderIntent(req, walletAddress)
-	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, errOrderSignatureInvalid) || errors.Is(err, errOrderWalletMismatch) {
-			status = http.StatusUnauthorized
-		}
-		writeError(w, status, err.Error())
-		return
-	}
-	_ = intent // 保留 intent 以便后续使用 (Redis 余额预扣等)
-
-	market, err := s.markets.Get(r.Context(), req.MarketID)
+	market, err := s.resolveMarketForOrder(r.Context(), req)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, markets.ErrMarketNotFound) {
 			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	var intentBytes []byte
+	req, intentBytes, err = s.normalizePlaceOrderRequest(req, market, walletAddress)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errOrderWalletMismatch) {
+			status = http.StatusUnauthorized
 		}
 		writeError(w, status, err.Error())
 		return
@@ -781,46 +757,26 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 对于限价买入订单，在发布命令前锁定余额
-	lockAmount := int64(0)
-	if strings.EqualFold(req.OrderType, "limit") && strings.EqualFold(req.OriginalAction, "buy") {
-		requiredUnits, err := requiredCollateralUnits(req)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		lockAmount = int64(requiredUnits)
-
-		// 使用 Redis Lua 脚本原子性锁定余额
-		if s.redisClient != nil {
-			success, lockedAmount, err := s.lockBalanceAtomic(r.Context(), walletAddress, lockAmount)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to lock balance: "+err.Error())
-				return
-			}
-			if !success {
-				writeError(w, http.StatusConflict, fmt.Sprintf("insufficient balance: available=%d, required=%d", lockedAmount, lockAmount))
-				return
-			}
-
-			// 持久化锁定记录到数据库
-			if err := s.persistOrderLock(r.Context(), orderID, walletAddress, req.MarketID, lockAmount); err != nil {
-				// 回滚 Redis 锁定
-				_, _, _ = s.releaseBalanceAtomic(r.Context(), walletAddress, lockAmount)
-				writeError(w, http.StatusInternalServerError, "failed to persist order lock: "+err.Error())
-				return
-			}
-		}
-	}
-
-	// 幂等 key 处理 (优先从 header 取，其次用 nonce 作为 idempotency key)
+	// 幂等 key 与 trace id 均要求前端显式传入，且使用雪花算法生成。
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idempotencyKey == "" {
-		idempotencyKey = fmt.Sprintf("%d", req.Nonce)
+		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	traceID := strings.TrimSpace(r.Header.Get("X-Trace-Id"))
+	if traceID == "" {
+		writeError(w, http.StatusBadRequest, "X-Trace-Id header is required")
+		return
 	}
 
-	commandID := uuid.NewString()
-	traceID := commandID
+	commandID, err := s.nextSnowflakeID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate command ID")
+		return
+	}
+	cmd.CommandID = commandID
+	cmd.TraceID = traceID
+	cmd.IdempotencyKey = idempotencyKey
 
 	envelope := protocol.CommandEnvelope[protocol.PlaceOrderCommand]{
 		ID:             commandID,
@@ -844,12 +800,6 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 			code = "command_bus_not_configured"
 		}
 
-		// 发布失败时，释放已锁定的余额
-		if lockAmount > 0 {
-			_, _, _ = s.releaseBalanceAtomic(r.Context(), walletAddress, lockAmount)
-			_ = s.deleteOrderLock(r.Context(), orderID)
-		}
-
 		writeJSON(w, status, map[string]any{"code": code, "message": message})
 		return
 	}
@@ -859,10 +809,119 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		"message":         "order command accepted",
 		"command_id":      envelope.ID,
 		"market_id":       strconv.FormatUint(envelope.MarketID, 10),
-		"order_id":        strconv.FormatUint(cmd.OrderID, 10),
+		"order_id":        strconv.FormatUint(cmd.Execution.OrderID, 10),
 		"idempotency_key": envelope.IdempotencyKey,
 		"tx_request":      tx,
 	})
+}
+
+func (s *Server) resolveMarketForOrder(ctx context.Context, req orders.PlaceOrderRequest) (markets.Market, error) {
+	if req.MarketID != 0 {
+		return s.markets.Get(ctx, req.MarketID)
+	}
+	raw := strings.TrimSpace(req.Market)
+	if raw == "" {
+		return markets.Market{}, errors.New("market or market_id is required")
+	}
+	list, err := s.markets.List(ctx)
+	if err != nil {
+		return markets.Market{}, err
+	}
+	for _, market := range list {
+		if strings.EqualFold(strings.TrimSpace(market.MarketPDA), raw) {
+			return market, nil
+		}
+	}
+	return markets.Market{}, markets.ErrMarketNotFound
+}
+
+func (s *Server) normalizePlaceOrderRequest(req orders.PlaceOrderRequest, market markets.Market, authenticatedWallet string) (orders.PlaceOrderRequest, []byte, error) {
+	if strings.TrimSpace(req.User) != strings.TrimSpace(authenticatedWallet) {
+		return req, nil, errOrderWalletMismatch
+	}
+	if req.Signature == "" {
+		return req, nil, errors.New("signature is required")
+	}
+	if req.Version == 0 {
+		req.Version = 1
+	}
+	if req.OrderType != "limit" && req.OrderType != "market" {
+		return req, nil, errors.New("order_type must be limit or market")
+	}
+	if req.Side != "buy" && req.Side != "sell" {
+		return req, nil, errors.New("side must be buy or sell")
+	}
+	if req.Outcome != "yes" && req.Outcome != "no" {
+		return req, nil, errors.New("outcome must be yes or no")
+	}
+	req.MarketID = market.MarketID
+	req.WalletAddress = req.User
+	req.OriginalAction = req.Side
+	req.OriginalOutcome = req.Outcome
+	normalizedSide, normalizedPriceTick, err := normalizeToYesBook(req.Side, req.Outcome, req.LimitPrice)
+	if err != nil {
+		return req, nil, err
+	}
+	req.OriginalPriceTick = uint8(req.LimitPrice)
+	req.NormalizedSide = normalizedSide
+	req.NormalizedPriceTick = normalizedPriceTick
+	req.Side = normalizedSide
+	req.PriceTick = uint8(normalizedPriceTick)
+	if req.OrderType == "market" && req.OriginalAction == "buy" {
+		req.QtyLots = 0
+		req.SpendAmount = req.TotalAmount
+	} else {
+		req.QtyLots = req.TotalAmount
+		req.SpendAmount = 0
+	}
+	req.ExpireTime = req.ExpiryTs
+
+	programID, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.ProgramID))
+	if err != nil {
+		return req, nil, errors.New("program_id is not a valid solana address")
+	}
+	marketPubkey, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.Market))
+	if err != nil {
+		return req, nil, errors.New("market is not a valid solana address")
+	}
+	userPubkey, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.User))
+	if err != nil {
+		return req, nil, errors.New("user is not a valid solana address")
+	}
+	intentBytes, err := buildRawOrderIntentBytes(req, programID, marketPubkey, userPubkey)
+	if err != nil {
+		return req, nil, err
+	}
+	return req, intentBytes, nil
+}
+
+func normalizeToYesBook(side string, outcome string, limitPrice uint64) (string, uint64, error) {
+	side = strings.ToLower(strings.TrimSpace(side))
+	outcome = strings.ToLower(strings.TrimSpace(outcome))
+	if side != "buy" && side != "sell" {
+		return "", 0, errors.New("side must be buy or sell")
+	}
+	if outcome != "yes" && outcome != "no" {
+		return "", 0, errors.New("outcome must be yes or no")
+	}
+	if limitPrice < 1 || limitPrice > 99 {
+		return "", 0, errors.New("limit_price must be between 1 and 99")
+	}
+	if outcome == "yes" {
+		return side, limitPrice, nil
+	}
+	if side == "buy" {
+		return "sell", 100 - limitPrice, nil
+	}
+	return "buy", 100 - limitPrice, nil
+}
+
+func (s *Server) nextSnowflakeID() (string, error) {
+	id, err := s.sonyflake.NextID()
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(id, 10), nil
 }
 
 func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRequest, market markets.Market, walletAddress string) error {
@@ -952,7 +1011,7 @@ func requiredCollateralUnits(req orders.PlaceOrderRequest) (uint64, error) {
 	if req.QtyLots > max/uint64(req.OriginalPriceTick) {
 		return 0, errors.New("order amount too large")
 	}
-	return (req.QtyLots * uint64(req.OriginalPriceTick)) / 100, nil
+	return (req.QtyLots*uint64(req.OriginalPriceTick) + 99) / 100, nil
 }
 
 func (s *Server) getCachedVUSDCUnits(ctx context.Context, walletAddress string) (uint64, error) {
@@ -980,47 +1039,11 @@ func (s *Server) getCachedVUSDCUnits(ctx context.Context, walletAddress string) 
 }
 
 func (s *Server) fetchOutcomeLotsFromRPC(ctx context.Context, market markets.Market, walletAddress string, outcome string) (uint64, error) {
-	if s.rpcClient == nil {
-		return 0, errors.New("rpc client not configured")
-	}
-	wallet, err := gsolana.PublicKeyFromBase58(walletAddress)
-	if err != nil {
-		return 0, err
-	}
-	mintAddress := market.YesMint
-	if strings.EqualFold(outcome, "no") {
-		mintAddress = market.NoMint
-	}
-	mint := gsolana.MustPublicKeyFromBase58(mintAddress)
-	tokenProgramID, err := detectMintTokenProgram(ctx, s.rpcClient, mint)
-	if err != nil {
-		return 0, err
-	}
-	ata, err := findAssociatedTokenAddress(wallet, mint, tokenProgramID)
-	if err != nil {
-		return 0, err
-	}
-	balance, err := s.rpcClient.GetTokenAccountBalance(ctx, ata, rpc.CommitmentProcessed)
-	if err != nil {
-		if isMissingTokenAccountError(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	rawAmount, err := strconv.ParseUint(balance.Value.Amount, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	divisor := uint64(1)
-	if balance.Value.Decimals > 2 {
-		for i := uint8(0); i < balance.Value.Decimals-2; i++ {
-			divisor *= 10
-		}
-	}
-	if divisor == 0 {
-		divisor = 1
-	}
-	return rawAmount / divisor, nil
+	_ = ctx
+	_ = market
+	_ = walletAddress
+	_ = outcome
+	return 0, errors.New("token-mint based position lookup is no longer supported")
 }
 
 type positionSnapshot struct {
@@ -1120,18 +1143,7 @@ func (s *Server) getOrInitWalletAccountSnapshot(ctx context.Context, walletAddre
 		_ = s.upsertWalletAccountSnapshot(ctx, walletAddress, snapshot)
 		return snapshot, nil
 	}
-	free, err := s.fetchVUSDCUnitsFromRPC(ctx, walletAddress)
-	if err != nil {
-		return walletAccountSnapshot{}, err
-	}
-	snapshot := walletAccountSnapshot{
-		CollateralTotalUnits: free,
-		CollateralFreeUnits:  free,
-	}
-	if err := s.upsertWalletAccountSnapshot(ctx, walletAddress, snapshot); err != nil {
-		return walletAccountSnapshot{}, err
-	}
-	return snapshot, nil
+	return walletAccountSnapshot{}, nil
 }
 
 func (s *Server) loadWalletAccountSnapshotFromDB(ctx context.Context, walletAddress string) (walletAccountSnapshot, error) {
@@ -1274,14 +1286,7 @@ func (s *Server) getOrInitPositionSnapshot(ctx context.Context, market markets.M
 		_ = s.upsertPositionSnapshot(ctx, market.MarketID, walletAddress, snapshot)
 		return snapshot, nil
 	}
-	snapshot, err := s.fetchPositionSnapshotFromRPC(ctx, market, walletAddress)
-	if err != nil {
-		return positionSnapshot{}, err
-	}
-	if err := s.upsertPositionSnapshot(ctx, market.MarketID, walletAddress, snapshot); err != nil {
-		return positionSnapshot{}, err
-	}
-	return snapshot, nil
+	return positionSnapshot{}, nil
 }
 
 func (s *Server) fetchPositionSnapshotFromRPC(ctx context.Context, market markets.Market, walletAddress string) (positionSnapshot, error) {
@@ -1386,7 +1391,7 @@ func isMissingTokenAccountError(err error) bool {
 // @Summary Cancel order
 // @Tags Orders
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Param orderId path string true "Order ID"
 // @Param market_id query string true "Market ID"
 // @Success 202 {object} cancelOrderAcceptedResponse
@@ -1414,7 +1419,11 @@ func (s *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "orderId path parameter is required")
 		return
 	}
-	commandID := uuid.NewString()
+	commandID, err := s.nextSnowflakeID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate cancel command ID")
+		return
+	}
 	envelope := protocol.CommandEnvelope[protocol.CancelOrderCommand]{
 		ID:             commandID,
 		Type:           protocol.CommandTypeCancelOrder,
@@ -1468,7 +1477,7 @@ func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's projected position
 // @Tags Positions
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Param marketId path string true "Market ID"
 // @Success 200 {object} positionResponse
 // @Failure 400 {object} errorResponse
@@ -1511,7 +1520,7 @@ func (s *Server) handlePosition(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's trading account balance
 // @Tags Positions
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Success 200 {object} walletAccountResponse
 // @Failure 401 {object} errorResponse
 // @Router /api/wallet-account [get]
@@ -1537,7 +1546,7 @@ func (s *Server) handleWalletAccount(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's open orders
 // @Tags Orders
 // @Produce json
-// @Security PrivyToken
+// @Security BearerAuth
 // @Param marketId path string true "Market ID"
 // @Success 200 {object} openOrdersResponse
 // @Failure 401 {object} errorResponse
@@ -1592,21 +1601,6 @@ func (s *Server) resolveAuthenticatedWalletAddress(r *http.Request, hintedWallet
 	}
 	if wallet := strings.TrimSpace(user.SolanaAddress); wallet != "" {
 		return wallet, nil
-	}
-
-	rawToken := authTokenFromRequest(r)
-	if rawToken != "" {
-		resolved, err := s.resolveSolanaAddressFromPrivy(r.Context(), rawToken, r.Header.Get("Origin"))
-		if err == nil && strings.TrimSpace(resolved) != "" {
-			return resolved, nil
-		}
-		if err != nil && strings.TrimSpace(hintedWallet) != "" {
-			return "", fmt.Errorf("unable to resolve authenticated wallet from privy token: %w", err)
-		}
-	}
-
-	if strings.TrimSpace(hintedWallet) != "" {
-		return "", errors.New("unable to resolve authenticated wallet from privy token")
 	}
 	return "", errors.New("authenticated solana wallet is required")
 }
@@ -1789,6 +1783,21 @@ type OrderIntentBorsh struct {
 	Nonce             uint64
 }
 
+type RawOrderIntentV1 struct {
+	Version     uint8
+	ChainID     uint16
+	ProgramID   [32]byte
+	Market      [32]byte
+	User        [32]byte
+	Nonce       uint64
+	Side        uint8
+	Outcome     uint8
+	OrderType   uint8
+	LimitPrice  uint64
+	TotalAmount uint64
+	ExpiryTs    int64
+}
+
 // serializeOrderIntentBorsh 序列化订单意图为 110 字节数组
 func serializeOrderIntentBorsh(intent *OrderIntentBorsh) ([]byte, error) {
 	if intent == nil {
@@ -1844,9 +1853,59 @@ func uint64ToLEBytes(v uint64) []byte {
 		byte(v >> 32), byte(v >> 40), byte(v >> 48), byte(v >> 56)}
 }
 
+func uint16ToLEBytes(v uint16) []byte {
+	return []byte{byte(v), byte(v >> 8)}
+}
+
+func serializeRawOrderIntentV1(intent *RawOrderIntentV1) ([]byte, error) {
+	if intent == nil {
+		return nil, errors.New("intent is nil")
+	}
+	buf := make([]byte, 0, 134)
+	buf = append(buf, intent.Version)
+	buf = append(buf, uint16ToLEBytes(intent.ChainID)...)
+	buf = append(buf, intent.ProgramID[:]...)
+	buf = append(buf, intent.Market[:]...)
+	buf = append(buf, intent.User[:]...)
+	buf = append(buf, uint64ToLEBytes(intent.Nonce)...)
+	buf = append(buf, intent.Side)
+	buf = append(buf, intent.Outcome)
+	buf = append(buf, intent.OrderType)
+	buf = append(buf, uint64ToLEBytes(intent.LimitPrice)...)
+	buf = append(buf, uint64ToLEBytes(intent.TotalAmount)...)
+	buf = append(buf, uint64ToLEBytes(uint64(intent.ExpiryTs))...)
+	if len(buf) != 134 {
+		return nil, fmt.Errorf("serialized size mismatch: expected 134, got %d", len(buf))
+	}
+	return buf, nil
+}
+
 func buildOrderSignatureMessage(messageHash []byte) []byte {
 	hexHash := hex.EncodeToString(messageHash)
 	return []byte(hexHash)
+}
+
+func buildRawOrderIntentBytes(
+	req orders.PlaceOrderRequest,
+	programID gsolana.PublicKey,
+	marketPubkey gsolana.PublicKey,
+	userPubkey gsolana.PublicKey,
+) ([]byte, error) {
+	intent := settlement.OrderIntentV1{
+		Version:     req.Version,
+		ChainID:     req.ChainID,
+		ProgramID:   programID,
+		Market:      marketPubkey,
+		User:        userPubkey,
+		Side:        settlement.Side(mapSideToUint8(req.OriginalAction)),
+		Outcome:     settlement.Outcome(mapOutcomeToUint8(req.OriginalOutcome)),
+		OrderType:   settlement.OrderType(mapOrderTypeToUint8(req.OrderType)),
+		LimitPrice:  req.LimitPrice,
+		TotalAmount: req.TotalAmount,
+		Nonce:       req.Nonce,
+		ExpiryTs:    req.ExpiryTs,
+	}
+	return intent.Serialize(), nil
 }
 
 // validateBorshOrderIntent 验证 Borsh 订单意图签名
@@ -1891,7 +1950,7 @@ func validateBorshOrderIntent(req orders.PlaceOrderRequest, authenticatedWallet 
 	}
 
 	// 根据订单类型验证字段组合
-	if req.OrderType == "limit" || (req.OrderType == "market" && req.Side == "sell") {
+	if req.OrderType == "limit" || (req.OrderType == "market" && req.OriginalAction == "sell") {
 		// 限价单或市价卖出：QtyLots 必须 > 0，SpendAmount 必须 = 0
 		if req.QtyLots == 0 {
 			return nil, nil, errors.New("qty_lots must be greater than 0 for limit/market sell order")
@@ -1900,7 +1959,7 @@ func validateBorshOrderIntent(req orders.PlaceOrderRequest, authenticatedWallet 
 			return nil, nil, errors.New("spend_amount must be 0 for limit/market sell order")
 		}
 	}
-	if req.OrderType == "market" && req.Side == "buy" {
+	if req.OrderType == "market" && req.OriginalAction == "buy" {
 		// 市价买入：SpendAmount 必须 > 0，QtyLots 必须 = 0
 		if req.SpendAmount == 0 {
 			return nil, nil, errors.New("spend_amount must be greater than 0 for market buy order")
@@ -1929,8 +1988,29 @@ func validateBorshOrderIntent(req orders.PlaceOrderRequest, authenticatedWallet 
 		return nil, nil, errors.New("wallet_address is not a valid solana address")
 	}
 
+	programID, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.ProgramID))
+	if err != nil {
+		return nil, nil, errors.New("program_id is not a valid solana address")
+	}
+	marketPubkey, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.Market))
+	if err != nil {
+		return nil, nil, errors.New("market is not a valid solana address")
+	}
+	intentBytes, err := buildRawOrderIntentBytes(req, programID, marketPubkey, pubkey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to serialize intent: %w", err)
+	}
+	parsedIntent, err := settlement.ParseOrderIntentV1(intentBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse serialized intent: %w", err)
+	}
+	signMessage := parsedIntent.SignableMessage()
+	if !ed25519.Verify(ed25519.PublicKey(pubkey.Bytes()), signMessage, signatureBytes) {
+		return nil, nil, errOrderSignatureInvalid
+	}
+
 	intent := &OrderIntentBorsh{
-		ProgramID:         [32]byte{},
+		ProgramID:         [32]byte(programID.Bytes()),
 		WalletAddress:     [32]byte(pubkey.Bytes()),
 		MarketID:          req.MarketID,
 		OriginalAction:    mapSideToUint8(req.OriginalAction),
@@ -1944,23 +2024,6 @@ func validateBorshOrderIntent(req orders.PlaceOrderRequest, authenticatedWallet 
 		ExpireTime:        req.ExpireTime,
 		Nonce:             req.Nonce,
 	}
-
-	intentBytes, err := serializeOrderIntentBorsh(intent)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to serialize intent: %w", err)
-	}
-
-	// Keccak256 哈希
-	hash := sha3.NewLegacyKeccak256()
-	hash.Write(intentBytes)
-	messageHash := hash.Sum(nil)
-
-	// Ed25519 验签：唯一合法签名对象为 utf8(hex(keccak256(borsh(intent))))。
-	signMessage := buildOrderSignatureMessage(messageHash)
-	if !ed25519.Verify(ed25519.PublicKey(pubkey.Bytes()), signMessage, signatureBytes) {
-		return nil, nil, errOrderSignatureInvalid
-	}
-
 	return intent, intentBytes, nil
 }
 
@@ -2000,22 +2063,30 @@ func mapOrderTypeToUint8(orderType string) uint8 {
 // buildPlaceOrderCommandV1 构建新的 PlaceOrderCommand (根据 orderDesign.md)
 func buildPlaceOrderCommandV1(req orders.PlaceOrderRequest, intentBytes []byte, orderID uint64) protocol.PlaceOrderCommand {
 	return protocol.PlaceOrderCommand{
-		OrderID:           orderID,
-		MarketID:          req.MarketID,
-		WalletAddress:     req.WalletAddress,
-		OriginalAction:    protocol.Side(strings.ToLower(strings.TrimSpace(req.OriginalAction))),
-		OriginalOutcome:   protocol.Outcome(strings.ToLower(strings.TrimSpace(req.OriginalOutcome))),
-		OriginalPriceTick: req.OriginalPriceTick,
-		Side:              protocol.Side(strings.ToLower(strings.TrimSpace(req.Side))),
-		OrderType:         protocol.OrderType(strings.ToLower(strings.TrimSpace(req.OrderType))),
-		PriceTick:         req.PriceTick,
-		QtyLots:           req.QtyLots,
-		SpendAmount:       req.SpendAmount,
-		ExpireTime:        req.ExpireTime,
-		Signature:         req.Signature,
-		Nonce:             req.Nonce,
-		IntentBytesHex:    hex.EncodeToString(intentBytes),
-		Timestamp:         time.Now().Unix(),
+		CommandID:      "",
+		TraceID:        "",
+		IdempotencyKey: "",
+		Timestamp:      time.Now().Unix(),
+		MarketID:       req.MarketID,
+		MarketPDA:      req.Market,
+		Execution: protocol.PlaceOrderExecution{
+			OrderID:             orderID,
+			WalletAddress:       req.WalletAddress,
+			OriginalAction:      strings.ToLower(strings.TrimSpace(req.OriginalAction)),
+			OriginalOutcome:     strings.ToLower(strings.TrimSpace(req.OriginalOutcome)),
+			OriginalPriceTick:   req.OriginalPriceTick,
+			OrderType:           strings.ToLower(strings.TrimSpace(req.OrderType)),
+			NormalizedSide:      strings.ToLower(strings.TrimSpace(req.NormalizedSide)),
+			NormalizedPriceTick: uint8(req.NormalizedPriceTick),
+			QtyLots:             req.QtyLots,
+			SpendAmount:         req.SpendAmount,
+			ExpireTime:          req.ExpireTime,
+			Nonce:               req.Nonce,
+		},
+		Settlement: protocol.SettlementPayload{
+			IntentBytesHex: hex.EncodeToString(intentBytes),
+			Signature:      req.Signature,
+		},
 	}
 }
 
@@ -2023,8 +2094,17 @@ func validateCreateMarket(req markets.CreateMarketRequest) error {
 	if req.Title == "" {
 		return errors.New("title is required")
 	}
+	if strings.TrimSpace(req.MetadataCID) == "" {
+		return errors.New("metadata_cid is required")
+	}
 	if req.CloseTime.IsZero() {
 		return errors.New("close_time is required")
+	}
+	if req.ClaimDeadlineTime.IsZero() {
+		return errors.New("claim_deadline_time is required")
+	}
+	if !req.ClaimDeadlineTime.After(req.CloseTime) {
+		return errors.New("claim_deadline_time must be later than close_time")
 	}
 	switch req.Resolution.Mode {
 	case markets.ResolutionModeCreator:
@@ -2035,8 +2115,11 @@ func validateCreateMarket(req markets.CreateMarketRequest) error {
 		if req.Resolution.OracleFeed == "" {
 			return errors.New("resolution.oracle_feed is required for pyth markets")
 		}
-		if req.Resolution.ObservationTime.IsZero() {
-			return errors.New("resolution.oracle_observation_time is required for pyth markets")
+		if req.ResolveAfterTime.IsZero() {
+			return errors.New("resolve_after_time is required for pyth markets")
+		}
+		if req.Resolution.OracleTarget == 0 {
+			return errors.New("resolution.oracle_target_price is required for pyth markets")
 		}
 	default:
 		return errors.New("resolution.mode must be creator or pyth")
@@ -2167,7 +2250,7 @@ func (s *Server) releaseBalanceAtomic(ctx context.Context, walletAddress string,
 // persistOrderLock 持久化订单锁定记录到数据库
 func (s *Server) persistOrderLock(ctx context.Context, orderID uint64, walletAddress string, marketID uint64, lockedAmount int64) error {
 	if s.dbPool == nil {
-		return errors.New("database pool not configured")
+		return nil
 	}
 
 	_, err := s.dbPool.Exec(ctx, `
@@ -2182,7 +2265,7 @@ func (s *Server) persistOrderLock(ctx context.Context, orderID uint64, walletAdd
 // deleteOrderLock 删除订单锁定记录
 func (s *Server) deleteOrderLock(ctx context.Context, orderID uint64) error {
 	if s.dbPool == nil {
-		return errors.New("database pool not configured")
+		return nil
 	}
 
 	_, err := s.dbPool.Exec(ctx, `

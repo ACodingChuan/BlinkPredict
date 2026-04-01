@@ -49,11 +49,11 @@ export const PriceChart = ({ market, outcome }: { market: Market; outcome: "yes"
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data) as Partial<MarketTradeSocketMessage>;
-          if (payload.market_id !== market.market_id || !payload.trade_id) return;
+          if (payload.type !== "market.trade.executed" || payload.market_id !== market.market_id || !payload.payload?.trade_id) return;
           const point = {
-            timestamp: payload.executed_at || new Date().toISOString(),
-            price: payload.price_tick || "0",
-            quantity: payload.match_qty || "0",
+            timestamp: payload.payload.executed_at || new Date().toISOString(),
+            price: payload.payload.price_tick || "0",
+            quantity: payload.payload.fill_amount || "0",
           };
           setHistory((current) => {
             if (range === "ALL") return current;

@@ -40,7 +40,7 @@ export const RecentTrades = ({ marketId }: { marketId: string }) => {
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data) as Partial<MarketTradeSocketMessage>;
-          if (payload.market_id !== marketId || !payload.trade_id) return;
+          if (payload.type !== "market.trade.executed" || payload.market_id !== marketId || !payload.payload?.trade_id) return;
           const trade = toTradeItem(payload as MarketTradeSocketMessage);
           setTrades((current) => {
             const next = [trade, ...current.filter((item) => item.id !== trade.id)];
@@ -117,7 +117,7 @@ function formatPrice(value?: string): string {
 function formatQty(value?: string): string {
   const parsed = Number(value || "0");
   if (!Number.isFinite(parsed)) return "--";
-  return parsed.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return (parsed / 100).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 function formatTime(value?: string): string {
@@ -136,9 +136,9 @@ function buildMarketWSURL(marketId: string): string {
 
 function toTradeItem(payload: MarketTradeSocketMessage): TradeItem {
   return {
-    id: payload.trade_id,
-    price: payload.price_tick,
-    quantity: payload.match_qty,
-    executed_at: payload.executed_at,
+    id: payload.payload.trade_id,
+    price: payload.payload.price_tick,
+    quantity: payload.payload.fill_amount,
+    executed_at: payload.payload.executed_at,
   };
 }

@@ -7,31 +7,35 @@ import (
 // ConvertProtocolToPlaceOrderCommand 将protocol.PlaceOrderCommand转换为matching.PlaceOrderCommand
 func ConvertProtocolToPlaceOrderCommand(cmd protocol.PlaceOrderCommand) *PlaceOrderCommand {
 	side := uint8(SideBuy)
-	if cmd.Side == protocol.SideSell {
+	if protocol.Side(cmd.Execution.NormalizedSide) == protocol.SideSell {
 		side = SideSell
 	}
 
 	orderType := uint8(OrderTypeLimit)
-	if cmd.OrderType == protocol.OrderTypeMarket {
+	if protocol.OrderType(cmd.Execution.OrderType) == protocol.OrderTypeMarket {
 		orderType = OrderTypeMarket
 	}
 
 	return &PlaceOrderCommand{
-		OrderID:           cmd.OrderID,
+		CommandID:         cmd.CommandID,
+		TraceID:           cmd.TraceID,
+		IdempotencyKey:    cmd.IdempotencyKey,
+		OrderID:           cmd.Execution.OrderID,
 		MarketID:          cmd.MarketID,
-		WalletAddress:     cmd.WalletAddress,
-		OriginalAction:    toMatchingSide(cmd.OriginalAction),
-		OriginalOutcome:   toMatchingOutcome(cmd.OriginalOutcome),
-		OriginalPriceTick: cmd.OriginalPriceTick,
+		MarketPDA:         cmd.MarketPDA,
+		WalletAddress:     cmd.Execution.WalletAddress,
+		OriginalAction:    toMatchingSide(protocol.Side(cmd.Execution.OriginalAction)),
+		OriginalOutcome:   toMatchingOutcome(protocol.Outcome(cmd.Execution.OriginalOutcome)),
+		OriginalPriceTick: cmd.Execution.OriginalPriceTick,
 		Side:              side,
 		OrderType:         orderType,
-		PriceTick:         cmd.PriceTick,
-		QtyLots:           cmd.QtyLots,
-		SpendAmount:       cmd.SpendAmount,
-		ExpireTime:        cmd.ExpireTime,
-		Signature:         cmd.Signature,
-		IntentBytesHex:    cmd.IntentBytesHex,
-		Nonce:             cmd.Nonce,
+		PriceTick:         cmd.Execution.NormalizedPriceTick,
+		QtyLots:           cmd.Execution.QtyLots,
+		SpendAmount:       cmd.Execution.SpendAmount,
+		ExpireTime:        cmd.Execution.ExpireTime,
+		Signature:         cmd.Settlement.Signature,
+		IntentBytesHex:    cmd.Settlement.IntentBytesHex,
+		Nonce:             cmd.Execution.Nonce,
 		Timestamp:         cmd.Timestamp,
 	}
 }

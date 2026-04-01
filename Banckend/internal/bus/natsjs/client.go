@@ -14,6 +14,7 @@ type Config struct {
 	Domain    string
 	CmdStream string
 	EvtStream string
+	WhkStream string
 }
 
 type Client struct {
@@ -31,6 +32,9 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.EvtStream == "" {
 		cfg.EvtStream = "AP_EVT"
+	}
+	if cfg.WhkStream == "" {
+		cfg.WhkStream = "AP_WHK"
 	}
 
 	nc, err := nats.Connect(cfg.URL)
@@ -72,6 +76,9 @@ func (c *Client) EnsureStreams(_ context.Context) error {
 		return err
 	}
 	if err := c.ensureStream(c.cfg.EvtStream, []string{"evt.>"}, nats.LimitsPolicy); err != nil {
+		return err
+	}
+	if err := c.ensureStream(c.cfg.WhkStream, []string{"whk.>"}, nats.LimitsPolicy); err != nil {
 		return err
 	}
 	return nil
@@ -124,6 +131,10 @@ func (c *Client) publishJSON(ctx context.Context, subject string, msgID string, 
 		return fmt.Errorf("publish %s: %w", subject, err)
 	}
 	return nil
+}
+
+func (c *Client) PublishJSON(ctx context.Context, subject string, msgID string, payload any) error {
+	return c.publishJSON(ctx, subject, msgID, payload)
 }
 
 func (c *Client) PublishCoreJSON(subject string, payload any) error {

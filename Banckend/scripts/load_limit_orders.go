@@ -12,7 +12,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,19 +21,19 @@ import (
 )
 
 type placeOrderRequest struct {
-	MarketID       string `json:"market_id"`
-	WalletAddress  string `json:"wallet_address"`
-	Side           string `json:"side"`
-	Share          string `json:"share"`
-	OrderType      string `json:"order_type"`
-	PriceTick      int    `json:"price_tick"`
-	QtyLots        int64  `json:"qty_lots"`
-	ExpireTime     string `json:"expire_time"`
-	ClientOrderID  string `json:"client_order_id"`
-	IdempotencyKey string `json:"idempotency_key"`
-	SignatureNonce string `json:"signature_nonce"`
-	SignedAt       string `json:"signed_at"`
-	Signature      string `json:"signature"`
+	Version     uint8  `json:"version"`
+	ChainID     uint16 `json:"chain_id"`
+	ProgramID   string `json:"program_id"`
+	Market      string `json:"market"`
+	User        string `json:"user"`
+	Side        string `json:"side"`
+	Outcome     string `json:"outcome"`
+	OrderType   string `json:"order_type"`
+	LimitPrice  uint64 `json:"limit_price"`
+	TotalAmount uint64 `json:"total_amount"`
+	Nonce       string `json:"nonce"`
+	ExpiryTs    int64  `json:"expiry_ts"`
+	Signature   string `json:"signature"`
 }
 
 type result struct {
@@ -46,17 +45,19 @@ type result struct {
 func main() {
 	var (
 		apiBase     = flag.String("api", "http://localhost:8080/api", "API base URL")
-		marketID    = flag.String("market-id", "", "market id, e.g. 2222363171854875225")
+		marketPDA   = flag.String("market", "", "market PDA")
+		programID   = flag.String("program", "", "program id")
+		chainID     = flag.Uint("chain-id", 101, "chain id")
 		total       = flag.Int("total", 10000, "total order count")
 		concurrency = flag.Int("concurrency", 200, "parallel workers")
 		timeoutSec  = flag.Int("timeout", 20, "per-request timeout seconds")
 		expireHours = flag.Int("expire-hours", 2, "limit order expire hours from now")
-		qtyLots     = flag.Int64("qty-lots", 100, "order qty in lots (100 lots = 1.00 share)")
+		amountUnits = flag.Uint64("total-amount", 100, "raw total amount units (100 = 1.00)")
 	)
 	flag.Parse()
 
-	if strings.TrimSpace(*marketID) == "" {
-		fmt.Fprintln(os.Stderr, "missing -market-id")
+	if strings.TrimSpace(*marketPDA) == "" || strings.TrimSpace(*programID) == "" {
+		fmt.Fprintln(os.Stderr, "missing -market or -program")
 		os.Exit(1)
 	}
 	if *total <= 0 || *concurrency <= 0 {
@@ -67,17 +68,9 @@ func main() {
 	privateKey := buildStablePrivateKey()
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	walletAddress := gsolana.PublicKeyFromBytes(publicKey).String()
-	privyToken := buildFakePrivyToken(walletAddress)
+	authToken := buildFakeAuthToken(walletAddress)
 
-	client := &http.Client{
-		Timeout: time.Duration(*timeoutSec) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        *concurrency * 2,
-			MaxIdleConnsPerHost: *concurrency * 2,
-			MaxConnsPerHost:     *concurrency * 2,
-		},
-	}
-
+	client := &http.Client{Timeout: time.Duration(*timeoutSec) * time.Second}
 	jobs := make(chan int, *concurrency)
 	results := make(chan result, *total)
 	var wg sync.WaitGroup
@@ -88,8 +81,10 @@ func main() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 			for idx := range jobs {
-				reqBody := buildRequest(idx, *marketID, walletAddress, *qtyLots, *expireHours, privateKey, rng)
-				out, err := submitOrder(context.Background(), client, strings.TrimRight(*apiBase, "/")+"/orders", privyToken, reqBody)
+				reqBody := buildRequest(idx, *marketPDA, *programID, uint16(*chainID), walletAddress, *amountUnits, *expireHours, rng)
+				idem := snowflakeLikeID(rng)
+				trace := snowflakeLikeID(rng)
+				out, err := submitOrder(context.Background(), client, strings.TrimRight(*apiBase, "/")+"/orders", authToken, reqBody, idem, trace)
 				if err != nil {
 					results <- result{err: err}
 					continue
@@ -111,47 +106,16 @@ func main() {
 
 	var accepted int64
 	var failed int64
-	statusCount := map[int]int64{}
-	errSamples := make([]string, 0, 10)
 	for out := range results {
-		if out.err != nil {
+		if out.err != nil || out.status != http.StatusAccepted {
 			atomic.AddInt64(&failed, 1)
-			if len(errSamples) < 10 {
-				errSamples = append(errSamples, out.err.Error())
-			}
 			continue
 		}
-		statusCount[out.status]++
-		if out.status == http.StatusAccepted {
-			atomic.AddInt64(&accepted, 1)
-			continue
-		}
-		atomic.AddInt64(&failed, 1)
-		if len(errSamples) < 10 {
-			body := strings.TrimSpace(out.body)
-			if len(body) > 200 {
-				body = body[:200] + "..."
-			}
-			errSamples = append(errSamples, fmt.Sprintf("status=%d body=%s", out.status, body))
-		}
+		atomic.AddInt64(&accepted, 1)
 	}
 
 	elapsed := time.Since(start)
-	rps := float64(*total) / elapsed.Seconds()
-
-	fmt.Printf("\nLoad test done\n")
-	fmt.Printf("- total: %d\n", *total)
-	fmt.Printf("- accepted(202): %d\n", accepted)
-	fmt.Printf("- failed: %d\n", failed)
-	fmt.Printf("- elapsed: %s\n", elapsed.Round(time.Millisecond))
-	fmt.Printf("- request rate: %.2f req/s\n", rps)
-	fmt.Printf("- status counts: %v\n", statusCount)
-	if len(errSamples) > 0 {
-		fmt.Printf("- sample errors:\n")
-		for _, sample := range errSamples {
-			fmt.Printf("  * %s\n", sample)
-		}
-	}
+	fmt.Printf("accepted=%d failed=%d elapsed=%s rps=%.2f\n", accepted, failed, elapsed.Round(time.Millisecond), float64(*total)/elapsed.Seconds())
 }
 
 func buildStablePrivateKey() ed25519.PrivateKey {
@@ -162,75 +126,55 @@ func buildStablePrivateKey() ed25519.PrivateKey {
 	return ed25519.NewKeyFromSeed(seed)
 }
 
-func buildFakePrivyToken(walletAddress string) string {
+func buildFakeAuthToken(walletAddress string) string {
 	header := map[string]any{"alg": "none", "typ": "JWT"}
 	payload := map[string]any{
-		"sub":   "did:privy:loadtest",
-		"email": "loadtest@example.com",
-		"linked_accounts": []map[string]string{
-			{
-				"type":       "wallet",
-				"chain_type": "solana",
-				"address":    walletAddress,
-			},
-		},
+		"sub":            "did:wallet:loadtest",
+		"solana_address": walletAddress,
 	}
 	encode := func(v any) string {
 		raw, _ := json.Marshal(v)
 		return base64.RawURLEncoding.EncodeToString(raw)
 	}
-	// Backend currently decodes claims without verifying JWT signature in local mode.
 	return encode(header) + "." + encode(payload) + ".loadtest"
 }
 
-func buildRequest(idx int, marketID string, walletAddress string, qtyLots int64, expireHours int, privateKey ed25519.PrivateKey, rng *rand.Rand) placeOrderRequest {
+func buildRequest(idx int, marketPDA, programID string, chainID uint16, walletAddress string, totalAmount uint64, expireHours int, rng *rand.Rand) placeOrderRequest {
 	side := "buy"
+	outcome := "yes"
 	if idx%2 == 1 {
 		side = "sell"
 	}
-
-	// Keep both sides around mid price to trigger matching under load.
-	priceTick := 58 + rng.Intn(5) // 58-62
-	expire := time.Now().UTC().Add(time.Duration(expireHours) * time.Hour).Format(time.RFC3339)
-	signedAt := time.Now().UTC().Format(time.RFC3339)
-	clientOrderID := fmt.Sprintf("load-%d-%d", idx, time.Now().UnixNano())
-	idem := fmt.Sprintf("idem-%d-%d", idx, time.Now().UnixNano())
-	nonce := fmt.Sprintf("nonce-%d-%d", idx, time.Now().UnixNano())
-
-	req := placeOrderRequest{
-		MarketID:       marketID,
-		WalletAddress:  walletAddress,
-		Side:           side,
-		Share:          "yes",
-		OrderType:      "limit",
-		PriceTick:      priceTick,
-		QtyLots:        qtyLots,
-		ExpireTime:     expire,
-		ClientOrderID:  clientOrderID,
-		IdempotencyKey: idem,
-		SignatureNonce: nonce,
-		SignedAt:       signedAt,
+	if idx%3 == 1 {
+		outcome = "no"
 	}
-	signPayload := strings.Join([]string{
-		"blinkpredict.order.v1",
-		"wallet_address=" + req.WalletAddress,
-		"market_id=" + req.MarketID,
-		"side=" + req.Side,
-		"share=" + req.Share,
-		"order_type=" + req.OrderType,
-		"price_tick=" + strconv.Itoa(req.PriceTick),
-		"qty_lots=" + strconv.FormatInt(req.QtyLots, 10),
-		"expire_time=" + req.ExpireTime,
-		"client_order_id=" + req.ClientOrderID,
-		"signature_nonce=" + req.SignatureNonce,
-		"signed_at=" + req.SignedAt,
-	}, "\n")
-	signature := ed25519.Sign(privateKey, []byte(signPayload))
-	req.Signature = base64.StdEncoding.EncodeToString(signature)
-	return req
+	priceUnits := uint64(3510 + rng.Intn(50))
+	nonce := snowflakeLikeID(rng)
+	expiry := time.Now().UTC().Add(time.Duration(expireHours) * time.Hour).Unix()
+	return placeOrderRequest{
+		Version:     1,
+		ChainID:     chainID,
+		ProgramID:   programID,
+		Market:      marketPDA,
+		User:        walletAddress,
+		Side:        side,
+		Outcome:     outcome,
+		OrderType:   "limit",
+		LimitPrice:  priceUnits,
+		TotalAmount: totalAmount,
+		Nonce:       nonce,
+		ExpiryTs:    expiry,
+		Signature:   base64.StdEncoding.EncodeToString(make([]byte, 64)),
+	}
 }
 
-func submitOrder(ctx context.Context, client *http.Client, url string, privyToken string, reqBody placeOrderRequest) (result, error) {
+func snowflakeLikeID(rng *rand.Rand) string {
+	now := uint64(time.Now().UnixMilli())
+	randPart := uint64(rng.Intn(1 << 22))
+	return fmt.Sprintf("%d", (now<<22)|randPart)
+}
+
+func submitOrder(ctx context.Context, client *http.Client, url string, authToken string, reqBody placeOrderRequest, idempotencyKey string, traceID string) (result, error) {
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return result{}, err
@@ -240,15 +184,15 @@ func submitOrder(ctx context.Context, client *http.Client, url string, privyToke
 		return result{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("privy-id-token", privyToken)
-	req.Header.Set("Idempotency-Key", reqBody.IdempotencyKey)
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+	req.Header.Set("X-Trace-Id", traceID)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return result{}, err
 	}
 	defer resp.Body.Close()
-
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return result{status: resp.StatusCode, body: string(raw)}, nil
 }

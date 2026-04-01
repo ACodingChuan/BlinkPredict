@@ -3,9 +3,9 @@
 // @description BlinkPredict backend API documentation. Import /api/openapi.json into Postman or FoxAPI.
 // @BasePath /
 // @schemes http https
-// @securityDefinitions.apikey PrivyToken
+// @securityDefinitions.apikey BearerAuth
 // @in header
-// @name privy-id-token
+// @name Authorization
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"blinkpredict/banckend/internal/auth"
 	"blinkpredict/banckend/internal/bootstrap"
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/cache"
@@ -25,10 +26,12 @@ import (
 	httpapi "blinkpredict/banckend/internal/http"
 	"blinkpredict/banckend/internal/indexer"
 	"blinkpredict/banckend/internal/logging"
+	"blinkpredict/banckend/internal/marketindexer"
 	"blinkpredict/banckend/internal/markets"
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/protocol"
 	"blinkpredict/banckend/internal/pusher"
+	"blinkpredict/banckend/internal/settlement"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
 	"blinkpredict/banckend/internal/writer"
@@ -49,6 +52,9 @@ func main() {
 
 	cfg := config.Load()
 	logging.Configure(cfg.LogLevel)
+	if _, err := auth.NewSessionManager(cfg); err != nil {
+		logger.Fatalf("auth session manager: %v", err)
+	}
 
 	var commandPublisher protocol.CommandPublisher = protocol.DisabledCommandPublisher{}
 	var natsClient *natsjs.Client
@@ -56,6 +62,7 @@ func main() {
 	var wsTicketStore *pusher.TicketStore
 	var pusherHub *pusher.Hub
 	var pusherService *pusher.Service
+	var settlementService *settlement.Service
 	var marketManager *matching.MarketManager
 	var err error
 	if cfg.NATSURL != "" {
@@ -64,6 +71,7 @@ func main() {
 			Domain:    cfg.NATSJSDomain,
 			CmdStream: cfg.NATSStreamCMD,
 			EvtStream: cfg.NATSStreamEVT,
+			WhkStream: cfg.NATSStreamWHK,
 		})
 		if err != nil {
 			logger.Fatalf("nats: %v", err)
@@ -80,7 +88,16 @@ func main() {
 		}
 
 		// 创建市场管理器
-		marketManager = matching.NewMarketManager(natsClient, nil)
+		marketManager = matching.NewMarketManager(natsClient, nil, matching.ManagerConfig{
+			Batch: matching.BatchConfig{
+				MaxFills:  cfg.MatcherBatchMaxFills,
+				MaxOrders: cfg.MatcherBatchMaxOrders,
+				MaxBytes:  cfg.MatcherBatchMaxBytes,
+				MaxAge:    cfg.MatcherBatchMaxAge,
+				IdleFlush: cfg.MatcherBatchIdleFlush,
+				FlushTick: cfg.MatcherBatchFlushTick,
+			},
+		})
 	} else {
 		logger.Warnf("NATS disabled (set NATS_URL to enable command bus)")
 	}
@@ -97,7 +114,16 @@ func main() {
 	marketRepo := markets.Repository(markets.NewPostgresRepository(pool))
 	logger.Infof("Markets repository: postgres (metadata reads/writes)")
 	if marketManager != nil {
-		marketManager = matching.NewMarketManager(natsClient, pool)
+		marketManager = matching.NewMarketManager(natsClient, pool, matching.ManagerConfig{
+			Batch: matching.BatchConfig{
+				MaxFills:  cfg.MatcherBatchMaxFills,
+				MaxOrders: cfg.MatcherBatchMaxOrders,
+				MaxBytes:  cfg.MatcherBatchMaxBytes,
+				MaxAge:    cfg.MatcherBatchMaxAge,
+				IdleFlush: cfg.MatcherBatchIdleFlush,
+				FlushTick: cfg.MatcherBatchFlushTick,
+			},
+		})
 	}
 
 	var matchingEngine matching.Engine = matching.NewDisabledEngine()
@@ -127,16 +153,23 @@ func main() {
 	// 初始化 Helius Webhook Handler
 	var webhookHandler *webhooks.HeliusHandler
 	if cfg.HeliusWebhookEnabled && cfg.HeliusWebhookSecret != "" {
-		if redisClient == nil || marketCache == nil {
-			logger.Warnf("Helius webhook enabled but Redis is disabled. Webhook requires Redis cache.")
+		if cfg.VUSDCMint == "" || cfg.GlobalVault == "" {
+			logger.Warnf("Helius webhook enabled but VUSDC_MINT/GLOBAL_VAULT is missing")
 		} else {
+			var sharedWallet *matching.SharedWalletManager
+			if marketManager != nil {
+				sharedWallet = marketManager.SharedWallet()
+			}
+			depositProjector := webhooks.NewDepositProjector(pool, redisClient, sharedWallet, &zerologLogger)
 			webhookHandler = webhooks.NewHeliusHandler(
-				marketRepo,
-				marketCache,
+				depositProjector,
 				&zerologLogger,
 				cfg.HeliusWebhookSecret,
+				cfg.VUSDCMint,
+				cfg.GlobalVault,
+				cfg.VUSDCDecimals,
 			)
-			logger.Infof("Helius webhook enabled (API key: %s...)", cfg.HeliusAPIKey[:8]+"...")
+			logger.Infof("Helius webhook enabled")
 		}
 	} else {
 		logger.Infof("Helius webhook disabled (set HELIUS_WEBHOOK_ENABLED=true to enable)")
@@ -146,23 +179,36 @@ func main() {
 	var alchemyHandler *webhooks.AlchemyHandler
 	if cfg.AlchemySigningKey != "" {
 		alchemyHandler = webhooks.NewAlchemyHandler(
-			marketRepo,
-			marketCache,
+			natsClient,
 			&zerologLogger,
 			cfg.AlchemySigningKey,
 			cfg.ProgramID,
-			cfg.SolanaRPCURL,
 		)
 		logger.Infof("Alchemy webhook enabled")
 	} else {
 		logger.Infof("Alchemy webhook disabled (set ALCHEMY_SIGNING_KEY to enable)")
+	}
+	if natsClient != nil {
+		indexConsumer := marketindexer.NewConsumer(natsClient.Conn(), pool, marketRepo, marketCache, &zerologLogger)
+		if err := indexConsumer.Start(ctx); err != nil {
+			logger.Fatalf("market index consumer: %v", err)
+		}
+		logger.Infof("Market index consumer started")
 	}
 	var boot *bootstrap.Coordinator
 	if natsClient != nil {
 		pusherHub = pusher.NewHub(cfg, wsTicketStore)
 		pusherService = pusher.NewService(natsClient, pusherHub)
 		pgWriter := writer.New(pool, natsClient, redisClient, "")
-		boot = bootstrap.NewCoordinator(pgWriter, marketManager, pusherService, cfg.MatcherTickInterval)
+		if cfg.SettlementRelayerKeypair != "" && cfg.ProgramID != "" {
+			programID := solana.MustPublicKeyFromBase58(cfg.ProgramID)
+			relayer, err := faucet.LoadKeypair(cfg.SettlementRelayerKeypair)
+			if err != nil {
+				logger.Fatalf("settlement relayer keypair: %v", err)
+			}
+			settlementService = settlement.NewService(natsClient, pool, cfg.SolanaRPCURL, programID, relayer, "")
+		}
+		boot = bootstrap.NewCoordinator(pgWriter, marketManager, pusherService, settlementService, cfg.MatcherTickInterval)
 		if err := boot.Start(ctx); err != nil {
 			logger.Fatalf("bootstrap: %v", err)
 		}

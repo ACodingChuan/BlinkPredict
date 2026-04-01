@@ -1,20 +1,21 @@
 import { Buffer } from "buffer";
 import { useState } from "react";
 import api from "@/app/utils/axiosInstance";
-import { Market, PlaceOrderCommandResponse, TransactionEnvelope } from "@/types/market";
+import { Market, OrderbookSnapshot, PlaceOrderCommandResponse, TransactionEnvelope } from "@/types/market";
 import { toast } from "sonner";
-import { usePrivy } from "@privy-io/react-auth";
-import { useSignAndSendTransaction, useSignMessage } from "@privy-io/react-auth/solana";
+import { usePrivy } from "@/lib/auth-client";
+import { useSignAndSendTransaction } from "@/hooks/useWalletTransactions";
 import { useUSDCStore } from "@/store/usdcStore";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
 import {
   buildOrderIntent,
   buildOrderSignatureMessage,
-  normalizeOrderParams,
+  encodeAmountToUnits,
+  encodePriceToTick,
   type BuildOrderIntentParams,
-  type NormalizedOrderParams,
 } from "@/lib/order-signature";
 import { PublicKey } from "@solana/web3.js";
+import { generateClientSnowflake } from "@/lib/snowflake";
 
 interface TradeParams {
   market: Market;
@@ -31,7 +32,6 @@ export const useTrading = () => {
   const [loading, setLoading] = useState(false);
   const { getAccessToken } = usePrivy();
   const { signAndSendTransaction } = useSignAndSendTransaction();
-  const { signMessage } = useSignMessage();
   const { wallet, walletAddress } = useCurrentSolanaWallet();
   const syncBalance = useUSDCStore((state) => state.syncBalance);
 
@@ -55,8 +55,6 @@ export const useTrading = () => {
     const raw = Buffer.from(payload.tx_message, "base64");
     await signAndSendTransaction({
       transaction: new Uint8Array(raw),
-      wallet,
-      chain: "solana:devnet",
     });
     toast.success(payload.message || "Transaction submitted");
     return true;
@@ -72,35 +70,18 @@ export const useTrading = () => {
   };
 
   const signOrderMessage = async (message: Uint8Array) => {
-    if (!wallet) {
+    if (!wallet?.signMessage) {
       toast.error("No wallet available for signing");
       return null;
     }
 
-    try {
-      const signedOutput = await wallet.signMessage({
-        message,
-      });
-      return Buffer.from(signedOutput.signature).toString("base64");
-    } catch (walletError) {
-      try {
-        const signedOutput = await signMessage({
-          message,
-          wallet,
-        });
-        return Buffer.from(signedOutput.signature).toString("base64");
-      } catch (hookError) {
-        console.error("wallet.signMessage failed", walletError);
-        console.error("privy signMessage failed", hookError);
-        throw hookError;
-      }
-    }
+    const signedOutput = await wallet.signMessage(message);
+    return Buffer.from(signedOutput).toString("base64");
   };
 
   const placeOrder = async ({ market, action, outcome, orderType, amount, limitPrice, expireTime, onAccepted }: TradeParams) => {
     setLoading(true);
     try {
-      // 处理 split/merge/claim 操作 (保持不变)
       if (orderType === "split" || orderType === "merge") {
         const token = await getAuthToken();
         if (!token) return false;
@@ -112,7 +93,7 @@ export const useTrading = () => {
             collateral_mint: market.collateral_mint,
             amount: Math.floor(Number(amount || "0") * 1_000_000),
           },
-          { headers: { "privy-id-token": token } },
+          { headers: { Authorization: `Bearer ${token}` } },
         );
         const ok = await maybeSendTransaction(data);
         if (ok) triggerBalanceSync();
@@ -125,24 +106,21 @@ export const useTrading = () => {
         const { data } = await api.post<TransactionEnvelope>(
           "/claims",
           { market_id: market.market_id, collateral_mint: market.collateral_mint, amount: 0 },
-          { headers: { "privy-id-token": token } },
+          { headers: { Authorization: `Bearer ${token}` } },
         );
         const ok = await maybeSendTransaction(data);
         if (ok) triggerBalanceSync();
         return ok;
       }
 
-      // 验证输入
       const parsedAmount = Number(amount || "0");
       if (parsedAmount <= 0) {
         toast.error("Amount must be greater than 0");
         return false;
       }
 
-      // 限价单价格验证
       if (orderType === "limit") {
-        const maybePriceTick = toPriceTick(limitPrice);
-        if (!maybePriceTick) {
+        if (!toPriceTick(limitPrice)) {
           toast.error("Limit price must be between 0.01 and 0.99");
           return false;
         }
@@ -152,89 +130,81 @@ export const useTrading = () => {
         }
       }
 
-      // 获取认证 token
       const token = await getAuthToken();
       if (!token) return false;
 
-      // 获取钱包地址
       if (!walletAddress) {
         toast.error("No Solana wallet connected");
         return false;
       }
 
-      // 归一化订单参数 (No -> Yes 转换)
-      const normalizedParams: NormalizedOrderParams = {
-        action,
-        outcome,
-        price: orderType === "limit" ? limitPrice : 0, // 市价单价格由滑点决定，这里传 0
-        amount: parsedAmount,
-        type: orderType as "limit" | "market",
-      };
-      const normalized = normalizeOrderParams(normalizedParams);
-
-      // 构建订单意图
-      const priceTick = normalized.priceTick;
-      const lotsOrAmount = normalized.lotsOrAmount;
-      const isMarketBuy = normalized.isMarketBuy;
-
-      // 市价单：买入用 spendAmount，卖出用 qtyLots
-      // 限价单：只用 qtyLots，spendAmount = 0
-      const qtyLots = isMarketBuy ? 0 : lotsOrAmount;
-      const spendAmount = isMarketBuy ? lotsOrAmount : 0;
-
-      // 计算 expireTime (Unix 秒级时间戳)
-      let expireTimeUnix = 0;
+      let expiryTs = 0;
       if (orderType === "limit" && expireTime) {
-        expireTimeUnix = Math.floor(new Date(expireTime).getTime() / 1000);
+        expiryTs = Math.floor(new Date(expireTime).getTime() / 1000);
       }
 
-      // 使用新的 Borsh 签名逻辑
+      const chainId = Number(process.env.NEXT_PUBLIC_CHAIN_ID || "101");
+      const programId = process.env.NEXT_PUBLIC_PROGRAM_ID;
+      if (!programId) {
+        toast.error("Missing NEXT_PUBLIC_PROGRAM_ID");
+        return false;
+      }
+      if (!market.market_pda) {
+        toast.error("Missing market PDA");
+        return false;
+      }
+
+      const limitPriceTick =
+        orderType === "market"
+          ? await resolveMarketProtectionTick(market.market_id, action, outcome)
+          : toPriceTick(limitPrice);
+      if (!limitPriceTick) {
+        toast.error(orderType === "market" ? "Unable to derive market protection price from orderbook" : "Limit price must be between 0.01 and 0.99");
+        return false;
+      }
+      const totalAmountUnits = encodeAmountToUnits(parsedAmount);
+
       const buildParams: BuildOrderIntentParams = {
-        walletAddress: new PublicKey(walletAddress),
-        marketId: market.market_id,
-        originalAction: normalized.originalAction,
-        originalOutcome: normalized.originalOutcome,
-        originalPriceTick: normalized.originalPriceTick,
-        side: normalized.side,
+        chainId,
+        programId: new PublicKey(programId),
+        market: new PublicKey(market.market_pda),
+        user: new PublicKey(walletAddress),
+        side: action,
+        outcome,
         orderType: orderType === "limit" ? "limit" : "market",
-        priceTick,
-        qtyLots,
-        spendAmount,
-        expireTime: expireTimeUnix,
+        limitPrice: limitPriceTick,
+        totalAmount: totalAmountUnits,
+        expiryTs,
       };
 
       const { intent, messageHash } = buildOrderIntent(buildParams);
       const signableMessage = buildOrderSignatureMessage(messageHash);
-
-      // 调用钱包签名。对外部钱包使用可读文本包裹，避免 Phantom 将原始二进制误判为 transaction payload。
       const signature = await signOrderMessage(signableMessage);
       if (!signature) {
         return false;
       }
       const nonce = intent.nonce.toString();
+      const idempotencyKey = generateClientSnowflake();
+      const traceId = generateClientSnowflake();
 
-      // 幂等 key
-      const idempotencyKey = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-
-      // 发送 HTTP 请求 (使用新的请求体结构)
       const { data } = await api.post<PlaceOrderCommandResponse & { code?: string }>(
         "/orders",
         {
-          market_id: market.market_id,
-          wallet_address: walletAddress,
-          original_action: normalized.originalAction,
-          original_outcome: normalized.originalOutcome,
-          original_price_tick: normalized.originalPriceTick,
-          side: normalized.side,
+          version: intent.version,
+          chain_id: chainId,
+          program_id: programId,
+          market: market.market_pda,
+          user: walletAddress,
+          side: action,
+          outcome,
           order_type: orderType,
-          price_tick: priceTick,
-          qty_lots: qtyLots,
-          spend_amount: spendAmount,
-          expire_time: expireTimeUnix,
+          limit_price: limitPriceTick,
+          total_amount: totalAmountUnits,
+          expiry_ts: expiryTs,
           nonce,
           signature,
         },
-        { headers: { "privy-id-token": token, "Idempotency-Key": idempotencyKey } },
+        { headers: { Authorization: `Bearer ${token}`, "Idempotency-Key": idempotencyKey, "X-Trace-Id": traceId } },
       );
 
       if (data.code === "command_bus_not_configured") {
@@ -246,10 +216,7 @@ export const useTrading = () => {
         description: `command_id: ${data.command_id}`,
       });
       onAccepted?.(data);
-
-      // 刷新交易账户余额
       await refreshTradingBalance();
-
       triggerBalanceSync();
       return true;
     } catch (error: unknown) {
@@ -266,7 +233,6 @@ export const useTrading = () => {
     }
   };
 
-  // 下单后同步一次本地余额缓存，避免依赖额外的 me websocket。
   const refreshTradingBalance = async () => {
     if (!walletAddress) return;
 
@@ -283,9 +249,69 @@ function toPriceTick(price: number): number | undefined {
   if (!Number.isFinite(price)) {
     return undefined;
   }
-  const tick = Math.round(price * 100);
+  const tick = encodePriceToTick(price);
   if (tick < 1 || tick > 99) {
     return undefined;
   }
   return tick;
+}
+
+async function resolveMarketProtectionTick(
+  marketId: string,
+  action: "buy" | "sell",
+  outcome: "yes" | "no",
+): Promise<number | undefined> {
+  try {
+    const { data } = await api.get<OrderbookSnapshot>(`/orderbook/${marketId}`);
+    return deriveMarketProtectionTick(data, action, outcome);
+  } catch (error) {
+    console.error("Failed to resolve market protection tick", error);
+    return undefined;
+  }
+}
+
+function deriveMarketProtectionTick(
+  snapshot: OrderbookSnapshot,
+  action: "buy" | "sell",
+  outcome: "yes" | "no",
+): number | undefined {
+  const bestBid = toExistingTick(snapshot.best_bid_price ?? snapshot.bids[0]?.price);
+  const bestAsk = toExistingTick(snapshot.best_ask_price ?? snapshot.asks[0]?.price);
+
+  if (action === "buy" && outcome === "yes") {
+    return bestAsk ? boundTick(bestAsk + 1) : undefined;
+  }
+  if (action === "sell" && outcome === "yes") {
+    return bestBid ? boundTick(bestBid - 1) : undefined;
+  }
+  if (action === "buy" && outcome === "no") {
+    return bestBid ? boundTick(101 - bestBid) : undefined;
+  }
+  if (action === "sell" && outcome === "no") {
+    return bestAsk ? boundTick(99 - bestAsk) : undefined;
+  }
+  return undefined;
+}
+
+function toExistingTick(value?: string): number | undefined {
+  const parsed = Number(value || "");
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+  return clampTick(Math.round(parsed));
+}
+
+function clampTick(tick: number): number | undefined {
+  if (!Number.isFinite(tick)) {
+    return undefined;
+  }
+  const rounded = Math.round(tick);
+  if (rounded < 1 || rounded > 99) {
+    return undefined;
+  }
+  return rounded;
+}
+
+function boundTick(tick: number): number {
+  return Math.max(1, Math.min(99, Math.round(tick)));
 }

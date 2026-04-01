@@ -11,6 +11,8 @@ func (c *Client) PullSubscribe(subject, durable string) (*nats.Subscription, err
 	stream := c.cfg.CmdStream
 	if strings.HasPrefix(subject, "evt.") {
 		stream = c.cfg.EvtStream
+	} else if strings.HasPrefix(subject, "whk.") {
+		stream = c.cfg.WhkStream
 	}
 	sub, err := c.js.PullSubscribe(subject, durable, nats.BindStream(stream))
 	if err != nil {

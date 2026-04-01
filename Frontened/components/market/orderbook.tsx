@@ -59,7 +59,7 @@ export const Orderbook = ({ outcome, marketId }: OrderbookProps) => {
         if (!active) return;
         try {
           const payload = JSON.parse(event.data) as Partial<MarketDepthSocketMessage>;
-          if (payload.market_id !== marketId || !Array.isArray(payload.levels)) return;
+          if (payload.type !== "market.depth.delta" || payload.market_id !== marketId || !Array.isArray(payload.payload?.levels)) return;
           setSnapshot((current) => applyDepthLevels(current, payload as MarketDepthSocketMessage));
           setLoading(false);
         } catch (error) {
@@ -236,7 +236,7 @@ function toTick(value: string): number {
 function toQty(value: string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
-  return parsed;
+  return parsed / 100;
 }
 
 function formatCents(value: number): string {
@@ -258,8 +258,8 @@ function applyDepthLevels(snapshot: OrderbookSnapshot, payload: MarketDepthSocke
   const bids = new Map(snapshot.bids.map((row) => [row.price, row.total_volume]));
   const asks = new Map(snapshot.asks.map((row) => [row.price, row.total_volume]));
 
-  for (const level of payload.levels) {
-    const target = level.side === 0 ? bids : asks;
+  for (const level of payload.payload.levels) {
+    const target = level.side === "bid" ? bids : asks;
     const key = level.price_tick.toString();
     if (level.total_volume === 0) {
       target.delete(key);

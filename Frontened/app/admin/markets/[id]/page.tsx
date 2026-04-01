@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import api from "@/app/utils/axiosInstance";
 import { Market, MarketResponse } from "@/types/market";
-import { useIdentityToken } from "@privy-io/react-auth";
+import { useIdentityToken } from "@/lib/auth-client";
 
 export default function AdminMarketDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -49,13 +49,13 @@ export default function AdminMarketDetailPage() {
 }
 
 async function resolveCreator(outcome: "yes" | "no", marketId: string, identityToken: string | null, setMessage: (value: string) => void, setMarket: (market: Market) => void) {
-  const { data } = await api.post(`/admin/markets/${marketId}/resolve`, { outcome }, { headers: { "privy-id-token": identityToken } });
+  const { data } = await api.post(`/admin/markets/${marketId}/resolve`, { outcome }, { headers: { Authorization: `Bearer ${identityToken}` } });
   setMessage(data.message);
   setMarket(data.market);
 }
 
 async function triggerPyth(marketId: string, identityToken: string | null, setMessage: (value: string) => void) {
-  const { data } = await api.post(`/admin/markets/${marketId}/trigger-oracle-resolve`, {}, { headers: { "privy-id-token": identityToken } });
+  const { data } = await api.post(`/admin/markets/${marketId}/trigger-oracle-resolve`, {}, { headers: { Authorization: `Bearer ${identityToken}` } });
   setMessage(data.message);
 }
 

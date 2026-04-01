@@ -140,6 +140,24 @@ func (h *Hub) PublishUserOrder(payload protocol.UserOrderPush) error {
 	return nil
 }
 
+func (h *Hub) PublishMarketMessage(marketID uint64, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	h.broadcastMarket(marketID, body)
+	return nil
+}
+
+func (h *Hub) PublishUserMessage(wallet string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	h.broadcastUser(wallet, body)
+	return nil
+}
+
 func (h *Hub) registerMarket(client *connection, marketID uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

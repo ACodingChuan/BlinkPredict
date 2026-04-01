@@ -57,7 +57,7 @@ func TestRedisQueryEngineReadsHotModels(t *testing.T) {
 	if len(orders) != 1 {
 		t.Fatalf("expected one open order, got %d", len(orders))
 	}
-	if orders[0].ID != "11" || orders[0].Side != "buy" || orders[0].Price != "60" {
+	if orders[0].ID != "11" || orders[0].Side != "buy" || orders[0].Price != "60" || orders[0].Status != "open" {
 		t.Fatalf("unexpected open order: %+v", orders[0])
 	}
 

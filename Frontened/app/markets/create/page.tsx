@@ -3,9 +3,8 @@
 import { Buffer } from "buffer";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useSignAndSendTransaction } from "@privy-io/react-auth/solana";
+import { useSignAndSendTransaction } from "@/hooks/useWalletTransactions";
 import { Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
-import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
 console.log("RPC", process.env.NEXT_PUBLIC_RPC_URL, "MINT", process.env.NEXT_PUBLIC_VUSDC_MINT);
 
@@ -52,6 +51,7 @@ export default function CreateMarketPage() {
     description: "",
     close_time: "",
     settle_time: "",
+    claim_deadline_time: "",
     // Pyth (pull) uses a 0x-prefixed 32-byte feed id from the Pyth UI/Hermes world.
     oracle_feed_id: "",
     oracle_condition: "gte" as "gte" | "gt" | "lt" | "lte",
@@ -234,7 +234,7 @@ export default function CreateMarketPage() {
               className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
               onClick={() => {
                 setSuccessSig("");
-                setForm({ title: "", description: "", close_time: "", settle_time: "", oracle_feed_id: "", oracle_condition: "gte", oracle_target_price: "250.00" });
+                setForm({ title: "", description: "", close_time: "", settle_time: "", claim_deadline_time: "", oracle_feed_id: "", oracle_condition: "gte", oracle_target_price: "250.00" });
               }}
             >
               Create another
@@ -330,6 +330,14 @@ export default function CreateMarketPage() {
             value={form.settle_time}
             onChange={(value) =>
               setForm((current) => ({ ...current, settle_time: value }))
+            }
+          />
+          <Input
+            label="Last claim time"
+            type="datetime-local"
+            value={form.claim_deadline_time}
+            onChange={(value) =>
+              setForm((current) => ({ ...current, claim_deadline_time: value }))
             }
           />
           <div>
@@ -512,9 +520,14 @@ export default function CreateMarketPage() {
                   setError("Earliest settle time is required.");
                   return;
                 }
+                if (!form.claim_deadline_time) {
+                  setError("Last claim time is required.");
+                  return;
+                }
                 const closeTime = new Date(form.close_time).getTime();
                 const settleTime = new Date(form.settle_time).getTime();
-                if (Number.isNaN(closeTime) || Number.isNaN(settleTime)) {
+                const claimDeadlineTime = new Date(form.claim_deadline_time).getTime();
+                if (Number.isNaN(closeTime) || Number.isNaN(settleTime) || Number.isNaN(claimDeadlineTime)) {
                   setError("Invalid time value.");
                   return;
                 }
@@ -525,6 +538,10 @@ export default function CreateMarketPage() {
                 }
                 if (settleTime < closeTime) {
                   setError("Earliest settle time must be >= close time.");
+                  return;
+                }
+                if (claimDeadlineTime <= settleTime) {
+                  setError("Last claim time must be later than earliest settle time.");
                   return;
                 }
                 if (mode === "pyth") {
@@ -576,6 +593,7 @@ export default function CreateMarketPage() {
 
                 const closeISO = new Date(form.close_time).toISOString();
                 const resolveISO = new Date(form.settle_time).toISOString();
+                const claimDeadlineISO = new Date(form.claim_deadline_time).toISOString();
 
                 const metadata = buildMetadata({
                   title: form.title.trim(),
@@ -584,6 +602,7 @@ export default function CreateMarketPage() {
                   category: "",
                   closeTime: closeISO,
                   resolveAfterTime: resolveISO,
+                  claimDeadlineTime: claimDeadlineISO,
                   resolution:
                     mode === "creator"
                       ? {
@@ -599,22 +618,18 @@ export default function CreateMarketPage() {
                 });
 
                 const metadataUri = await pinJSONToIPFS(metadata, pinataJwt);
+                const metadataCid = cidFromIpfsUri(metadataUri);
                 const marketId = await computeMarketId({
                   creator: creatorAddress,
                   title: metadata.title,
                   closeTime: closeISO,
-                  metadataUri,
+                  metadataCid,
                 });
 
                 const programId = new PublicKey(
                   process.env.NEXT_PUBLIC_PROGRAM_ID ||
                     "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE",
                 );
-                const collateralMint = process.env.NEXT_PUBLIC_VUSDC_MINT;
-                if (!collateralMint) {
-                  setError("NEXT_PUBLIC_VUSDC_MINT is required.");
-                  return;
-                }
 
                 const priceInt = mode === "pyth" ? BigInt(targetPriceIntAtExpo) : BigInt(0);
                 const priceExpo = mode === "pyth" && feedCheck.status === "valid" ? feedCheck.expo : 0;
@@ -623,18 +638,18 @@ export default function CreateMarketPage() {
                     ? hexToBytes32(form.oracle_feed_id.trim())
                     : new Uint8Array(32);
 
-                const instruction = await buildInitializeMarketInstruction({
+                const instruction = await buildCreateMarketInstruction({
                   programId,
                   marketId,
-                  metadataUri,
+                  metadataCid,
                   closeTime: BigInt(Math.floor(new Date(form.close_time).getTime() / 1000)),
                   resolveAfterTime: BigInt(Math.floor(new Date(form.settle_time).getTime() / 1000)),
+                  claimDeadlineTime: BigInt(Math.floor(new Date(form.claim_deadline_time).getTime() / 1000)),
                   resolutionMode: mode === "creator" ? 0 : 1,
                   oracleFeedId,
                   oracleCondition: mode === "pyth" ? conditionToIndex(form.oracle_condition) : 0,
                   oracleTargetPriceInt: priceInt,
                   oracleTargetExpo: priceExpo,
-                  collateralMint: new PublicKey(collateralMint),
                   creator: new PublicKey(creatorAddress),
                 });
 
@@ -686,7 +701,7 @@ export default function CreateMarketPage() {
                     setError("No wallet connected.");
                     return;
                   }
-                  console.log("Selected wallet:", wallet.address);
+                  console.log("Selected wallet:", walletAddress);
 
                   try {
                     console.log("Calling signAndSendTransaction...");
@@ -855,6 +870,7 @@ type MetadataPayload = {
   category: string;
   close_time: string;
   resolve_after_time: string;
+  claim_deadline_time?: string;
   resolution: {
     mode: "creator" | "pyth";
     authority?: string;
@@ -872,6 +888,7 @@ function buildMetadata(input: {
   category: string;
   closeTime: string;
   resolveAfterTime: string;
+  claimDeadlineTime: string;
   resolution:
     | { mode: "creator"; authority: string }
     | {
@@ -888,6 +905,7 @@ function buildMetadata(input: {
     category: input.category,
     close_time: input.closeTime,
     resolve_after_time: input.resolveAfterTime,
+    claim_deadline_time: input.claimDeadlineTime,
     resolution:
       input.resolution.mode === "creator"
         ? {
@@ -952,14 +970,22 @@ async function pinJSONToIPFS(payload: MetadataPayload, jwt: string): Promise<str
   return `ipfs://${json.IpfsHash}`;
 }
 
+function cidFromIpfsUri(uri: string): string {
+  const trimmed = uri.trim();
+  if (trimmed.startsWith("ipfs://")) {
+    return trimmed.slice("ipfs://".length);
+  }
+  return trimmed;
+}
+
 async function computeMarketId(input: {
   creator: string;
   title: string;
   closeTime: string;
-  metadataUri: string;
+  metadataCid: string;
 }): Promise<bigint> {
   const encoder = new TextEncoder();
-  const seed = `${input.creator}|${input.title}|${input.closeTime}|${input.metadataUri}`;
+  const seed = `${input.creator}|${input.title}|${input.closeTime}|${input.metadataCid}`;
   const hash = await sha256Bytes(encoder.encode(seed));
   let id = BigInt(0);
   for (let i = 0; i < 8; i += 1) {
@@ -998,45 +1024,34 @@ function conditionToIndex(condition: "gte" | "gt" | "lt" | "lte"): number {
   }
 }
 
-type InitializeMarketArgs = {
+type CreateMarketInstructionArgs = {
   programId: PublicKey;
   marketId: bigint;
-  metadataUri: string;
+  metadataCid: string;
   closeTime: bigint;
   resolveAfterTime: bigint;
+  claimDeadlineTime: bigint;
   resolutionMode: number;
   oracleFeedId: Uint8Array;
   oracleCondition: number;
   oracleTargetPriceInt: bigint;
   oracleTargetExpo: number;
-  collateralMint: PublicKey;
   creator: PublicKey;
 };
 
-async function buildInitializeMarketInstruction(args: InitializeMarketArgs): Promise<TransactionInstruction> {
+async function buildCreateMarketInstruction(args: CreateMarketInstructionArgs): Promise<TransactionInstruction> {
   const marketIdBytes = u64ToBytesLE(args.marketId);
   const [marketPda] = PublicKey.findProgramAddressSync(
     [Buffer.from("market"), Buffer.from(marketIdBytes)],
     args.programId,
   );
-  const [vaultPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("collateral_vault"), Buffer.from(marketIdBytes)],
-    args.programId,
-  );
-  const [yesMintPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("yes_mint"), Buffer.from(marketIdBytes)],
-    args.programId,
-  );
-  const [noMintPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("no_mint"), Buffer.from(marketIdBytes)],
-    args.programId,
-  );
 
-  const data = await encodeInitializeMarketData({
+  const data = await encodeCreateMarketData({
     marketId: args.marketId,
-    metadataUri: args.metadataUri,
+    metadataCid: args.metadataCid,
     closeTime: args.closeTime,
     resolveAfterTime: args.resolveAfterTime,
+    claimDeadlineTime: args.claimDeadlineTime,
     resolutionMode: args.resolutionMode,
     oracleFeedId: args.oracleFeedId,
     oracleCondition: args.oracleCondition,
@@ -1048,37 +1063,33 @@ async function buildInitializeMarketInstruction(args: InitializeMarketArgs): Pro
     programId: args.programId,
     keys: [
       { pubkey: marketPda, isSigner: false, isWritable: true },
-      { pubkey: vaultPda, isSigner: false, isWritable: true },
-      { pubkey: yesMintPda, isSigner: false, isWritable: true },
-      { pubkey: noMintPda, isSigner: false, isWritable: true },
-      { pubkey: args.collateralMint, isSigner: false, isWritable: false },
       { pubkey: args.creator, isSigner: true, isWritable: true },
-      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.from(data),
   });
 }
 
-async function encodeInitializeMarketData(input: {
+async function encodeCreateMarketData(input: {
   marketId: bigint;
-  metadataUri: string;
+  metadataCid: string;
   closeTime: bigint;
   resolveAfterTime: bigint;
+  claimDeadlineTime: bigint;
   resolutionMode: number;
   oracleFeedId: Uint8Array;
   oracleCondition: number;
   oracleTargetPriceInt: bigint;
   oracleTargetExpo: number;
 }): Promise<Uint8Array> {
-  const discriminator = await anchorDiscriminator("initialize_market");
+  const discriminator = await anchorDiscriminator("create_market");
   const parts = [
     discriminator,
     u64ToBytesLE(input.marketId),
-    encodeString(input.metadataUri),
+    encodeFixedString(input.metadataCid, 96),
     i64ToBytesLE(input.closeTime),
     i64ToBytesLE(input.resolveAfterTime),
+    i64ToBytesLE(input.claimDeadlineTime),
     Uint8Array.of(input.resolutionMode),
     input.oracleFeedId,
     Uint8Array.of(input.oracleCondition),
@@ -1095,18 +1106,14 @@ async function anchorDiscriminator(name: string): Promise<Uint8Array> {
   return hash.slice(0, 8);
 }
 
-function encodeString(value: string): Uint8Array {
+function encodeFixedString(value: string, size: number): Uint8Array {
   const encoder = new TextEncoder();
   const bytes = encoder.encode(value);
-  return concatBytes([u32ToBytesLE(bytes.length), bytes]);
-}
-
-function u32ToBytesLE(value: number): Uint8Array {
-  const out = new Uint8Array(4);
-  out[0] = value & 0xff;
-  out[1] = (value >> 8) & 0xff;
-  out[2] = (value >> 16) & 0xff;
-  out[3] = (value >> 24) & 0xff;
+  if (bytes.length > size) {
+    throw new Error(`value exceeds fixed size ${size}`);
+  }
+  const out = new Uint8Array(size);
+  out.set(bytes);
   return out;
 }
 

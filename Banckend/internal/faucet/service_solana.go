@@ -86,7 +86,8 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 	if strings.TrimSpace(solanaAddress) == "" || strings.TrimSpace(ip) == "" {
 		return Result{}, fmt.Errorf("missing address or ip")
 	}
-	if _, err := solana.PublicKeyFromBase58(solanaAddress); err != nil {
+	userWallet, err := solana.PublicKeyFromBase58(solanaAddress)
+	if err != nil {
 		return Result{}, fmt.Errorf("invalid solana address: %w", err)
 	}
 
@@ -109,15 +110,15 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, err
 	}
 
-	treasuryOwner := s.cfg.Payer.PublicKey()
-	ata, err := findAssociatedTokenAddress(treasuryOwner, s.cfg.Mint, tokenProgramID)
+	// Derive the user's vUSDC ATA (NOT the treasury/payer's ATA).
+	userATA, err := findAssociatedTokenAddress(userWallet, s.cfg.Mint, tokenProgramID)
 	if err != nil {
-		return Result{}, fmt.Errorf("derive treasury ata: %w", err)
+		return Result{}, fmt.Errorf("derive user ata: %w", err)
 	}
 
+	// Check if the user's ATA already exists; create it if missing.
 	ataExists := true
-	if _, err := s.rpc.GetAccountInfo(ctx, ata); err != nil {
-		// Treat any RPC failure as "unknown"; only create if explicitly missing.
+	if _, err := s.rpc.GetAccountInfo(ctx, userATA); err != nil {
 		if errors.Is(err, rpc.ErrNotFound) {
 			ataExists = false
 		} else {
@@ -127,11 +128,12 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 
 	instructions := make([]solana.Instruction, 0, 2)
 	if !ataExists {
+		// Payer (relayer) funds the ATA rent; owner is the user.
 		instructions = append(instructions, buildCreateATAInstruction(
-			s.cfg.Payer.PublicKey(),
-			treasuryOwner,
+			s.cfg.Payer.PublicKey(), // payer (rent funder)
+			userWallet,              // ATA owner = the user
 			s.cfg.Mint,
-			ata,
+			userATA,
 			tokenProgramID,
 			s.cfg.AssociatedProgramID,
 		))
@@ -142,10 +144,11 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, err
 	}
 
+	// Mint vUSDC directly to the user's ATA.
 	mintTo := token.NewMintToInstruction(
 		amountBaseUnits,
 		s.cfg.Mint,
-		ata,
+		userATA, // destination = user's ATA
 		s.cfg.MintAuthority.PublicKey(),
 		nil,
 	).Build()
@@ -195,38 +198,24 @@ func (s *SolanaService) Claim(ctx context.Context, solanaAddress string, ip stri
 		return Result{}, fmt.Errorf("send transaction: %w", err)
 	}
 
-	confirmedAt := time.Now().UTC()
-	_ = s.repo.InsertDepositRequest(ctx, DepositRequestRow{
-		WalletAddress:       solanaAddress,
-		AmountUnits:         amountBaseUnits / divisorForLedgerUnits(s.cfg.Decimals),
-		Mint:                s.cfg.Mint.String(),
-		TreasuryDestination: ata.String(),
-		ChainSignature:      sig.String(),
-		Status:              "confirmed",
-		Source:              "faucet",
-		CreatedAt:           now,
-		ConfirmedAt:         &confirmedAt,
-	})
-	_ = s.repo.CreditWalletAccount(ctx, solanaAddress, amountBaseUnits/divisorForLedgerUnits(s.cfg.Decimals))
-
 	if err := s.repo.InsertClaim(ctx, ClaimRow{
 		SolanaAddress: solanaAddress,
 		IP:            ip,
 		Signature:     sig.String(),
 		Amount:        s.cfg.AmountTokens,
 		Mint:          s.cfg.Mint.String(),
-		ATA:           ata.String(),
+		ATA:           userATA.String(),
 		ClaimedAt:     now,
 	}); err != nil {
 		// If DB write fails, we still return the signature so the user can verify/move on.
-		return Result{Signature: sig.String(), Mint: s.cfg.Mint.String(), ATA: ata.String(), Amount: s.cfg.AmountTokens, ClaimedAt: now},
+		return Result{Signature: sig.String(), Mint: s.cfg.Mint.String(), ATA: userATA.String(), Amount: s.cfg.AmountTokens, ClaimedAt: now},
 			fmt.Errorf("record claim: %w", err)
 	}
 
 	return Result{
 		Signature: sig.String(),
 		Mint:      s.cfg.Mint.String(),
-		ATA:       ata.String(),
+		ATA:       userATA.String(),
 		Amount:    s.cfg.AmountTokens,
 		ClaimedAt: now,
 	}, nil

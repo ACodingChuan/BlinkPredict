@@ -19,10 +19,15 @@ const (
 	SubjectTradeExecuted = "evt.trade.executed"
 	SubjectOrderbook     = "evt.orderbook.updated"
 	SubjectBatchTrades   = "evt.trades"
+	SubjectMatchBatchV2  = "evt.match.batch.v2"
 )
 
 func SubjectBatchTradesMarket(marketID uint64) string {
 	return fmt.Sprintf("%s.%d", SubjectBatchTrades, marketID)
+}
+
+func SubjectMatchBatchV2Market(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectMatchBatchV2, marketID)
 }
 
 type OrderStatus string

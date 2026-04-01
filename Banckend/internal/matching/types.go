@@ -72,6 +72,7 @@ type OpenOrder struct {
 	Outcome  string `json:"outcome,omitempty"`
 	Price    string `json:"price,omitempty"`
 	Quantity string `json:"quantity,omitempty"`
+	Status   string `json:"status,omitempty"`
 }
 
 // DisabledEngine 禁用的引擎
@@ -133,8 +134,12 @@ type Command interface {
 
 // PlaceOrderCommand 下单命令
 type PlaceOrderCommand struct {
+	CommandID         string `json:"command_id"`
+	TraceID           string `json:"trace_id"`
+	IdempotencyKey    string `json:"idempotency_key"`
 	OrderID           uint64 `json:"order_id"`
 	MarketID          uint64 `json:"market_id"`
+	MarketPDA         string `json:"market_pda"`
 	WalletAddress     string `json:"wallet_address"`
 	OriginalAction    uint8  `json:"original_action"`
 	OriginalOutcome   uint8  `json:"original_outcome"`
@@ -182,6 +187,88 @@ type CommandWrapper struct {
 	SourceCmdSeq uint64
 }
 
+const (
+	MatchTypeMatchMint = "match_mint"
+	MatchTypeTransfer  = "transfer"
+	MatchTypeMergeBurn = "merge_burn"
+)
+
+type MatchBatchEventV2 struct {
+	EventID       string `json:"event_id"`
+	SchemaVersion int    `json:"schema_version"`
+
+	MarketID   uint64 `json:"market_id,string"`
+	MarketPDA  string `json:"market_pda"`
+	ProducedAt int64  `json:"produced_at"`
+
+	SourceCmdSeqMin uint64 `json:"source_cmd_seq_min"`
+	SourceCmdSeqMax uint64 `json:"source_cmd_seq_max"`
+
+	SourceCommandIDs []string `json:"source_command_ids,omitempty"`
+	TraceIDs         []string `json:"trace_ids,omitempty"`
+
+	Orders       []MatchedOrderV2 `json:"orders"`
+	Fills        []MatchFillV2    `json:"fills"`
+	OrderUpdates []OrderUpdateV2  `json:"order_updates"`
+	DepthUpdates []DepthUpdateV2  `json:"depth_updates"`
+}
+
+type ExecutionSnapshotV2 struct {
+	OrderID             uint64 `json:"order_id"`
+	WalletAddress       string `json:"wallet_address"`
+	OriginalAction      string `json:"original_action"`
+	OriginalOutcome     string `json:"original_outcome"`
+	OriginalPriceTick   uint8  `json:"original_price_tick"`
+	OrderType           string `json:"order_type"`
+	NormalizedSide      string `json:"normalized_side"`
+	NormalizedPriceTick uint8  `json:"normalized_price_tick"`
+	QtyLots             uint64 `json:"qty_lots"`
+	SpendAmount         uint64 `json:"spend_amount"`
+	ExpireTime          int64  `json:"expire_time"`
+	Nonce               uint64 `json:"nonce"`
+}
+
+type SettlementPayloadV2 struct {
+	IntentBytesHex string `json:"intent_bytes_hex"`
+	Signature      string `json:"signature"`
+}
+
+type MatchedOrderV2 struct {
+	OrderIndex uint16              `json:"order_index"`
+	OrderID    uint64              `json:"order_id"`
+	Execution  ExecutionSnapshotV2 `json:"execution"`
+	Settlement SettlementPayloadV2 `json:"settlement"`
+	CreatedAt  int64               `json:"created_at"`
+}
+
+type MatchFillV2 struct {
+	FillIndex        uint32 `json:"fill_index"`
+	MakerOrderIndex  uint16 `json:"maker_order_index"`
+	TakerOrderIndex  uint16 `json:"taker_order_index"`
+	FillAmount       uint64 `json:"fill_amount"`
+	FillPrice        uint64 `json:"fill_price"`
+	MatchType        string `json:"match_type"`
+	NotionalUnits    uint64 `json:"notional_units"`
+	TakerFeeUnits    uint64 `json:"taker_fee_units"`
+	CreatorFeeUnits  uint64 `json:"creator_fee_units"`
+	PlatformFeeUnits uint64 `json:"platform_fee_units"`
+}
+
+type OrderUpdateV2 struct {
+	OrderIndex           uint16 `json:"order_index"`
+	Status               string `json:"status"`
+	RemainingQtyLots     uint64 `json:"remaining_qty_lots"`
+	RemainingSpendAmount uint64 `json:"remaining_spend_amount"`
+	RefundAmount         uint64 `json:"refund_amount"`
+	ReasonCode           string `json:"reason_code,omitempty"`
+}
+
+type DepthUpdateV2 struct {
+	Side        string `json:"side"`
+	PriceTick   uint8  `json:"price_tick"`
+	TotalVolume uint64 `json:"total_volume"`
+}
+
 // ==========================================
 // 3. BatchEventPayload 事件体系 (输出)
 // ==========================================
@@ -211,6 +298,7 @@ type BatchEventPayload struct {
 	SourceCmdSeq uint64            `json:"source_cmd_seq"`
 	Timestamp    int64             `json:"timestamp"`
 	SourceOrder  *FullOrderData    `json:"source_order,omitempty"`
+	SourceOrders []FullOrderData   `json:"source_orders,omitempty"`
 	TradeEvents  []TradeEvent      `json:"trade_events"`
 	StateEvents  []OrderStateEvent `json:"state_events"`
 	DepthEvents  []L2DepthEvent    `json:"depth_events"`
@@ -236,11 +324,12 @@ func (b *BatchEventPayload) AddTradeEvent(maker, taker *MemoryOrder, price uint8
 // AddStateEvent 添加订单状态事件
 func (b *BatchEventPayload) AddStateEvent(orderID uint64, walletAddress string, status uint8, remainingQty uint64, refund uint64) {
 	b.StateEvents = append(b.StateEvents, OrderStateEvent{
-		OrderID:       orderID,
-		WalletAddress: walletAddress,
-		Status:        status,
-		RemainingQty:  remainingQty,
-		RefundAmount:  refund,
+		OrderID:              orderID,
+		WalletAddress:        walletAddress,
+		Status:               status,
+		RemainingQty:         remainingQty,
+		RemainingSpendAmount: 0,
+		RefundAmount:         refund,
 	})
 }
 
@@ -270,11 +359,12 @@ type TradeEvent struct {
 
 // OrderStateEvent 订单状态变更事件
 type OrderStateEvent struct {
-	OrderID       uint64 `json:"order_id"`
-	WalletAddress string `json:"wallet_address,omitempty"`
-	Status        uint8  `json:"status"`
-	RemainingQty  uint64 `json:"remaining_qty"`
-	RefundAmount  uint64 `json:"refund_amount"`
+	OrderID              uint64 `json:"order_id"`
+	WalletAddress        string `json:"wallet_address,omitempty"`
+	Status               uint8  `json:"status"`
+	RemainingQty         uint64 `json:"remaining_qty"`
+	RemainingSpendAmount uint64 `json:"remaining_spend_amount,omitempty"`
+	RefundAmount         uint64 `json:"refund_amount"`
 }
 
 // L2DepthEvent L2深度变更事件

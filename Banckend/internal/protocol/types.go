@@ -55,25 +55,35 @@ type CommandEnvelope[T any] struct {
 	Payload        T         `json:"payload"`
 }
 
-// PlaceOrderCommand 下单命令 (投入 NATS 的 Payload)
-// 根据订单系统全局规范 V1 (orderDesign.md)
+type PlaceOrderExecution struct {
+	OrderID             uint64 `json:"order_id"`
+	WalletAddress       string `json:"wallet_address"`
+	OriginalAction      string `json:"original_action"`
+	OriginalOutcome     string `json:"original_outcome"`
+	OriginalPriceTick   uint8  `json:"original_price_tick"`
+	OrderType           string `json:"order_type"`
+	NormalizedSide      string `json:"normalized_side"`
+	NormalizedPriceTick uint8  `json:"normalized_price_tick"`
+	QtyLots             uint64 `json:"qty_lots"`
+	SpendAmount         uint64 `json:"spend_amount"`
+	ExpireTime          int64  `json:"expire_time"`
+	Nonce               uint64 `json:"nonce"`
+}
+
+type SettlementPayload struct {
+	IntentBytesHex string `json:"intent_bytes_hex"`
+	Signature      string `json:"signature"`
+}
+
 type PlaceOrderCommand struct {
-	OrderID           uint64    `json:"order_id"`            // 雪花ID (单调递增)
-	MarketID          uint64    `json:"market_id"`           // 市场ID
-	WalletAddress     string    `json:"wallet_address"`      // 用户钱包地址 (base58)
-	OriginalAction    Side      `json:"original_action"`     // 用户原始动作
-	OriginalOutcome   Outcome   `json:"original_outcome"`    // 用户原始标的
-	OriginalPriceTick uint8     `json:"original_price_tick"` // 用户原始价格/滑点边界
-	Side              Side      `json:"side"`                // "buy" | "sell" (已归一化为 Yes)
-	OrderType         OrderType `json:"order_type"`          // "limit" | "market"
-	PriceTick         uint8     `json:"price_tick"`          // 1-99 (归一化后的挂单价或滑点底线)
-	QtyLots           uint64    `json:"qty_lots"`            // 份额 (乘100后的整数，市价买入为0)
-	SpendAmount       uint64    `json:"spend_amount"`        // 金额 (乘100后的整数，仅市价买入有值)
-	ExpireTime        int64     `json:"expire_time"`         // Unix秒级时间戳 (0=GTC)
-	Signature         string    `json:"signature"`           // base64 Ed25519签名
-	Nonce             uint64    `json:"nonce"`               // 防碰撞nonce
-	IntentBytesHex    string    `json:"intent_bytes_hex"`    // Borsh编码的Hex (链上结算用)
-	Timestamp         int64     `json:"timestamp"`           // 逻辑时钟 (Unix秒级)
+	CommandID      string              `json:"command_id"`
+	TraceID        string              `json:"trace_id"`
+	IdempotencyKey string              `json:"idempotency_key"`
+	Timestamp      int64               `json:"timestamp"`
+	MarketID       uint64              `json:"market_id"`
+	MarketPDA      string              `json:"market_pda"`
+	Execution      PlaceOrderExecution `json:"execution"`
+	Settlement     SettlementPayload   `json:"settlement"`
 }
 
 type CancelOrderCommand struct {
@@ -98,93 +108,88 @@ func (DisabledCommandPublisher) PublishCancelOrder(context.Context, CommandEnvel
 }
 
 func ValidatePlaceOrderCommand(cmd PlaceOrderCommand) error {
-	// 基础字段验证
-	if cmd.OrderID == 0 {
-		return errors.New("order_id is required")
+	if strings.TrimSpace(cmd.CommandID) == "" {
+		return errors.New("command_id is required")
 	}
 	if cmd.MarketID == 0 {
 		return errors.New("market_id is required")
 	}
-	if strings.TrimSpace(cmd.WalletAddress) == "" {
+	if strings.TrimSpace(cmd.MarketPDA) == "" {
+		return errors.New("market_pda is required")
+	}
+	if strings.TrimSpace(cmd.Execution.WalletAddress) == "" {
 		return errors.New("wallet_address is required")
 	}
-	switch cmd.OriginalAction {
+	switch Side(cmd.Execution.OriginalAction) {
 	case SideBuy, SideSell:
 	default:
-		return fmt.Errorf("invalid original_action: %s", cmd.OriginalAction)
+		return fmt.Errorf("invalid original_action: %s", cmd.Execution.OriginalAction)
 	}
-	switch cmd.OriginalOutcome {
+	switch Outcome(cmd.Execution.OriginalOutcome) {
 	case OutcomeYes, OutcomeNo:
 	default:
-		return fmt.Errorf("invalid original_outcome: %s", cmd.OriginalOutcome)
+		return fmt.Errorf("invalid original_outcome: %s", cmd.Execution.OriginalOutcome)
 	}
-	if strings.TrimSpace(cmd.Signature) == "" {
+	if strings.TrimSpace(cmd.Settlement.Signature) == "" {
 		return errors.New("signature is required")
 	}
-	if cmd.Nonce == 0 {
+	if cmd.Execution.Nonce == 0 {
 		return errors.New("nonce is required")
 	}
-	if strings.TrimSpace(cmd.IntentBytesHex) == "" {
+	if strings.TrimSpace(cmd.Settlement.IntentBytesHex) == "" {
 		return errors.New("intent_bytes_hex is required")
 	}
 	if cmd.Timestamp == 0 {
 		return errors.New("timestamp is required")
 	}
 
-	// Side 验证
-	switch cmd.Side {
+	switch Side(cmd.Execution.NormalizedSide) {
 	case SideBuy, SideSell:
 	default:
-		return fmt.Errorf("invalid side: %s", cmd.Side)
+		return fmt.Errorf("invalid normalized_side: %s", cmd.Execution.NormalizedSide)
 	}
-	if cmd.OriginalPriceTick < 1 || cmd.OriginalPriceTick > 99 {
+	if cmd.Execution.OriginalPriceTick < 1 || cmd.Execution.OriginalPriceTick > 99 {
 		return errors.New("original_price_tick must be between 1 and 99")
 	}
 
-	// OrderType 验证
-	switch cmd.OrderType {
+	switch OrderType(cmd.Execution.OrderType) {
 	case OrderTypeLimit:
-		// 限价单验证
-		if cmd.PriceTick < 1 || cmd.PriceTick > 99 {
-			return errors.New("price_tick must be between 1 and 99 for limit order")
+		if cmd.Execution.NormalizedPriceTick < 1 || cmd.Execution.NormalizedPriceTick > 99 {
+			return errors.New("normalized_price_tick must be between 1 and 99 for limit order")
 		}
-		if cmd.ExpireTime == 0 {
+		if cmd.Execution.ExpireTime == 0 {
 			return errors.New("expire_time is required for limit order")
 		}
-		if cmd.QtyLots == 0 {
+		if cmd.Execution.QtyLots == 0 {
 			return errors.New("qty_lots must be greater than 0 for limit order")
 		}
-		if cmd.SpendAmount != 0 {
+		if cmd.Execution.SpendAmount != 0 {
 			return errors.New("spend_amount must be 0 for limit order")
 		}
 	case OrderTypeMarket:
-		// 市价单验证
-		if cmd.PriceTick < 1 || cmd.PriceTick > 99 {
-			return errors.New("price_tick must be between 1 and 99 for market order (slippage limit)")
+		if cmd.Execution.NormalizedPriceTick < 1 || cmd.Execution.NormalizedPriceTick > 99 {
+			return errors.New("normalized_price_tick must be between 1 and 99 for market order")
 		}
-		// 市价单两种模式：买入用 spendAmount，卖出用 qtyLots
-		if cmd.Side == SideBuy {
-			// 市价买入：spendAmount > 0, qtyLots = 0
-			if cmd.SpendAmount == 0 {
+		if Side(cmd.Execution.OriginalAction) == SideBuy {
+			if cmd.Execution.SpendAmount == 0 {
 				return errors.New("spend_amount must be greater than 0 for market buy order")
 			}
-			if cmd.QtyLots != 0 {
+			if cmd.Execution.QtyLots != 0 {
 				return errors.New("qty_lots must be 0 for market buy order")
 			}
 		} else {
-			// 市价卖出：qtyLots > 0, spendAmount = 0
-			if cmd.QtyLots == 0 {
+			if cmd.Execution.QtyLots == 0 {
 				return errors.New("qty_lots must be greater than 0 for market sell order")
 			}
-			if cmd.SpendAmount != 0 {
+			if cmd.Execution.SpendAmount != 0 {
 				return errors.New("spend_amount must be 0 for market sell order")
 			}
 		}
-		if cmd.ExpireTime != 0 {
+		if cmd.Execution.ExpireTime != 0 {
 			return errors.New("expire_time must be 0 for market order")
 		}
 	default:
-		return fmt.Errorf("invalid order_type: %s", cmd.OrderType)
+		return fmt.Errorf("invalid order_type: %s", cmd.Execution.OrderType)
 	}
 
 	return nil
