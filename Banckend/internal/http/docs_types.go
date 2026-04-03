@@ -10,12 +10,45 @@ type healthResponse struct {
 	Service string `json:"service"`
 }
 
+type authChallengeRequest struct {
+	WalletAddress string `json:"wallet_address"`
+}
+
+type authChallengeResponse struct {
+	ChallengeID string `json:"challenge_id"`
+	Message     string `json:"message"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+type authLoginRequest struct {
+	WalletAddress string `json:"wallet_address"`
+	ChallengeID   string `json:"challenge_id"`
+	Signature     string `json:"signature"`
+}
+
+type authLoginUserResponse struct {
+	WalletAddress string `json:"walletAddress"`
+	IsAdmin       bool   `json:"isAdmin"`
+}
+
+type authLoginResponse struct {
+	AuthToken string                `json:"auth_token"`
+	ExpiresAt string                `json:"expires_at"`
+	User      authLoginUserResponse `json:"user"`
+}
+
 type marketsResponse struct {
 	Markets []markets.Market `json:"markets"`
 }
 
 type marketResponse struct {
 	Market markets.Market `json:"market"`
+}
+
+type marketCreateAcceptedResponse struct {
+	Message   string `json:"message"`
+	Signature string `json:"signature"`
+	Status    string `json:"status"`
 }
 
 type openOrdersResponse struct {
@@ -60,14 +93,17 @@ type positionResponse struct {
 	WalletAddress         string `json:"wallet_address"`
 	YesFreeLots           string `json:"yes_free_lots"`
 	YesLockedLots         string `json:"yes_locked_lots"`
+	YesPendingLots        string `json:"yes_pending_lots"`
 	NoFreeLots            string `json:"no_free_lots"`
 	NoLockedLots          string `json:"no_locked_lots"`
-	CollateralFreeUnits   string `json:"collateral_free_units"`
+	NoPendingLots         string `json:"no_pending_lots"`
 	CollateralLockedUnits string `json:"collateral_locked_units"`
 }
 
 type walletAccountResponse struct {
-	WalletAddress        string `json:"wallet_address"`
-	CollateralTotalUnits string `json:"collateral_total_units"`
-	CollateralFreeUnits  string `json:"collateral_free_units"`
+	WalletAddress          string `json:"wallet_address"`
+	CollateralTotalUnits   string `json:"collateral_total_units"`
+	CollateralFreeUnits    string `json:"collateral_free_units"`
+	CollateralLockedUnits  string `json:"collateral_locked_units"`
+	CollateralPendingUnits string `json:"collateral_pending_units"`
 }

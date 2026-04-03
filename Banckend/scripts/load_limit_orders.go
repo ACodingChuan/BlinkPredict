@@ -22,7 +22,6 @@ import (
 
 type placeOrderRequest struct {
 	Version     uint8  `json:"version"`
-	ChainID     uint16 `json:"chain_id"`
 	ProgramID   string `json:"program_id"`
 	Market      string `json:"market"`
 	User        string `json:"user"`
@@ -47,7 +46,6 @@ func main() {
 		apiBase     = flag.String("api", "http://localhost:8080/api", "API base URL")
 		marketPDA   = flag.String("market", "", "market PDA")
 		programID   = flag.String("program", "", "program id")
-		chainID     = flag.Uint("chain-id", 101, "chain id")
 		total       = flag.Int("total", 10000, "total order count")
 		concurrency = flag.Int("concurrency", 200, "parallel workers")
 		timeoutSec  = flag.Int("timeout", 20, "per-request timeout seconds")
@@ -81,7 +79,7 @@ func main() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 			for idx := range jobs {
-				reqBody := buildRequest(idx, *marketPDA, *programID, uint16(*chainID), walletAddress, *amountUnits, *expireHours, rng)
+				reqBody := buildRequest(idx, *marketPDA, *programID, walletAddress, *amountUnits, *expireHours, rng)
 				idem := snowflakeLikeID(rng)
 				trace := snowflakeLikeID(rng)
 				out, err := submitOrder(context.Background(), client, strings.TrimRight(*apiBase, "/")+"/orders", authToken, reqBody, idem, trace)
@@ -139,7 +137,7 @@ func buildFakeAuthToken(walletAddress string) string {
 	return encode(header) + "." + encode(payload) + ".loadtest"
 }
 
-func buildRequest(idx int, marketPDA, programID string, chainID uint16, walletAddress string, totalAmount uint64, expireHours int, rng *rand.Rand) placeOrderRequest {
+func buildRequest(idx int, marketPDA, programID string, walletAddress string, totalAmount uint64, expireHours int, rng *rand.Rand) placeOrderRequest {
 	side := "buy"
 	outcome := "yes"
 	if idx%2 == 1 {
@@ -153,7 +151,6 @@ func buildRequest(idx int, marketPDA, programID string, chainID uint16, walletAd
 	expiry := time.Now().UTC().Add(time.Duration(expireHours) * time.Hour).Unix()
 	return placeOrderRequest{
 		Version:     1,
-		ChainID:     chainID,
 		ProgramID:   programID,
 		Market:      marketPDA,
 		User:        walletAddress,

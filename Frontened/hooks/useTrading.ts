@@ -143,7 +143,6 @@ export const useTrading = () => {
         expiryTs = Math.floor(new Date(expireTime).getTime() / 1000);
       }
 
-      const chainId = Number(process.env.NEXT_PUBLIC_CHAIN_ID || "101");
       const programId = process.env.NEXT_PUBLIC_PROGRAM_ID;
       if (!programId) {
         toast.error("Missing NEXT_PUBLIC_PROGRAM_ID");
@@ -165,7 +164,6 @@ export const useTrading = () => {
       const totalAmountUnits = encodeAmountToUnits(parsedAmount);
 
       const buildParams: BuildOrderIntentParams = {
-        chainId,
         programId: new PublicKey(programId),
         market: new PublicKey(market.market_pda),
         user: new PublicKey(walletAddress),
@@ -191,7 +189,6 @@ export const useTrading = () => {
         "/orders",
         {
           version: intent.version,
-          chain_id: chainId,
           program_id: programId,
           market: market.market_pda,
           user: walletAddress,

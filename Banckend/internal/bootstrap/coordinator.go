@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"blinkpredict/banckend/internal/funds"
 	"blinkpredict/banckend/internal/logging"
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/pusher"
@@ -16,10 +17,12 @@ var logger = logging.New("bootstrap")
 
 type Coordinator struct {
 	writer          *writer.Writer
+	funds           *funds.Service
 	matcher         *matching.MarketManager
 	pusher          *pusher.Service
 	settlement      *settlement.Service
 	writerState     atomic.Int32
+	fundsState      atomic.Int32
 	matcherState    atomic.Int32
 	pusherState     atomic.Int32
 	settlementState atomic.Int32
@@ -38,9 +41,10 @@ const (
 	StateFailed     ModuleState = "failed"
 )
 
-func NewCoordinator(writer *writer.Writer, matcher *matching.MarketManager, pusher *pusher.Service, settlementSvc *settlement.Service, tickInterval time.Duration) *Coordinator {
+func NewCoordinator(writer *writer.Writer, fundsSvc *funds.Service, matcher *matching.MarketManager, pusher *pusher.Service, settlementSvc *settlement.Service, tickInterval time.Duration) *Coordinator {
 	return &Coordinator{
 		writer:       writer,
+		funds:        fundsSvc,
 		matcher:      matcher,
 		pusher:       pusher,
 		settlement:   settlementSvc,
@@ -57,6 +61,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 			return err
 		}
 		c.writerState.Store(int32(StateReadyIndex()))
+	}
+	if c.funds != nil {
+		c.fundsState.Store(int32(StateRecoveringIndex()))
+		logger.Infof("recovering funds snapshots")
+		if err := c.funds.Start(ctx); err != nil {
+			c.fundsState.Store(int32(StateFailedIndex()))
+			return err
+		}
+		c.fundsState.Store(int32(StateReadyIndex()))
 	}
 	if c.matcher != nil {
 		c.matcherState.Store(int32(StateRecoveringIndex()))
@@ -108,6 +121,7 @@ func (c *Coordinator) OrdersReady() bool {
 func (c *Coordinator) Status() map[string]any {
 	return map[string]any{
 		"writer":              stateFromIndex(c.writerState.Load()),
+		"funds":               stateFromIndex(c.fundsState.Load()),
 		"matcher":             stateFromIndex(c.matcherState.Load()),
 		"pusher":              stateFromIndex(c.pusherState.Load()),
 		"settlement":          stateFromIndex(c.settlementState.Load()),

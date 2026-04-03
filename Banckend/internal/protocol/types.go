@@ -9,13 +9,26 @@ import (
 )
 
 const (
-	CommandTypePlaceOrder  = "cmd.order.place.v1"
-	CommandTypeCancelOrder = "cmd.order.cancel.v1"
+	CommandTypePlaceOrder     = "cmd.order.place.v1"
+	CommandTypeSubmitOrder    = "cmd.order.submit.v1"
+	CommandTypeCancelOrder    = "cmd.order.cancel.v1"
+	CommandTypeDepositConfirm = "cmd.tx.confirm.deposit.v1"
+	CommandTypeMarketConfirm  = "cmd.tx.confirm.market_create.v1"
 )
 
 const (
-	SubjectPlaceOrder  = "cmd.order.place"
-	SubjectCancelOrder = "cmd.order.cancel"
+	SubjectPlaceOrder         = "cmd.order.place"
+	SubjectOrderSubmit        = "cmd.order.submit"
+	SubjectCancelOrder        = "cmd.order.cancel"
+	SubjectDepositConfirm     = "cmd.tx.confirm.deposit.v1"
+	SubjectMarketConfirm      = "cmd.tx.confirm.market_create.v1"
+	SubjectOrderReservedV1    = "evt.order.reserved.v1"
+	SubjectOrderReserveReject = "evt.order.reserve_rejected.v1"
+	SubjectSettlementConfirm  = "evt.settlement.confirmed.v1"
+	SubjectDepositConfirmed   = "evt.deposit.confirmed.v1"
+	SubjectDepositFailed      = "evt.deposit.failed.v1"
+	SubjectMarketConfirmed    = "evt.market.confirmed.v1"
+	SubjectMarketFailed       = "evt.market.failed.v1"
 )
 
 var ErrCommandBusDisabled = errors.New("command bus is not configured")
@@ -92,12 +105,93 @@ type CancelOrderCommand struct {
 	Reason        string `json:"reason"`
 }
 
+type DepositConfirmCommand struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	AmountUnits   uint64 `json:"amount_units"`
+}
+
+type DepositConfirmedEvent struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	AmountUnits   uint64 `json:"amount_units"`
+	Slot          uint64 `json:"slot"`
+}
+
+type DepositFailedEvent struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	Reason        string `json:"reason"`
+}
+
+type MarketConfirmCommand struct {
+	Signature string `json:"signature"`
+}
+
+type MarketConfirmedEvent struct {
+	Signature           string `json:"signature"`
+	Slot                uint64 `json:"slot"`
+	MarketID            uint64 `json:"market_id"`
+	MarketPDA           string `json:"market_pda"`
+	Creator             string `json:"creator"`
+	MetadataCID         string `json:"metadata_cid"`
+	MetadataURL         string `json:"metadata_url"`
+	Title               string `json:"title"`
+	Description         string `json:"description"`
+	Category            string `json:"category"`
+	ImageURL            string `json:"image_url"`
+	ResolutionMode      string `json:"resolution_mode"`
+	ResolutionAuthority string `json:"resolution_authority,omitempty"`
+	OracleFeed          string `json:"oracle_feed,omitempty"`
+	OracleCondition     string `json:"oracle_condition,omitempty"`
+	OracleTargetPrice   uint64 `json:"oracle_target_price"`
+	OracleTargetExpo    int32  `json:"oracle_target_expo"`
+	CloseTS             int64  `json:"close_ts"`
+	ResolveAfterTS      int64  `json:"resolve_after_ts"`
+	ClaimDeadlineTS     int64  `json:"claim_deadline_ts"`
+}
+
+type MarketFailedEvent struct {
+	Signature string `json:"signature"`
+	Reason    string `json:"reason"`
+}
+
+type OrderReserveRejectedEvent struct {
+	CommandID      string `json:"command_id"`
+	TraceID        string `json:"trace_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	MarketID       uint64 `json:"market_id"`
+	MarketPDA      string `json:"market_pda"`
+	OrderID        uint64 `json:"order_id"`
+	WalletAddress  string `json:"wallet_address"`
+	ReasonCode     string `json:"reason_code"`
+	ReasonMessage  string `json:"reason_message"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+type SettlementConfirmedEvent struct {
+	EventID               string   `json:"event_id"`
+	SchemaVersion         int      `json:"schema_version"`
+	MarketID              uint64   `json:"market_id"`
+	MarketPDA             string   `json:"market_pda"`
+	SettlementTxSignature string   `json:"settlement_tx_signature"`
+	Wallets               []string `json:"wallets"`
+	ConfirmedAt           int64    `json:"confirmed_at"`
+}
+
 type CommandPublisher interface {
+	PublishSubmitOrder(context.Context, CommandEnvelope[PlaceOrderCommand]) error
 	PublishPlaceOrder(context.Context, CommandEnvelope[PlaceOrderCommand]) error
 	PublishCancelOrder(context.Context, CommandEnvelope[CancelOrderCommand]) error
+	PublishDepositConfirm(context.Context, DepositConfirmCommand) error
+	PublishMarketConfirm(context.Context, MarketConfirmCommand) error
 }
 
 type DisabledCommandPublisher struct{}
+
+func (DisabledCommandPublisher) PublishSubmitOrder(context.Context, CommandEnvelope[PlaceOrderCommand]) error {
+	return ErrCommandBusDisabled
+}
 
 func (DisabledCommandPublisher) PublishPlaceOrder(context.Context, CommandEnvelope[PlaceOrderCommand]) error {
 	return ErrCommandBusDisabled
@@ -105,6 +199,26 @@ func (DisabledCommandPublisher) PublishPlaceOrder(context.Context, CommandEnvelo
 
 func (DisabledCommandPublisher) PublishCancelOrder(context.Context, CommandEnvelope[CancelOrderCommand]) error {
 	return ErrCommandBusDisabled
+}
+
+func (DisabledCommandPublisher) PublishDepositConfirm(context.Context, DepositConfirmCommand) error {
+	return ErrCommandBusDisabled
+}
+
+func (DisabledCommandPublisher) PublishMarketConfirm(context.Context, MarketConfirmCommand) error {
+	return ErrCommandBusDisabled
+}
+
+func SubjectOrderReservedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectOrderReservedV1, marketID)
+}
+
+func SubjectOrderReserveRejectedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectOrderReserveReject, marketID)
+}
+
+func SubjectSettlementConfirmedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectSettlementConfirm, marketID)
 }
 
 func ValidatePlaceOrderCommand(cmd PlaceOrderCommand) error {

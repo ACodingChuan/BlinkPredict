@@ -268,7 +268,6 @@ pub mod predix_program {
 
         for order in &args.orders {
             require!(order.version == 1, ErrorCode::InvalidOrder);
-            require!(order.chain_id > 0, ErrorCode::InvalidOrder);
             require_keys_eq!(order.program_id, crate::ID, ErrorCode::InvalidOrder);
             require_keys_eq!(
                 order.market,
@@ -281,6 +280,10 @@ pub mod predix_program {
                 ErrorCode::InvalidAmount
             );
             require!(order.expiry_ts >= now, ErrorCode::OrderExpired);
+            require!(
+                minimum_order_notional(order)? >= 100,
+                ErrorCode::InvalidAmount
+            );
         }
 
         let (ledger_accounts, position_accounts, order_state_accounts) =
@@ -376,6 +379,8 @@ pub mod predix_program {
                 maker,
                 taker,
                 &ctx.accounts.market,
+                &maker_order_state_loader,
+                &taker_order_state_loader,
                 &maker_ledger_loader,
                 &taker_ledger_loader,
                 &maker_position_loader,
@@ -383,8 +388,13 @@ pub mod predix_program {
             )?;
 
             {
-                let maker_progress =
-                    order_progress_amount(maker, fill.fill_amount, fill.fill_price)?;
+                let maker_state = maker_order_state_loader.load()?;
+                let maker_progress = order_progress_delta(
+                    maker,
+                    &maker_state,
+                    fill.fill_amount,
+                    fill.fill_price,
+                )?;
                 let mut maker_order_state = maker_order_state_loader.load_mut()?;
                 maker_order_state.filled_amount = maker_order_state
                     .filled_amount
@@ -392,8 +402,13 @@ pub mod predix_program {
                     .ok_or(ErrorCode::MathOverflow)?;
             }
             {
-                let taker_progress =
-                    order_progress_amount(taker, fill.fill_amount, fill.fill_price)?;
+                let taker_state = taker_order_state_loader.load()?;
+                let taker_progress = order_progress_delta(
+                    taker,
+                    &taker_state,
+                    fill.fill_amount,
+                    fill.fill_price,
+                )?;
                 let mut taker_order_state = taker_order_state_loader.load_mut()?;
                 taker_order_state.filled_amount = taker_order_state
                     .filled_amount
@@ -930,9 +945,13 @@ fn load_or_init_order_state<'info>(
             state.order_hash = order_hash(order)?;
             state.total_amount = order.total_amount;
             state.filled_amount = 0;
+            state.paid_cash = 0;
+            state.paid_creator_fee = 0;
+            state.paid_platform_fee = 0;
+            state.cash_remainder = 0;
             state.canceled = 0;
             state.bump = bump;
-            state._reserved = [0; 6];
+            state._reserved = [0; 5];
         }
         loader.exit(&crate::ID)?;
         return Ok(loader);
@@ -1028,7 +1047,7 @@ fn validate_order_state(
     fill_amount: u64,
     fill_price: u64,
 ) -> Result<()> {
-    let progress_amount = order_progress_amount(order, fill_amount, fill_price)?;
+    let progress_amount = order_progress_delta(order, order_state, fill_amount, fill_price)?;
     require_keys_eq!(order_state.owner, order.user, ErrorCode::InvalidOrderState);
     require_keys_eq!(ledger.owner, order.user, ErrorCode::InvalidAccountOwner);
     require!(
@@ -1082,9 +1101,14 @@ fn extract_order_timestamp_ms(nonce: u64) -> Result<i64> {
     i64::try_from(millis).map_err(|_| error!(ErrorCode::MathOverflow))
 }
 
-fn order_progress_amount(order: &OrderIntentV1, fill_amount: u64, fill_price: u64) -> Result<u64> {
+fn order_progress_delta(
+    order: &OrderIntentV1,
+    order_state: &OrderState,
+    fill_amount: u64,
+    fill_price: u64,
+) -> Result<u64> {
     if order.order_type == OrderType::Market && order.side == Side::Buy {
-        return trade_cash_for_order(order, fill_amount, fill_price);
+        return Ok(cash_progress_after_fill(order, order_state, fill_amount, fill_price)?.delta_cash);
     }
     Ok(fill_amount)
 }
@@ -1128,23 +1152,45 @@ fn apply_fill<'info>(
     maker: &OrderIntentV1,
     taker: &OrderIntentV1,
     market: &Account<'info, MarketState>,
+    maker_order_state_loader: &AccountLoader<'info, OrderState>,
+    taker_order_state_loader: &AccountLoader<'info, OrderState>,
     maker_ledger_loader: &AccountLoader<'info, UserLedger>,
     taker_ledger_loader: &AccountLoader<'info, UserLedger>,
     maker_position_loader: &AccountLoader<'info, UserPosition>,
     taker_position_loader: &AccountLoader<'info, UserPosition>,
 ) -> Result<TradeResult> {
-    let maker_cash = trade_cash_for_order(maker, fill.fill_amount, fill.fill_price)?;
-    let taker_cash = trade_cash_for_order(taker, fill.fill_amount, fill.fill_price)?;
-    let taker_creator_fee = ceil_mul_div(taker_cash, market.creator_fee_bps as u64, 10_000)?;
-    let taker_platform_fee = ceil_mul_div(taker_cash, market.platform_fee_bps as u64, 10_000)?;
+    let maker_state = maker_order_state_loader.load()?;
+    let taker_state = taker_order_state_loader.load()?;
+    let maker_cash = cash_progress_after_fill(maker, &maker_state, fill.fill_amount, fill.fill_price)?;
+    let taker_cash = cash_progress_after_fill(taker, &taker_state, fill.fill_amount, fill.fill_price)?;
+    let taker_creator_fee_total =
+        ceil_mul_div(taker_cash.new_paid_cash, market.creator_fee_bps as u64, 10_000)?;
+    let taker_platform_fee_total =
+        ceil_mul_div(taker_cash.new_paid_cash, market.platform_fee_bps as u64, 10_000)?;
+    require!(
+        taker_creator_fee_total >= taker_state.paid_creator_fee,
+        ErrorCode::MathOverflow
+    );
+    require!(
+        taker_platform_fee_total >= taker_state.paid_platform_fee,
+        ErrorCode::MathOverflow
+    );
+    let taker_creator_fee = taker_creator_fee_total
+        .checked_sub(taker_state.paid_creator_fee)
+        .ok_or(ErrorCode::MathOverflow)?;
+    let taker_platform_fee = taker_platform_fee_total
+        .checked_sub(taker_state.paid_platform_fee)
+        .ok_or(ErrorCode::MathOverflow)?;
     let taker_total_fee = taker_creator_fee
         .checked_add(taker_platform_fee)
         .ok_or(ErrorCode::MathOverflow)?;
+    drop(maker_state);
+    drop(taker_state);
 
-    match branch {
+    let trade_result = match branch {
         SettleBranch::MatchAndMint => {
-            debit_buyer(maker_ledger_loader, maker_cash, false, 0)?;
-            debit_buyer(taker_ledger_loader, taker_cash, true, taker_total_fee)?;
+            debit_buyer(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
+            debit_buyer(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
             credit_position(
                 maker_position_loader,
                 maker.outcome,
@@ -1155,7 +1201,7 @@ fn apply_fill<'info>(
                 taker.outcome,
                 fill.fill_amount as i128,
             )?;
-            Ok(TradeResult {
+            TradeResult {
                 creator_fee: taker_creator_fee,
                 platform_fee: taker_platform_fee,
                 yes_open_interest_delta: 1i128
@@ -1164,13 +1210,13 @@ fn apply_fill<'info>(
                 no_open_interest_delta: 1i128
                     .checked_mul(fill.fill_amount as i128)
                     .ok_or(ErrorCode::MathOverflow)?,
-            })
+            }
         }
         SettleBranch::Transfer => {
             let maker_is_buy = maker.side == Side::Buy;
             if maker_is_buy {
-                debit_buyer(maker_ledger_loader, maker_cash, false, 0)?;
-                credit_seller(taker_ledger_loader, taker_cash, true, taker_total_fee)?;
+                debit_buyer(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
+                credit_seller(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
                 credit_position(
                     maker_position_loader,
                     maker.outcome,
@@ -1182,8 +1228,8 @@ fn apply_fill<'info>(
                     -(fill.fill_amount as i128),
                 )?;
             } else {
-                credit_seller(maker_ledger_loader, maker_cash, false, 0)?;
-                debit_buyer(taker_ledger_loader, taker_cash, true, taker_total_fee)?;
+                credit_seller(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
+                debit_buyer(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
                 credit_position(
                     maker_position_loader,
                     maker.outcome,
@@ -1195,16 +1241,16 @@ fn apply_fill<'info>(
                     fill.fill_amount as i128,
                 )?;
             }
-            Ok(TradeResult {
+            TradeResult {
                 creator_fee: taker_creator_fee,
                 platform_fee: taker_platform_fee,
                 yes_open_interest_delta: 0,
                 no_open_interest_delta: 0,
-            })
+            }
         }
         SettleBranch::MergeAndBurn => {
-            credit_seller(maker_ledger_loader, maker_cash, false, 0)?;
-            credit_seller(taker_ledger_loader, taker_cash, true, taker_total_fee)?;
+            credit_seller(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
+            credit_seller(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
             credit_position(
                 maker_position_loader,
                 maker.outcome,
@@ -1215,14 +1261,33 @@ fn apply_fill<'info>(
                 taker.outcome,
                 -(fill.fill_amount as i128),
             )?;
-            Ok(TradeResult {
+            TradeResult {
                 creator_fee: taker_creator_fee,
                 platform_fee: taker_platform_fee,
                 yes_open_interest_delta: -(fill.fill_amount as i128),
                 no_open_interest_delta: -(fill.fill_amount as i128),
-            })
+            }
         }
+    };
+    {
+        let mut maker_state = maker_order_state_loader.load_mut()?;
+        maker_state.paid_cash = maker_cash.new_paid_cash;
+        maker_state.cash_remainder = maker_cash.new_remainder;
     }
+    {
+        let mut taker_state = taker_order_state_loader.load_mut()?;
+        taker_state.paid_cash = taker_cash.new_paid_cash;
+        taker_state.cash_remainder = taker_cash.new_remainder;
+        taker_state.paid_creator_fee = accumulate_paid_fee(
+            taker_state.paid_creator_fee,
+            taker_creator_fee,
+        )?;
+        taker_state.paid_platform_fee = accumulate_paid_fee(
+            taker_state.paid_platform_fee,
+            taker_platform_fee,
+        )?;
+    }
+    Ok(trade_result)
 }
 
 fn debit_buyer<'info>(
@@ -1321,6 +1386,63 @@ fn trade_cash_for_order(order: &OrderIntentV1, qty: u64, fill_price: u64) -> Res
     ceil_mul_div(qty, effective_price, 100)
 }
 
+struct CashProgress {
+    delta_cash: u64,
+    new_paid_cash: u64,
+    new_remainder: u8,
+}
+
+fn cash_progress_after_fill(
+    order: &OrderIntentV1,
+    order_state: &OrderState,
+    qty: u64,
+    fill_price: u64,
+) -> Result<CashProgress> {
+    let effective_price = match order.outcome {
+        Outcome::Yes => fill_price,
+        Outcome::No => 100u64
+            .checked_sub(fill_price)
+            .ok_or(ErrorCode::MathOverflow)?,
+    };
+    let increment = (qty as u128)
+        .checked_mul(effective_price as u128)
+        .ok_or(ErrorCode::MathOverflow)?;
+    let previous_remainder = order_state.cash_remainder as u128;
+    let previous_carry = if previous_remainder > 0 { 1u128 } else { 0u128 };
+    let combined = previous_remainder
+        .checked_add(increment)
+        .ok_or(ErrorCode::MathOverflow)?;
+    let rounded_total = combined
+        .checked_add(99)
+        .ok_or(ErrorCode::MathOverflow)?
+        / 100;
+    require!(rounded_total >= previous_carry, ErrorCode::MathOverflow);
+    let delta_cash =
+        u64::try_from(rounded_total - previous_carry).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let new_paid_cash = order_state
+        .paid_cash
+        .checked_add(delta_cash)
+        .ok_or(ErrorCode::MathOverflow)?;
+    let new_remainder =
+        u8::try_from(combined % 100).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    Ok(CashProgress {
+        delta_cash,
+        new_paid_cash,
+        new_remainder,
+    })
+}
+
+fn accumulate_paid_fee(current: u64, delta: u64) -> Result<u64> {
+    current.checked_add(delta).ok_or_else(|| error!(ErrorCode::MathOverflow))
+}
+
+fn minimum_order_notional(order: &OrderIntentV1) -> Result<u64> {
+    if order.order_type == OrderType::Market && order.side == Side::Buy {
+        return Ok(order.total_amount);
+    }
+    ceil_mul_div(order.total_amount, order.limit_price, 100)
+}
+
 fn ceil_mul_div(lhs: u64, rhs: u64, denominator: u64) -> Result<u64> {
     require!(denominator > 0, ErrorCode::MathOverflow);
     let numerator = (lhs as u128)
@@ -1373,7 +1495,6 @@ mod tests {
     fn sample_order(side: Side, outcome: Outcome) -> OrderIntentV1 {
         OrderIntentV1 {
             version: 1,
-            chain_id: 245,
             program_id: crate::ID,
             market: Pubkey::new_unique(),
             user: Pubkey::new_unique(),
@@ -1414,8 +1535,22 @@ mod tests {
         let mut order = sample_order(Side::Buy, Outcome::Yes);
         order.order_type = OrderType::Market;
         order.total_amount = 60;
+        let state = OrderState {
+            owner: order.user,
+            nonce: order.nonce,
+            order_hash: [0; 32],
+            total_amount: order.total_amount,
+            filled_amount: 0,
+            paid_cash: 0,
+            paid_creator_fee: 0,
+            paid_platform_fee: 0,
+            cash_remainder: 0,
+            canceled: 0,
+            bump: 0,
+            _reserved: [0; 5],
+        };
 
-        assert_eq!(order_progress_amount(&order, 100, 60).unwrap(), 60);
+        assert_eq!(order_progress_delta(&order, &state, 100, 60).unwrap(), 60);
     }
 
     #[test]
@@ -1452,5 +1587,64 @@ mod tests {
         ix.extend_from_slice(&message);
 
         assert!(ed25519_instruction_matches(&ix, &pubkey, &message).unwrap());
+    }
+
+    #[test]
+    fn cash_progress_is_path_independent_for_split_fills() {
+        let order = sample_order(Side::Buy, Outcome::Yes);
+        let mut state = OrderState {
+            owner: order.user,
+            nonce: order.nonce,
+            order_hash: [0; 32],
+            total_amount: order.total_amount,
+            filled_amount: 0,
+            paid_cash: 0,
+            paid_creator_fee: 0,
+            paid_platform_fee: 0,
+            cash_remainder: 0,
+            canceled: 0,
+            bump: 0,
+            _reserved: [0; 5],
+        };
+        let first = cash_progress_after_fill(&order, &state, 1, 50).unwrap();
+        state.paid_cash = first.new_paid_cash;
+        state.cash_remainder = first.new_remainder;
+        let second = cash_progress_after_fill(&order, &state, 1, 50).unwrap();
+
+        let one_shot = cash_progress_after_fill(
+            &order,
+            &OrderState {
+                owner: order.user,
+                nonce: order.nonce,
+                order_hash: [0; 32],
+                total_amount: order.total_amount,
+                filled_amount: 0,
+                paid_cash: 0,
+                paid_creator_fee: 0,
+                paid_platform_fee: 0,
+                cash_remainder: 0,
+                canceled: 0,
+                bump: 0,
+                _reserved: [0; 5],
+            },
+            2,
+            50,
+        )
+        .unwrap();
+
+        assert_eq!(first.delta_cash + second.delta_cash, one_shot.delta_cash);
+        assert_eq!(second.new_paid_cash, one_shot.new_paid_cash);
+        assert_eq!(second.new_remainder, one_shot.new_remainder);
+    }
+
+    #[test]
+    fn minimum_order_notional_enforces_one_usdc() {
+        let mut order = sample_order(Side::Buy, Outcome::Yes);
+        order.total_amount = 100;
+        order.limit_price = 99;
+        assert_eq!(minimum_order_notional(&order).unwrap(), 99);
+
+        order.total_amount = 102;
+        assert_eq!(minimum_order_notional(&order).unwrap(), 101);
     }
 }

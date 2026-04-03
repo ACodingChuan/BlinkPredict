@@ -19,7 +19,6 @@ type TokenActionRequest struct {
 // 根据订单系统全局规范 V1 (orderDesign.md)
 type PlaceOrderRequest struct {
 	Version       uint8  `json:"version"`
-	ChainID       uint16 `json:"chain_id"`
 	ProgramID     string `json:"program_id"`
 	Market        string `json:"market"`
 	User          string `json:"user"`

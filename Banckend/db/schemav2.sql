@@ -118,6 +118,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_requests_chain_signature
     ON deposit_requests (chain_signature)
     WHERE chain_signature IS NOT NULL AND chain_signature <> '';
 
+CREATE TABLE IF NOT EXISTS deposit_submissions (
+    signature TEXT PRIMARY KEY,
+    wallet_address VARCHAR(44) NOT NULL,
+    amount_units BIGINT NOT NULL CHECK (amount_units > 0),
+    status TEXT NOT NULL CHECK (status IN ('submitted', 'watching', 'confirmed', 'failed', 'expired')),
+    failure_reason TEXT NOT NULL DEFAULT '',
+    slot BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    confirmed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_deposit_submissions_status_created
+    ON deposit_submissions (status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_deposit_submissions_wallet_created
+    ON deposit_submissions (wallet_address, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS webhook_receipts (
     event_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,

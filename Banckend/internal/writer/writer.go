@@ -32,11 +32,12 @@ const (
 )
 
 type Writer struct {
-	consumerName string
-	pool         *pgxpool.Pool
-	client       *natsjs.Client
-	rdb          *redis.Client
-	sub          *nats.Subscription
+	consumerName  string
+	pool          *pgxpool.Pool
+	client        *natsjs.Client
+	rdb           *redis.Client
+	sub           *nats.Subscription
+	settlementSub *nats.Subscription
 }
 
 type pushMessages struct {
@@ -50,9 +51,10 @@ type positionDelta struct {
 	WalletAddress         string
 	YesFreeLotsDelta      int64
 	YesLockedLotsDelta    int64
+	YesPendingLotsDelta   int64
 	NoFreeLotsDelta       int64
 	NoLockedLotsDelta     int64
-	CollateralFreeDelta   int64
+	NoPendingLotsDelta    int64
 	CollateralLockedDelta int64
 }
 
@@ -89,6 +91,9 @@ func (w *Writer) Start(ctx context.Context) error {
 	if err := w.ensureSubscription(); err != nil {
 		return err
 	}
+	if err := w.ensureSettlementSubscription(); err != nil {
+		return err
+	}
 	if err := w.catchUp(ctx); err != nil {
 		return err
 	}
@@ -105,6 +110,25 @@ func (w *Writer) ensureSubscription() error {
 		return fmt.Errorf("writer subscribe: %w", err)
 	}
 	w.sub = sub
+	return nil
+}
+
+func (w *Writer) ensureSettlementSubscription() error {
+	if w.settlementSub != nil {
+		return nil
+	}
+	sub, err := w.client.JetStream().QueueSubscribe(
+		protocol.SubjectSettlementConfirm+".*",
+		"writer_settlement_group",
+		w.handleSettlementConfirmedMessage,
+		nats.Durable("writer-settlement-confirmed"),
+		nats.ManualAck(),
+		nats.DeliverNew(),
+	)
+	if err != nil {
+		return fmt.Errorf("writer settlement subscribe: %w", err)
+	}
+	w.settlementSub = sub
 	return nil
 }
 
@@ -130,6 +154,9 @@ func (w *Writer) run(ctx context.Context) {
 	defer func() {
 		if w.sub != nil {
 			_ = w.sub.Unsubscribe()
+		}
+		if w.settlementSub != nil {
+			_ = w.settlementSub.Unsubscribe()
 		}
 	}()
 
@@ -244,12 +271,6 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	if err := w.handleOrderLocks(ctx, tx, &batch); err != nil {
-		logger.Warnf("handle order locks failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
-		_ = msg.NakWithDelay(time.Second)
-		return
-	}
-
 	if err := w.advanceCursor(ctx, tx, batch.MarketID, evtSeq, sourceCmdSeq); err != nil {
 		logger.Warnf("advance cursor failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
@@ -274,6 +295,58 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		logger.Infof("writer acked stream_seq=%d market=%d deliveries=%d elapsed=%s trades=%d states=%d depths=%d",
 			meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, elapsed.Round(time.Millisecond), len(batch.TradeEvents), len(batch.StateEvents), len(batch.DepthEvents))
 	}
+}
+
+func (w *Writer) handleSettlementConfirmedMessage(msg *nats.Msg) {
+	var event protocol.SettlementConfirmedEvent
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		logger.Warnf("writer settlement decode failed: %v", err)
+		_ = msg.Term()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := w.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		logger.Warnf("writer settlement begin tx failed market=%d err=%v", event.MarketID, err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	marketIDStr := strconv.FormatUint(event.MarketID, 10)
+	for _, wallet := range event.Wallets {
+		wallet = strings.TrimSpace(wallet)
+		if wallet == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE positions
+			SET
+				yes_free_lots = yes_free_lots + yes_pending_lots,
+				yes_pending_lots = 0,
+				no_free_lots = no_free_lots + no_pending_lots,
+				no_pending_lots = 0,
+				updated_at = NOW()
+			WHERE market_id = $1::NUMERIC(20,0) AND wallet_address = $2
+		`, marketIDStr, wallet); err != nil {
+			logger.Warnf("writer settlement apply positions failed market=%d wallet=%s err=%v", event.MarketID, wallet, err)
+			_ = msg.NakWithDelay(time.Second)
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		logger.Warnf("writer settlement commit failed market=%d err=%v", event.MarketID, err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+	if w.rdb != nil {
+		if err := w.syncPositionRedis(ctx, &matching.BatchEventPayload{MarketID: event.MarketID}); err != nil {
+			logger.Warnf("writer settlement redis sync failed market=%d err=%v", event.MarketID, err)
+		}
+	}
+	_ = msg.Ack()
 }
 
 func (w *Writer) lockCursorRow(ctx context.Context, tx pgx.Tx, marketID uint64) (int64, error) {
@@ -344,11 +417,11 @@ func (w *Writer) upsertSourceOrder(ctx context.Context, tx pgx.Tx, marketID uint
 	_, err = tx.Exec(ctx, `
 		INSERT INTO orders (
 			order_id, market_id, wallet_address, original_action, original_outcome, original_price_tick, side, order_type, price_tick,
-			initial_qty, initial_spend_amount, remaining_qty, expire_time,
+			initial_qty, initial_spend_amount, remaining_qty, remaining_spend_amount, expire_time,
 			status, signature, intent_hex, nonce, created_cmd_seq, created_at, updated_at
 		) VALUES (
 			$1, $2::NUMERIC(20,0), $3, $4, $5, $6, $7, $8, $9,
-			$10, $11, $10, $12,
+			$10, $11, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $18
 		)
 		ON CONFLICT (order_id) DO NOTHING
@@ -460,10 +533,11 @@ func (w *Writer) applyStateEvents(ctx context.Context, tx pgx.Tx, batch *matchin
 		tag, err := tx.Exec(ctx, `
 			UPDATE orders
 			SET remaining_qty = $1,
-				status = $2,
-				updated_at = $3
-			WHERE order_id = $4
-		`, remainingQty, int16(state.Status), now, orderID)
+				remaining_spend_amount = $2,
+				status = $3,
+				updated_at = $4
+			WHERE order_id = $5
+		`, remainingQty, int64(state.RemainingSpendAmount), int16(state.Status), now, orderID)
 		if err != nil {
 			return err
 		}
@@ -503,9 +577,10 @@ func (w *Writer) buildPositionDeltas(ctx context.Context, tx pgx.Tx, batch *matc
 		existing := acc[key]
 		existing.YesFreeLotsDelta += delta.YesFreeLotsDelta
 		existing.YesLockedLotsDelta += delta.YesLockedLotsDelta
+		existing.YesPendingLotsDelta += delta.YesPendingLotsDelta
 		existing.NoFreeLotsDelta += delta.NoFreeLotsDelta
 		existing.NoLockedLotsDelta += delta.NoLockedLotsDelta
-		existing.CollateralFreeDelta += delta.CollateralFreeDelta
+		existing.NoPendingLotsDelta += delta.NoPendingLotsDelta
 		existing.CollateralLockedDelta += delta.CollateralLockedDelta
 	}
 
@@ -619,11 +694,11 @@ func (w *Writer) applySinglePositionDelta(ctx context.Context, tx pgx.Tx, delta 
 	_, err := tx.Exec(ctx, `
 		INSERT INTO positions (
 			market_id, wallet_address,
-			yes_free_lots, yes_locked_lots,
-			no_free_lots, no_locked_lots,
-			collateral_free_units, collateral_locked_units,
+			yes_free_lots, yes_locked_lots, yes_pending_lots,
+			no_free_lots, no_locked_lots, no_pending_lots,
+			collateral_locked_units,
 			updated_at
-		) VALUES ($1::NUMERIC(20,0), $2, 0, 0, 0, 0, 0, 0, NOW())
+		) VALUES ($1::NUMERIC(20,0), $2, 0, 0, 0, 0, 0, 0, 0, NOW())
 		ON CONFLICT (market_id, wallet_address) DO NOTHING
 	`, marketIDStr, delta.WalletAddress)
 	if err != nil {
@@ -634,13 +709,14 @@ func (w *Writer) applySinglePositionDelta(ctx context.Context, tx pgx.Tx, delta 
 		SET
 			yes_free_lots = yes_free_lots + $1,
 			yes_locked_lots = yes_locked_lots + $2,
-			no_free_lots = no_free_lots + $3,
-			no_locked_lots = no_locked_lots + $4,
-			collateral_free_units = collateral_free_units + $5,
-			collateral_locked_units = collateral_locked_units + $6,
+			yes_pending_lots = yes_pending_lots + $3,
+			no_free_lots = no_free_lots + $4,
+			no_locked_lots = no_locked_lots + $5,
+			no_pending_lots = no_pending_lots + $6,
+			collateral_locked_units = collateral_locked_units + $7,
 			updated_at = NOW()
-		WHERE market_id = $7::NUMERIC(20,0) AND wallet_address = $8
-	`, delta.YesFreeLotsDelta, delta.YesLockedLotsDelta, delta.NoFreeLotsDelta, delta.NoLockedLotsDelta, delta.CollateralFreeDelta, delta.CollateralLockedDelta, marketIDStr, delta.WalletAddress)
+		WHERE market_id = $8::NUMERIC(20,0) AND wallet_address = $9
+	`, delta.YesFreeLotsDelta, delta.YesLockedLotsDelta, delta.YesPendingLotsDelta, delta.NoFreeLotsDelta, delta.NoLockedLotsDelta, delta.NoPendingLotsDelta, delta.CollateralLockedDelta, marketIDStr, delta.WalletAddress)
 	return err
 }
 
@@ -731,7 +807,7 @@ func (w *Writer) rebuildDepths(ctx context.Context) error {
 func (w *Writer) rebuildActiveOrders(ctx context.Context) error {
 	rows, err := w.pool.Query(ctx, `
 		SELECT order_id, market_id, wallet_address, original_action, original_outcome, original_price_tick, side, order_type, price_tick,
-		       initial_qty, initial_spend_amount, remaining_qty, expire_time,
+		       initial_qty, initial_spend_amount, remaining_qty, remaining_spend_amount, expire_time,
 		       status, created_cmd_seq, EXTRACT(EPOCH FROM updated_at)::BIGINT
 		FROM orders
 		WHERE status IN (1, 2)
@@ -756,6 +832,7 @@ func (w *Writer) rebuildActiveOrders(ctx context.Context) error {
 			initialQty         int64
 			initialSpendAmount int64
 			remainingQty       int64
+			remainingSpend     int64
 			expireTime         int64
 			status             int16
 			createdCmdSeq      int64
@@ -763,28 +840,29 @@ func (w *Writer) rebuildActiveOrders(ctx context.Context) error {
 		)
 		if err := rows.Scan(
 			&orderID, &marketIDStr, &walletAddress, &originalAction, &originalOutcome, &originalPriceTick, &side, &orderType, &priceTick,
-			&initialQty, &initialSpendAmount, &remainingQty, &expireTime,
+			&initialQty, &initialSpendAmount, &remainingQty, &remainingSpend, &expireTime,
 			&status, &createdCmdSeq, &updatedAtUnix,
 		); err != nil {
 			return err
 		}
 		w.writeOpenOrderToRedis(ctx, pipe, openOrderProjection{
-			OrderID:            orderID,
-			MarketID:           marketIDStr,
-			WalletAddress:      walletAddress,
-			OriginalAction:     originalAction,
-			OriginalOutcome:    originalOutcome,
-			OriginalPriceTick:  int(originalPriceTick),
-			Side:               int(side),
-			OrderType:          int(orderType),
-			PriceTick:          int(priceTick),
-			InitialQty:         initialQty,
-			InitialSpendAmount: initialSpendAmount,
-			RemainingQty:       remainingQty,
-			ExpireTime:         expireTime,
-			Status:             int(status),
-			CreatedCmdSeq:      createdCmdSeq,
-			UpdatedAtUnix:      updatedAtUnix,
+			OrderID:              orderID,
+			MarketID:             marketIDStr,
+			WalletAddress:        walletAddress,
+			OriginalAction:       originalAction,
+			OriginalOutcome:      originalOutcome,
+			OriginalPriceTick:    int(originalPriceTick),
+			Side:                 int(side),
+			OrderType:            int(orderType),
+			PriceTick:            int(priceTick),
+			InitialQty:           initialQty,
+			InitialSpendAmount:   initialSpendAmount,
+			RemainingQty:         remainingQty,
+			RemainingSpendAmount: remainingSpend,
+			ExpireTime:           expireTime,
+			Status:               int(status),
+			CreatedCmdSeq:        createdCmdSeq,
+			UpdatedAtUnix:        updatedAtUnix,
 		})
 	}
 	if rows.Err() != nil {
@@ -845,9 +923,9 @@ func (w *Writer) rebuildRecentTrades(ctx context.Context) error {
 func (w *Writer) rebuildPositions(ctx context.Context) error {
 	rows, err := w.pool.Query(ctx, `
 		SELECT market_id, wallet_address,
-		       yes_free_lots, yes_locked_lots,
-		       no_free_lots, no_locked_lots,
-		       collateral_free_units, collateral_locked_units,
+		       yes_free_lots, yes_locked_lots, yes_pending_lots,
+		       no_free_lots, no_locked_lots, no_pending_lots,
+		       collateral_locked_units,
 		       EXTRACT(EPOCH FROM updated_at)::BIGINT
 		FROM positions
 	`)
@@ -863,17 +941,18 @@ func (w *Writer) rebuildPositions(ctx context.Context) error {
 			walletAddress         string
 			yesFreeLots           int64
 			yesLockedLots         int64
+			yesPendingLots        int64
 			noFreeLots            int64
 			noLockedLots          int64
-			collateralFreeUnits   int64
+			noPendingLots         int64
 			collateralLockedUnits int64
 			updatedAtUnix         int64
 		)
 		if err := rows.Scan(
 			&marketIDStr, &walletAddress,
-			&yesFreeLots, &yesLockedLots,
-			&noFreeLots, &noLockedLots,
-			&collateralFreeUnits, &collateralLockedUnits,
+			&yesFreeLots, &yesLockedLots, &yesPendingLots,
+			&noFreeLots, &noLockedLots, &noPendingLots,
+			&collateralLockedUnits,
 			&updatedAtUnix,
 		); err != nil {
 			return err
@@ -882,9 +961,10 @@ func (w *Writer) rebuildPositions(ctx context.Context) error {
 		pipe.HSet(ctx, key, map[string]any{
 			"yes_free_lots":           yesFreeLots,
 			"yes_locked_lots":         yesLockedLots,
+			"yes_pending_lots":        yesPendingLots,
 			"no_free_lots":            noFreeLots,
 			"no_locked_lots":          noLockedLots,
-			"collateral_free_units":   collateralFreeUnits,
+			"no_pending_lots":         noPendingLots,
 			"collateral_locked_units": collateralLockedUnits,
 			"updated_at":              updatedAtUnix,
 		})
@@ -1051,9 +1131,10 @@ type openOrderProjection struct {
 type positionProjection struct {
 	YesFreeLots           int64
 	YesLockedLots         int64
+	YesPendingLots        int64
 	NoFreeLots            int64
 	NoLockedLots          int64
-	CollateralFreeUnits   int64
+	NoPendingLots         int64
 	CollateralLockedUnits int64
 	UpdatedAtUnix         int64
 }
@@ -1142,9 +1223,9 @@ func (w *Writer) syncPositionRedis(ctx context.Context, batch *matching.BatchEve
 	marketIDStr := strconv.FormatUint(batch.MarketID, 10)
 	rows, err := w.pool.Query(ctx, `
 		SELECT market_id, wallet_address,
-		       yes_free_lots, yes_locked_lots,
-		       no_free_lots, no_locked_lots,
-		       collateral_free_units, collateral_locked_units,
+		       yes_free_lots, yes_locked_lots, yes_pending_lots,
+		       no_free_lots, no_locked_lots, no_pending_lots,
+		       collateral_locked_units,
 		       EXTRACT(EPOCH FROM updated_at)::BIGINT
 		FROM positions
 		WHERE market_id = $1::NUMERIC(20,0)
@@ -1160,17 +1241,18 @@ func (w *Writer) syncPositionRedis(ctx context.Context, batch *matching.BatchEve
 			walletAddress         string
 			yesFreeLots           int64
 			yesLockedLots         int64
+			yesPendingLots        int64
 			noFreeLots            int64
 			noLockedLots          int64
-			collateralFreeUnits   int64
+			noPendingLots         int64
 			collateralLockedUnits int64
 			updatedAtUnix         int64
 		)
 		if err := rows.Scan(
 			&marketIDStr, &walletAddress,
-			&yesFreeLots, &yesLockedLots,
-			&noFreeLots, &noLockedLots,
-			&collateralFreeUnits, &collateralLockedUnits,
+			&yesFreeLots, &yesLockedLots, &yesPendingLots,
+			&noFreeLots, &noLockedLots, &noPendingLots,
+			&collateralLockedUnits,
 			&updatedAtUnix,
 		); err != nil {
 			return err
@@ -1178,9 +1260,10 @@ func (w *Writer) syncPositionRedis(ctx context.Context, batch *matching.BatchEve
 		writePositionToRedis(ctx, pipe, marketIDStr, walletAddress, positionProjection{
 			YesFreeLots:           yesFreeLots,
 			YesLockedLots:         yesLockedLots,
+			YesPendingLots:        yesPendingLots,
 			NoFreeLots:            noFreeLots,
 			NoLockedLots:          noLockedLots,
-			CollateralFreeUnits:   collateralFreeUnits,
+			NoPendingLots:         noPendingLots,
 			CollateralLockedUnits: collateralLockedUnits,
 			UpdatedAtUnix:         updatedAtUnix,
 		})
@@ -1197,9 +1280,10 @@ func writePositionToRedis(ctx context.Context, pipe redis.Pipeliner, marketID st
 	pipe.HSet(ctx, key, map[string]any{
 		"yes_free_lots":           position.YesFreeLots,
 		"yes_locked_lots":         position.YesLockedLots,
+		"yes_pending_lots":        position.YesPendingLots,
 		"no_free_lots":            position.NoFreeLots,
 		"no_locked_lots":          position.NoLockedLots,
-		"collateral_free_units":   position.CollateralFreeUnits,
+		"no_pending_lots":         position.NoPendingLots,
 		"collateral_locked_units": position.CollateralLockedUnits,
 		"updated_at":              position.UpdatedAtUnix,
 	})
@@ -1554,7 +1638,6 @@ func initialLockDelta(marketID uint64, meta orderMeta, initialQty uint64, initia
 		if meta.OrderType == matching.OrderTypeLimit {
 			required = int64(reservedUnitsForLots(initialQty, meta.OriginalPriceTick))
 		}
-		delta.CollateralFreeDelta -= required
 		delta.CollateralLockedDelta += required
 	case "sell":
 		if meta.OriginalOutcome == "yes" {
@@ -1570,19 +1653,18 @@ func initialLockDelta(marketID uint64, meta orderMeta, initialQty uint64, initia
 
 func settlementDelta(marketID uint64, meta orderMeta, qty uint64, normalizedMatchPrice uint8) positionDelta {
 	delta := positionDelta{MarketID: marketID, WalletAddress: meta.WalletAddress}
-	actualUnits := int64(actualCollateralForTrade(meta, qty, normalizedMatchPrice))
 	switch meta.OriginalAction {
 	case "buy":
 		if meta.OriginalOutcome == "yes" {
-			delta.YesFreeLotsDelta += int64(qty)
+			delta.YesPendingLotsDelta += int64(qty)
 		} else {
-			delta.NoFreeLotsDelta += int64(qty)
+			delta.NoPendingLotsDelta += int64(qty)
 		}
 		if meta.OrderType == matching.OrderTypeLimit {
 			reserved := int64(reservedUnitsForLots(qty, meta.OriginalPriceTick))
 			delta.CollateralLockedDelta -= reserved
-			delta.CollateralFreeDelta += reserved - actualUnits
 		} else {
+			actualUnits := int64(actualCollateralForTrade(meta, qty, normalizedMatchPrice))
 			delta.CollateralLockedDelta -= actualUnits
 		}
 	case "sell":
@@ -1591,7 +1673,6 @@ func settlementDelta(marketID uint64, meta orderMeta, qty uint64, normalizedMatc
 		} else {
 			delta.NoLockedLotsDelta -= int64(qty)
 		}
-		delta.CollateralFreeDelta += actualUnits
 	}
 	return delta
 }
@@ -1605,7 +1686,6 @@ func unlockDelta(marketID uint64, meta orderMeta, remainingQty uint64, refundAmo
 			unlock = reservedUnitsForLots(remainingQty, meta.OriginalPriceTick)
 		}
 		delta.CollateralLockedDelta -= int64(unlock)
-		delta.CollateralFreeDelta += int64(unlock)
 	case "sell":
 		if meta.OriginalOutcome == "yes" {
 			delta.YesLockedLotsDelta -= int64(remainingQty)

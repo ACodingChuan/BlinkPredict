@@ -15,6 +15,102 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/api/auth/challenge": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Create auth challenge",
+                "parameters": [
+                    {
+                        "description": "Challenge request payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.authChallengeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.authChallengeResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.errorResponse"
+                        }
+                    },
+                    "501": {
+                        "description": "Not Implemented",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.errorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/login": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Login with signed challenge",
+                "parameters": [
+                    {
+                        "description": "Login request payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.authLoginRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.authLoginResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.errorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.errorResponse"
+                        }
+                    },
+                    "501": {
+                        "description": "Not Implemented",
+                        "schema": {
+                            "$ref": "#/definitions/httpapi.errorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/health": {
             "get": {
                 "produces": [
@@ -59,11 +155,6 @@ const docTemplate = `{
                 }
             },
             "post": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "consumes": [
                     "application/json"
                 ],
@@ -86,10 +177,10 @@ const docTemplate = `{
                     }
                 ],
                 "responses": {
-                    "201": {
-                        "description": "Created",
+                    "202": {
+                        "description": "Accepted",
                         "schema": {
-                            "$ref": "#/definitions/httpapi.marketResponse"
+                            "$ref": "#/definitions/httpapi.marketCreateAcceptedResponse"
                         }
                     },
                     "400": {
@@ -177,11 +268,6 @@ const docTemplate = `{
         },
         "/api/orders": {
             "post": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "consumes": [
                     "application/json"
                 ],
@@ -240,11 +326,6 @@ const docTemplate = `{
         },
         "/api/orders/open/{marketId}": {
             "get": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "produces": [
                     "application/json"
                 ],
@@ -259,6 +340,12 @@ const docTemplate = `{
                         "name": "marketId",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Wallet address when auth is disabled",
+                        "name": "wallet_address",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -279,11 +366,6 @@ const docTemplate = `{
         },
         "/api/orders/{orderId}": {
             "delete": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "produces": [
                     "application/json"
                 ],
@@ -305,6 +387,12 @@ const docTemplate = `{
                         "name": "market_id",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Wallet address when auth is disabled",
+                        "name": "wallet_address",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -338,11 +426,6 @@ const docTemplate = `{
         },
         "/api/positions/{marketId}": {
             "get": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "produces": [
                     "application/json"
                 ],
@@ -357,6 +440,12 @@ const docTemplate = `{
                         "name": "marketId",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Wallet address when auth is disabled",
+                        "name": "wallet_address",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -470,11 +559,6 @@ const docTemplate = `{
         },
         "/api/wallet-account": {
             "get": {
-                "security": [
-                    {
-                        "PrivyToken": []
-                    }
-                ],
                 "produces": [
                     "application/json"
                 ],
@@ -482,6 +566,14 @@ const docTemplate = `{
                     "Positions"
                 ],
                 "summary": "Get current user's trading account balance",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Wallet address when auth is disabled",
+                        "name": "wallet_address",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -500,6 +592,67 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "httpapi.authChallengeRequest": {
+            "type": "object",
+            "properties": {
+                "wallet_address": {
+                    "type": "string"
+                }
+            }
+        },
+        "httpapi.authChallengeResponse": {
+            "type": "object",
+            "properties": {
+                "challenge_id": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "message": {
+                    "type": "string"
+                }
+            }
+        },
+        "httpapi.authLoginRequest": {
+            "type": "object",
+            "properties": {
+                "challenge_id": {
+                    "type": "string"
+                },
+                "signature": {
+                    "type": "string"
+                },
+                "wallet_address": {
+                    "type": "string"
+                }
+            }
+        },
+        "httpapi.authLoginResponse": {
+            "type": "object",
+            "properties": {
+                "auth_token": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "user": {
+                    "$ref": "#/definitions/httpapi.authLoginUserResponse"
+                }
+            }
+        },
+        "httpapi.authLoginUserResponse": {
+            "type": "object",
+            "properties": {
+                "isAdmin": {
+                    "type": "boolean"
+                },
+                "walletAddress": {
+                    "type": "string"
+                }
+            }
+        },
         "httpapi.cancelOrderAcceptedResponse": {
             "type": "object",
             "properties": {
@@ -529,6 +682,20 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "service": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "httpapi.marketCreateAcceptedResponse": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string"
+                },
+                "signature": {
                     "type": "string"
                 },
                 "status": {
@@ -592,9 +759,6 @@ const docTemplate = `{
         "httpapi.positionResponse": {
             "type": "object",
             "properties": {
-                "collateral_free_units": {
-                    "type": "string"
-                },
                 "collateral_locked_units": {
                     "type": "string"
                 },
@@ -607,6 +771,9 @@ const docTemplate = `{
                 "no_locked_lots": {
                     "type": "string"
                 },
+                "no_pending_lots": {
+                    "type": "string"
+                },
                 "wallet_address": {
                     "type": "string"
                 },
@@ -614,6 +781,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "yes_locked_lots": {
+                    "type": "string"
+                },
+                "yes_pending_lots": {
                     "type": "string"
                 }
             }
@@ -658,6 +828,12 @@ const docTemplate = `{
                 "collateral_free_units": {
                     "type": "string"
                 },
+                "collateral_locked_units": {
+                    "type": "string"
+                },
+                "collateral_pending_units": {
+                    "type": "string"
+                },
                 "collateral_total_units": {
                     "type": "string"
                 },
@@ -669,28 +845,7 @@ const docTemplate = `{
         "markets.CreateMarketRequest": {
             "type": "object",
             "properties": {
-                "category": {
-                    "type": "string"
-                },
-                "close_time": {
-                    "type": "string"
-                },
-                "collateral_mint": {
-                    "type": "string"
-                },
-                "description": {
-                    "type": "string"
-                },
-                "image_url": {
-                    "type": "string"
-                },
-                "metadata_url": {
-                    "type": "string"
-                },
-                "resolution": {
-                    "$ref": "#/definitions/markets.ResolutionConfig"
-                },
-                "title": {
+                "signature": {
                     "type": "string"
                 }
             }
@@ -701,17 +856,20 @@ const docTemplate = `{
                 "category": {
                     "type": "string"
                 },
+                "claim_deadline_time": {
+                    "type": "string"
+                },
                 "close_time": {
                     "type": "string"
                 },
                 "collateral_mint": {
                     "type": "string"
                 },
-                "collateral_vault": {
-                    "type": "string"
-                },
                 "created_at": {
                     "type": "string"
+                },
+                "creator_unclaimed_fee": {
+                    "type": "integer"
                 },
                 "description": {
                     "type": "string"
@@ -729,17 +887,23 @@ const docTemplate = `{
                 "market_pda": {
                     "type": "string"
                 },
-                "metadata_url": {
+                "metadata_cid": {
                     "type": "string"
                 },
-                "no_mint": {
+                "metadata_url": {
                     "type": "string"
                 },
                 "outcome": {
                     "$ref": "#/definitions/markets.MarketOutcome"
                 },
+                "platform_unclaimed_fee": {
+                    "type": "integer"
+                },
                 "resolution": {
                     "$ref": "#/definitions/markets.ResolutionConfig"
+                },
+                "resolve_after_time": {
+                    "type": "string"
                 },
                 "resolved_at": {
                     "type": "string"
@@ -751,9 +915,6 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "updated_at": {
-                    "type": "string"
-                },
-                "yes_mint": {
                     "type": "string"
                 }
             }
@@ -812,8 +973,8 @@ const docTemplate = `{
                 "oracle_feed": {
                     "type": "string"
                 },
-                "oracle_observation_time": {
-                    "type": "string"
+                "oracle_target_expo": {
+                    "type": "integer"
                 },
                 "oracle_target_price": {
                     "type": "integer"
@@ -847,6 +1008,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "side": {
+                    "type": "string"
+                },
+                "status": {
                     "type": "string"
                 }
             }
@@ -955,67 +1119,50 @@ const docTemplate = `{
         "orders.PlaceOrderRequest": {
             "type": "object",
             "properties": {
-                "expire_time": {
-                    "description": "Unix秒级时间戳 (0=GTC)",
+                "expiry_ts": {
                     "type": "integer"
                 },
-                "market_id": {
-                    "description": "市场ID",
-                    "type": "string",
-                    "example": "0"
+                "limit_price": {
+                    "type": "integer"
+                },
+                "market": {
+                    "type": "string"
                 },
                 "nonce": {
-                    "description": "防碰撞nonce (42位时间戳+22位随机数)",
                     "type": "string",
                     "example": "0"
                 },
                 "order_type": {
-                    "description": "\"limit\" | \"market\"",
                     "type": "string"
                 },
-                "original_action": {
-                    "description": "用户原始动作: buy | sell",
+                "outcome": {
                     "type": "string"
                 },
-                "original_outcome": {
-                    "description": "用户原始标的: yes | no",
+                "program_id": {
                     "type": "string"
-                },
-                "original_price_tick": {
-                    "description": "用户原始价格/滑点边界",
-                    "type": "integer"
-                },
-                "price_tick": {
-                    "description": "归一化后的 1-99",
-                    "type": "integer"
-                },
-                "qty_lots": {
-                    "description": "份额 (乘100后的整数，市价买入为0)",
-                    "type": "integer"
                 },
                 "side": {
-                    "description": "归一化后的 \"buy\" | \"sell\" (只面向 YES)",
                     "type": "string"
                 },
                 "signature": {
-                    "description": "base64 Ed25519签名 (对Keccak256(Borsh(Intent))签名)",
                     "type": "string"
                 },
-                "spend_amount": {
-                    "description": "金额 (乘100后的整数，仅市价买入有值)",
+                "total_amount": {
                     "type": "integer"
                 },
-                "wallet_address": {
-                    "description": "用户钱包地址 (base58)",
+                "user": {
                     "type": "string"
+                },
+                "version": {
+                    "type": "integer"
                 }
             }
         }
     },
     "securityDefinitions": {
-        "PrivyToken": {
+        "BearerAuth": {
             "type": "apiKey",
-            "name": "privy-id-token",
+            "name": "Authorization",
             "in": "header"
         }
     }

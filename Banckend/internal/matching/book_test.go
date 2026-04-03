@@ -7,8 +7,6 @@ import (
 
 func TestMarketBuySpendUsesLotScaling(t *testing.T) {
 	book := NewFixedArrayOrderBook(1001)
-	wallets := NewSharedWalletManager()
-	wallets.SeedLedger("taker", UserWallet{AvailableUSDC: 1000})
 	maker := AcquireOrder()
 	maker.OrderID = 1
 	maker.MarketPDA = "market"
@@ -20,7 +18,6 @@ func TestMarketBuySpendUsesLotScaling(t *testing.T) {
 	maker.PriceTick = 50
 	maker.RemainingQty = 1000 // 10.00 shares
 	book.RestoreOrder(maker)
-	wallets.RecoverOrderLock(maker, "market")
 
 	taker := &PlaceOrderCommand{
 		OrderID:           2,
@@ -40,7 +37,7 @@ func TestMarketBuySpendUsesLotScaling(t *testing.T) {
 	batch := newPendingBatch(1001, "market", testNow())
 	batch.includeWrapper(&CommandWrapper{Cmd: taker, SourceCmdSeq: 1}, testNow())
 
-	book.ProcessCommand(taker, wallets, batch)
+	book.ProcessCommand(taker, batch)
 
 	if len(batch.event.Fills) != 1 {
 		t.Fatalf("expected one fill, got %d", len(batch.event.Fills))
@@ -52,8 +49,6 @@ func TestMarketBuySpendUsesLotScaling(t *testing.T) {
 
 func TestMarketBuyNoUsesSpendAgainstBidBook(t *testing.T) {
 	book := NewFixedArrayOrderBook(1002)
-	wallets := NewSharedWalletManager()
-	wallets.SeedLedger("taker", UserWallet{AvailableUSDC: 1000})
 
 	maker := AcquireOrder()
 	maker.OrderID = 1
@@ -67,7 +62,6 @@ func TestMarketBuyNoUsesSpendAgainstBidBook(t *testing.T) {
 	maker.PriceTick = 40
 	maker.RemainingQty = 1000
 	book.RestoreOrder(maker)
-	wallets.RecoverOrderLock(maker, "market")
 
 	taker := &PlaceOrderCommand{
 		OrderID:           2,
@@ -87,7 +81,7 @@ func TestMarketBuyNoUsesSpendAgainstBidBook(t *testing.T) {
 	batch := newPendingBatch(1002, "market", testNow())
 	batch.includeWrapper(&CommandWrapper{Cmd: taker, SourceCmdSeq: 1}, testNow())
 
-	book.ProcessCommand(taker, wallets, batch)
+	book.ProcessCommand(taker, batch)
 
 	if len(batch.event.Fills) != 1 {
 		t.Fatalf("expected one fill, got %d", len(batch.event.Fills))

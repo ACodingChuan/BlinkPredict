@@ -18,15 +18,18 @@ import (
 	"blinkpredict/banckend/internal/auth"
 	"blinkpredict/banckend/internal/cache"
 	"blinkpredict/banckend/internal/config"
+	"blinkpredict/banckend/internal/depositconfirm"
+	"blinkpredict/banckend/internal/deposits"
 	"blinkpredict/banckend/internal/faucet"
 	"blinkpredict/banckend/internal/indexer"
+	"blinkpredict/banckend/internal/logging"
+	"blinkpredict/banckend/internal/marketconfirm"
 	"blinkpredict/banckend/internal/markets"
-	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/orders"
 	"blinkpredict/banckend/internal/protocol"
 	"blinkpredict/banckend/internal/pusher"
+	"blinkpredict/banckend/internal/query"
 	"blinkpredict/banckend/internal/settlement"
-	"blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
 
@@ -53,7 +56,7 @@ var (
 type Server struct {
 	cfg       config.Config
 	markets   markets.Repository
-	matching  matching.Engine
+	matching  query.Engine
 	listener  indexer.Listener
 	writeGate interface {
 		OrdersReady() bool
@@ -74,7 +77,7 @@ type Server struct {
 	sessions              *auth.SessionManager
 }
 
-func New(cfg config.Config, repo markets.Repository, engine matching.Engine, listener indexer.Listener, writeGate interface {
+func New(cfg config.Config, repo markets.Repository, engine query.Engine, listener indexer.Listener, writeGate interface {
 	OrdersReady() bool
 	Status() map[string]any
 }, txStore *txreqs.Store, faucetSvc faucet.Service, cmdPublisher protocol.CommandPublisher, pusherHub *pusher.Hub, marketCache *cache.MarketCache, redisClient *redis.Client, dbPool *pgxpool.Pool, webhookHandler *webhooks.HeliusHandler, alchemyHandler *webhooks.AlchemyHandler, logger *zerolog.Logger) *Server {
@@ -91,13 +94,14 @@ func New(cfg config.Config, repo markets.Repository, engine matching.Engine, lis
 		cfg: cfg, markets: repo, matching: engine, listener: listener,
 		writeGate: writeGate, txRequests: txStore, faucet: faucetSvc, commands: cmdPublisher,
 		pusherHub: pusherHub, sonyflake: sf, marketCache: marketCache, redisClient: redisClient, dbPool: dbPool,
-		rpcClient:      rpc.New(cfg.SolanaRPCURL),
+		rpcClient:      logging.NewSolanaRPCClient("http-solana-rpc", cfg.SolanaRPCURL),
 		webhookHandler: webhookHandler, alchemyWebhookHandler: alchemyHandler, logger: logger, sessions: sessions,
 	}
 }
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(logging.HTTPMiddleware("http"))
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000"},
@@ -135,19 +139,19 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/webhooks/helius", s.handleHeliusWebhook)
 	// Alchemy Webhook (不需要认证)
 	r.Post("/api/webhooks/alchemy", s.handleAlchemyWebhook)
+	r.Post("/api/markets", s.handleCreateMarket)
+	r.Post("/api/faucet/claim", s.handleFaucetClaim)
+	r.Post("/api/deposits", s.handleSubmitDeposit)
+	r.Post("/api/orders", s.handlePlaceOrder)
+	r.Delete("/api/orders/{orderId}", s.handleCancelOrder)
 
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireUser)
-		// Market creation is open to any authenticated user in the new product model.
-		r.Post("/api/markets", s.handleCreateMarket)
-		r.Post("/api/faucet/claim", s.handleFaucetClaim)
 		r.Post("/api/markets/delegate", s.handleDelegate)
 		r.Post("/api/orders/split", s.handleSplit)
 		r.Post("/api/orders/merge", s.handleMerge)
 		r.Post("/api/claims", s.handleClaim)
-		r.Post("/api/orders", s.handlePlaceOrder)
 		r.Post("/api/ws-ticket", s.handleCreateWSTicket)
-		r.Delete("/api/orders/{orderId}", s.handleCancelOrder)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -169,22 +173,9 @@ func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	user, ok := auth.FromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	walletAddress := user.SolanaAddress
-	if walletAddress == "" && req.WalletAddress != "" {
-		walletAddress = strings.TrimSpace(req.WalletAddress)
-	}
-	if walletAddress == "" {
-		writeError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-	if _, err := gsolana.PublicKeyFromBase58(walletAddress); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid wallet_address")
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, req.WalletAddress)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -223,6 +214,70 @@ func (s *Server) handleFaucetClaim(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleSubmitDeposit(w http.ResponseWriter, r *http.Request) {
+	var req deposits.SubmitDepositRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Signature = strings.TrimSpace(req.Signature)
+	req.WalletAddress = strings.TrimSpace(req.WalletAddress)
+	if req.Signature == "" {
+		writeError(w, http.StatusBadRequest, "signature is required")
+		return
+	}
+	if req.AmountUnits == 0 {
+		writeError(w, http.StatusBadRequest, "amount_units must be greater than 0")
+		return
+	}
+	if _, err := gsolana.SignatureFromBase58(req.Signature); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid signature")
+		return
+	}
+	if _, err := gsolana.PublicKeyFromBase58(req.WalletAddress); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid wallet_address")
+		return
+	}
+	repo := depositconfirm.NewRepository(s.dbPool)
+	submission, err := repo.UpsertSubmitted(r.Context(), protocol.DepositConfirmCommand{
+		Signature:     req.Signature,
+		WalletAddress: req.WalletAddress,
+		AmountUnits:   req.AmountUnits,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if submission.WalletAddress != req.WalletAddress || submission.AmountUnits != req.AmountUnits {
+		writeError(w, http.StatusConflict, "signature already registered with a different wallet or amount")
+		return
+	}
+	if err := s.commands.PublishDepositConfirm(r.Context(), protocol.DepositConfirmCommand{
+		Signature:     submission.Signature,
+		WalletAddress: submission.WalletAddress,
+		AmountUnits:   submission.AmountUnits,
+	}); err != nil {
+		writeError(w, http.StatusNotImplemented, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, deposits.SubmitDepositResponse{
+		Status:        submission.Status,
+		Signature:     submission.Signature,
+		WalletAddress: submission.WalletAddress,
+		AmountUnits:   submission.AmountUnits,
+	})
+}
+
+// handleAuthChallenge godoc
+// @Summary Create auth challenge
+// @Tags Auth
+// @Accept json
+// @Produce json
+// @Param body body authChallengeRequest true "Challenge request payload"
+// @Success 200 {object} authChallengeResponse
+// @Failure 400 {object} errorResponse
+// @Failure 501 {object} errorResponse
+// @Router /api/auth/challenge [post]
 func (s *Server) handleAuthChallenge(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		writeError(w, http.StatusNotImplemented, "auth session manager is not configured")
@@ -247,6 +302,17 @@ func (s *Server) handleAuthChallenge(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAuthLogin godoc
+// @Summary Login with signed challenge
+// @Tags Auth
+// @Accept json
+// @Produce json
+// @Param body body authLoginRequest true "Login request payload"
+// @Success 200 {object} authLoginResponse
+// @Failure 400 {object} errorResponse
+// @Failure 401 {object} errorResponse
+// @Failure 501 {object} errorResponse
+// @Router /api/auth/login [post]
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		writeError(w, http.StatusNotImplemented, "auth session manager is not configured")
@@ -448,9 +514,8 @@ func (s *Server) handleGetMarket(w http.ResponseWriter, r *http.Request) {
 // @Tags Markets
 // @Accept json
 // @Produce json
-// @Security BearerAuth
 // @Param body body markets.CreateMarketRequest true "Create market payload"
-// @Success 201 {object} marketResponse
+// @Success 202 {object} marketCreateAcceptedResponse
 // @Failure 400 {object} errorResponse
 // @Failure 500 {object} errorResponse
 // @Router /api/markets [post]
@@ -460,58 +525,38 @@ func (s *Server) handleCreateMarket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := validateCreateMarket(req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	req.Signature = strings.TrimSpace(req.Signature)
+	if req.Signature == "" {
+		writeError(w, http.StatusBadRequest, "signature is required")
 		return
 	}
-	programID := gsolana.MustPublicKeyFromBase58(s.cfg.ProgramID)
-	marketID := solana.StableMarketID(req.Title + req.MetadataCID + req.CloseTime.UTC().String())
-	marketPDA, err := solana.DeriveMarketPDA(programID, marketID)
+	if _, err := gsolana.SignatureFromBase58(req.Signature); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid signature")
+		return
+	}
+	repo := marketconfirm.NewRepository(s.dbPool)
+	submission, err := repo.UpsertSubmitted(r.Context(), protocol.MarketConfirmCommand{
+		Signature: req.Signature,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	collateralMint := strings.TrimSpace(s.cfg.VUSDCMint)
-	if collateralMint == "" {
-		writeError(w, http.StatusInternalServerError, "VUSDC_MINT is required for market creation")
+	if err := s.commands.PublishMarketConfirm(r.Context(), protocol.MarketConfirmCommand{
+		Signature: submission.Signature,
+	}); err != nil {
+		writeError(w, http.StatusNotImplemented, err.Error())
 		return
 	}
-	now := time.Now().UTC()
-	entityID, err := s.nextSnowflakeID()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to generate market entity ID")
-		return
+	if s.logger != nil {
+		s.logger.Info().
+			Str("signature", submission.Signature).
+			Msg("accepted market create confirmation request")
 	}
-	market := markets.Market{
-		ID:                entityID,
-		MarketID:          marketID,
-		MarketPDA:         marketPDA.String(),
-		MetadataCID:       req.MetadataCID,
-		MetadataURL:       req.MetadataURL,
-		CollateralMint:    collateralMint,
-		Title:             req.Title,
-		Description:       req.Description,
-		Category:          req.Category,
-		ImageURL:          req.ImageURL,
-		Status:            markets.MarketStatusOpen,
-		Outcome:           markets.MarketOutcomeUndecided,
-		Resolution:        req.Resolution,
-		CloseTime:         req.CloseTime,
-		ResolveAfterTime:  req.ResolveAfterTime,
-		ClaimDeadlineTime: req.ClaimDeadlineTime,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}
-	if err := s.markets.Save(r.Context(), market); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	tx := s.txRequests.Create("create_market", marketID)
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"market":     market,
-		"tx_message": "",
-		"message":    "Market saved in v1a skeleton. Contract tx builder slots in here next.",
-		"tx_request": tx,
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"message":   "market create confirmation submitted",
+		"signature": submission.Signature,
+		"status":    submission.Status,
 	})
 }
 
@@ -682,7 +727,6 @@ func applyTokenAction(kind string, current positionSnapshot, account walletAccou
 // @Tags Orders
 // @Accept json
 // @Produce json
-// @Security BearerAuth
 // @Param body body orders.PlaceOrderRequest true "Place order payload"
 // @Success 202 {object} placeOrderAcceptedResponse
 // @Failure 400 {object} errorResponse
@@ -729,6 +773,17 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	if _, validatedIntentBytes, err := validateBorshOrderIntent(req, walletAddress); err != nil {
+		status := http.StatusBadRequest
+		switch {
+		case errors.Is(err, errOrderWalletMismatch), errors.Is(err, errOrderSignatureInvalid):
+			status = http.StatusUnauthorized
+		}
+		writeError(w, status, err.Error())
+		return
+	} else {
+		intentBytes = validatedIntentBytes
+	}
 	if err := s.precheckPlaceOrder(r.Context(), req, market, walletAddress); err != nil {
 		status := http.StatusBadRequest
 		switch {
@@ -745,15 +800,6 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	orderID, err := s.sonyflake.NextID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate order ID")
-		return
-	}
-
-	// 构建新的 PlaceOrderCommand
-	cmd := buildPlaceOrderCommandV1(req, intentBytes, orderID)
-
-	// 验证命令
-	if err := protocol.ValidatePlaceOrderCommand(cmd); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -774,13 +820,22 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to generate command ID")
 		return
 	}
+
+	// 构建新的 PlaceOrderCommand
+	cmd := buildPlaceOrderCommandV1(req, intentBytes, orderID)
 	cmd.CommandID = commandID
 	cmd.TraceID = traceID
 	cmd.IdempotencyKey = idempotencyKey
 
+	// 验证命令
+	if err := protocol.ValidatePlaceOrderCommand(cmd); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	envelope := protocol.CommandEnvelope[protocol.PlaceOrderCommand]{
 		ID:             commandID,
-		Type:           protocol.CommandTypePlaceOrder,
+		Type:           protocol.CommandTypeSubmitOrder,
 		SchemaVersion:  1,
 		MarketID:       req.MarketID,
 		Producer:       "gateway",
@@ -790,7 +845,7 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		Payload:        cmd,
 	}
 
-	if err := s.commands.PublishPlaceOrder(r.Context(), envelope); err != nil {
+	if err := s.commands.PublishSubmitOrder(r.Context(), envelope); err != nil {
 		status := http.StatusInternalServerError
 		message := "failed to publish place-order command"
 		code := "command_publish_failed"
@@ -959,15 +1014,19 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	}
 
 	if originalAction == "sell" {
-		if err != nil {
-			return nil
-		}
-		availableLots := position.YesFreeLots
-		if strings.EqualFold(req.OriginalOutcome, "no") {
-			availableLots = position.NoFreeLots
-		}
-		if availableLots < req.QtyLots {
-			return errInsufficientFunds
+		if err == nil {
+			availableLots := position.YesFreeLots
+			if strings.EqualFold(req.OriginalOutcome, "no") {
+				availableLots = position.NoFreeLots
+			}
+			if availableLots < req.QtyLots && s.logger != nil {
+				s.logger.Warn().
+					Str("wallet", walletAddress).
+					Uint64("market_id", req.MarketID).
+					Uint64("required_qty", req.QtyLots).
+					Uint64("available_qty", availableLots).
+					Msg("gateway sell balance soft-check failed; deferring final decision to funds")
+			}
 		}
 		return nil
 	}
@@ -981,8 +1040,13 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	}
 
 	if err == nil {
-		if account.CollateralFreeUnits < requiredUnits {
-			return errInsufficientFunds
+		if account.CollateralFreeUnits < requiredUnits && s.logger != nil {
+			s.logger.Warn().
+				Str("wallet", walletAddress).
+				Uint64("market_id", req.MarketID).
+				Uint64("required_units", requiredUnits).
+				Uint64("available_units", account.CollateralFreeUnits).
+				Msg("gateway wallet snapshot soft-check failed; deferring final decision to funds")
 		}
 		return nil
 	}
@@ -994,8 +1058,13 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 		}
 		return nil
 	}
-	if availableUnits < requiredUnits {
-		return errInsufficientFunds
+	if availableUnits < requiredUnits && s.logger != nil {
+		s.logger.Warn().
+			Str("wallet", walletAddress).
+			Uint64("market_id", req.MarketID).
+			Uint64("required_units", requiredUnits).
+			Uint64("available_units", availableUnits).
+			Msg("gateway rpc balance soft-check failed; deferring final decision to funds")
 	}
 	return nil
 }
@@ -1049,15 +1118,18 @@ func (s *Server) fetchOutcomeLotsFromRPC(ctx context.Context, market markets.Mar
 type positionSnapshot struct {
 	YesFreeLots           uint64
 	YesLockedLots         uint64
+	YesPendingLots        uint64
 	NoFreeLots            uint64
 	NoLockedLots          uint64
-	CollateralFreeUnits   uint64
+	NoPendingLots         uint64
 	CollateralLockedUnits uint64
 }
 
 type walletAccountSnapshot struct {
-	CollateralTotalUnits uint64
-	CollateralFreeUnits  uint64
+	CollateralTotalUnits   uint64
+	CollateralFreeUnits    uint64
+	CollateralLockedUnits  uint64
+	CollateralPendingUnits int64
 }
 
 func (s *Server) getPositionSnapshot(ctx context.Context, marketID uint64, walletAddress string) (positionSnapshot, error) {
@@ -1102,7 +1174,24 @@ func parseWalletAccountSnapshot(values map[string]string) (walletAccountSnapshot
 	if err != nil {
 		return walletAccountSnapshot{}, err
 	}
-	return walletAccountSnapshot{CollateralTotalUnits: total, CollateralFreeUnits: free}, nil
+	locked, err := parse("collateral_locked_units")
+	if err != nil {
+		return walletAccountSnapshot{}, err
+	}
+	pendingRaw := strings.TrimSpace(values["collateral_pending_units"])
+	pending := int64(0)
+	if pendingRaw != "" {
+		pending, err = strconv.ParseInt(pendingRaw, 10, 64)
+		if err != nil {
+			return walletAccountSnapshot{}, err
+		}
+	}
+	return walletAccountSnapshot{
+		CollateralTotalUnits:   total,
+		CollateralFreeUnits:    free,
+		CollateralLockedUnits:  locked,
+		CollateralPendingUnits: pending,
+	}, nil
 }
 
 func (s *Server) upsertWalletAccountSnapshot(ctx context.Context, walletAddress string, next walletAccountSnapshot) error {
@@ -1114,9 +1203,11 @@ func (s *Server) upsertWalletAccountSnapshot(ctx context.Context, walletAddress 
 	}
 	key := fmt.Sprintf("wallet-account:%s", walletAddress)
 	return s.redisClient.HSet(ctx, key, map[string]any{
-		"collateral_total_units": next.CollateralTotalUnits,
-		"collateral_free_units":  next.CollateralFreeUnits,
-		"updated_at":             time.Now().UTC().Unix(),
+		"collateral_total_units":   next.CollateralTotalUnits,
+		"collateral_free_units":    next.CollateralFreeUnits,
+		"collateral_locked_units":  next.CollateralLockedUnits,
+		"collateral_pending_units": next.CollateralPendingUnits,
+		"updated_at":               time.Now().UTC().Unix(),
 	}).Err()
 }
 
@@ -1125,13 +1216,22 @@ func (s *Server) persistWalletAccountSnapshot(ctx context.Context, walletAddress
 		return nil
 	}
 	_, err := s.dbPool.Exec(ctx, `
-		INSERT INTO wallet_accounts (wallet_address, collateral_total_units, collateral_free_units, updated_at)
-		VALUES ($1, $2, $3, NOW())
+		INSERT INTO wallet_accounts (
+			wallet_address,
+			collateral_total_units,
+			collateral_free_units,
+			collateral_locked_units,
+			collateral_pending_units,
+			updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, NOW())
 		ON CONFLICT (wallet_address) DO UPDATE SET
 			collateral_total_units = EXCLUDED.collateral_total_units,
 			collateral_free_units = EXCLUDED.collateral_free_units,
+			collateral_locked_units = EXCLUDED.collateral_locked_units,
+			collateral_pending_units = EXCLUDED.collateral_pending_units,
 			updated_at = NOW()
-	`, walletAddress, next.CollateralTotalUnits, next.CollateralFreeUnits)
+	`, walletAddress, next.CollateralTotalUnits, next.CollateralFreeUnits, next.CollateralLockedUnits, next.CollateralPendingUnits)
 	return err
 }
 
@@ -1151,12 +1251,12 @@ func (s *Server) loadWalletAccountSnapshotFromDB(ctx context.Context, walletAddr
 		return walletAccountSnapshot{}, errors.New("db pool not configured")
 	}
 	row := s.dbPool.QueryRow(ctx, `
-		SELECT collateral_total_units, collateral_free_units
+		SELECT collateral_total_units, collateral_free_units, collateral_locked_units, collateral_pending_units
 		FROM wallet_accounts
 		WHERE wallet_address = $1
 	`, walletAddress)
 	var snapshot walletAccountSnapshot
-	if err := row.Scan(&snapshot.CollateralTotalUnits, &snapshot.CollateralFreeUnits); err != nil {
+	if err := row.Scan(&snapshot.CollateralTotalUnits, &snapshot.CollateralFreeUnits, &snapshot.CollateralLockedUnits, &snapshot.CollateralPendingUnits); err != nil {
 		return walletAccountSnapshot{}, err
 	}
 	return snapshot, nil
@@ -1168,9 +1268,9 @@ func (s *Server) loadPositionSnapshotFromDB(ctx context.Context, marketID uint64
 	}
 	marketIDStr := strconv.FormatUint(marketID, 10)
 	row := s.dbPool.QueryRow(ctx, `
-		SELECT yes_free_lots, yes_locked_lots,
-		       no_free_lots, no_locked_lots,
-		       collateral_free_units, collateral_locked_units
+		SELECT yes_free_lots, yes_locked_lots, yes_pending_lots,
+		       no_free_lots, no_locked_lots, no_pending_lots,
+		       collateral_locked_units
 		FROM positions
 		WHERE market_id = $1::NUMERIC(20,0) AND wallet_address = $2
 	`, marketIDStr, walletAddress)
@@ -1178,9 +1278,10 @@ func (s *Server) loadPositionSnapshotFromDB(ctx context.Context, marketID uint64
 	if err := row.Scan(
 		&snapshot.YesFreeLots,
 		&snapshot.YesLockedLots,
+		&snapshot.YesPendingLots,
 		&snapshot.NoFreeLots,
 		&snapshot.NoLockedLots,
-		&snapshot.CollateralFreeUnits,
+		&snapshot.NoPendingLots,
 		&snapshot.CollateralLockedUnits,
 	); err != nil {
 		return positionSnapshot{}, err
@@ -1204,6 +1305,10 @@ func parsePositionSnapshot(values map[string]string) (positionSnapshot, error) {
 	if err != nil {
 		return positionSnapshot{}, err
 	}
+	yesPending, err := parse("yes_pending_lots")
+	if err != nil {
+		return positionSnapshot{}, err
+	}
 	noFree, err := parse("no_free_lots")
 	if err != nil {
 		return positionSnapshot{}, err
@@ -1212,7 +1317,7 @@ func parsePositionSnapshot(values map[string]string) (positionSnapshot, error) {
 	if err != nil {
 		return positionSnapshot{}, err
 	}
-	collateralFree, err := parse("collateral_free_units")
+	noPending, err := parse("no_pending_lots")
 	if err != nil {
 		return positionSnapshot{}, err
 	}
@@ -1223,9 +1328,10 @@ func parsePositionSnapshot(values map[string]string) (positionSnapshot, error) {
 	return positionSnapshot{
 		YesFreeLots:           yesFree,
 		YesLockedLots:         yesLocked,
+		YesPendingLots:        yesPending,
 		NoFreeLots:            noFree,
 		NoLockedLots:          noLocked,
-		CollateralFreeUnits:   collateralFree,
+		NoPendingLots:         noPending,
 		CollateralLockedUnits: collateralLocked,
 	}, nil
 }
@@ -1241,9 +1347,10 @@ func (s *Server) upsertPositionSnapshot(ctx context.Context, marketID uint64, wa
 	return s.redisClient.HSet(ctx, cacheKey, map[string]any{
 		"yes_free_lots":           next.YesFreeLots,
 		"yes_locked_lots":         next.YesLockedLots,
+		"yes_pending_lots":        next.YesPendingLots,
 		"no_free_lots":            next.NoFreeLots,
 		"no_locked_lots":          next.NoLockedLots,
-		"collateral_free_units":   next.CollateralFreeUnits,
+		"no_pending_lots":         next.NoPendingLots,
 		"collateral_locked_units": next.CollateralLockedUnits,
 		"updated_at":              time.Now().UTC().Unix(),
 	}).Err()
@@ -1257,23 +1364,24 @@ func (s *Server) persistPositionSnapshot(ctx context.Context, marketID uint64, w
 	_, err := s.dbPool.Exec(ctx, `
 		INSERT INTO positions (
 			market_id, wallet_address,
-			yes_free_lots, yes_locked_lots,
-			no_free_lots, no_locked_lots,
-			collateral_free_units, collateral_locked_units,
+			yes_free_lots, yes_locked_lots, yes_pending_lots,
+			no_free_lots, no_locked_lots, no_pending_lots,
+			collateral_locked_units,
 			updated_at
 		) VALUES ($1::NUMERIC(20,0), $2, $3, $4, $5, $6, $7, $8, NOW())
 		ON CONFLICT (market_id, wallet_address) DO UPDATE SET
 			yes_free_lots = EXCLUDED.yes_free_lots,
 			yes_locked_lots = EXCLUDED.yes_locked_lots,
+			yes_pending_lots = EXCLUDED.yes_pending_lots,
 			no_free_lots = EXCLUDED.no_free_lots,
 			no_locked_lots = EXCLUDED.no_locked_lots,
-			collateral_free_units = EXCLUDED.collateral_free_units,
+			no_pending_lots = EXCLUDED.no_pending_lots,
 			collateral_locked_units = EXCLUDED.collateral_locked_units,
 			updated_at = NOW()
 		`, marketIDStr, walletAddress,
-		next.YesFreeLots, next.YesLockedLots,
-		next.NoFreeLots, next.NoLockedLots,
-		next.CollateralFreeUnits, next.CollateralLockedUnits,
+		next.YesFreeLots, next.YesLockedLots, next.YesPendingLots,
+		next.NoFreeLots, next.NoLockedLots, next.NoPendingLots,
+		next.CollateralLockedUnits,
 	)
 	return err
 }
@@ -1290,10 +1398,6 @@ func (s *Server) getOrInitPositionSnapshot(ctx context.Context, market markets.M
 }
 
 func (s *Server) fetchPositionSnapshotFromRPC(ctx context.Context, market markets.Market, walletAddress string) (positionSnapshot, error) {
-	collateral, err := s.fetchVUSDCUnitsFromRPC(ctx, walletAddress)
-	if err != nil {
-		return positionSnapshot{}, err
-	}
 	yesLots, err := s.fetchOutcomeLotsFromRPC(ctx, market, walletAddress, "yes")
 	if err != nil {
 		return positionSnapshot{}, err
@@ -1303,9 +1407,8 @@ func (s *Server) fetchPositionSnapshotFromRPC(ctx context.Context, market market
 		return positionSnapshot{}, err
 	}
 	return positionSnapshot{
-		YesFreeLots:         yesLots,
-		NoFreeLots:          noLots,
-		CollateralFreeUnits: collateral,
+		YesFreeLots: yesLots,
+		NoFreeLots:  noLots,
 	}, nil
 }
 
@@ -1391,9 +1494,9 @@ func isMissingTokenAccountError(err error) bool {
 // @Summary Cancel order
 // @Tags Orders
 // @Produce json
-// @Security BearerAuth
 // @Param orderId path string true "Order ID"
 // @Param market_id query string true "Market ID"
+// @Param wallet_address query string false "Wallet address when auth is disabled"
 // @Success 202 {object} cancelOrderAcceptedResponse
 // @Failure 400 {object} errorResponse
 // @Failure 401 {object} errorResponse
@@ -1404,7 +1507,7 @@ func (s *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "system bootstrap in progress")
 		return
 	}
-	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, "")
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, strings.TrimSpace(r.URL.Query().Get("wallet_address")))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -1477,8 +1580,8 @@ func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's projected position
 // @Tags Positions
 // @Produce json
-// @Security BearerAuth
 // @Param marketId path string true "Market ID"
+// @Param wallet_address query string false "Wallet address when auth is disabled"
 // @Success 200 {object} positionResponse
 // @Failure 400 {object} errorResponse
 // @Failure 401 {object} errorResponse
@@ -1489,7 +1592,7 @@ func (s *Server) handlePosition(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, "")
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, strings.TrimSpace(r.URL.Query().Get("wallet_address")))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -1509,9 +1612,10 @@ func (s *Server) handlePosition(w http.ResponseWriter, r *http.Request) {
 		WalletAddress:         walletAddress,
 		YesFreeLots:           strconv.FormatUint(position.YesFreeLots, 10),
 		YesLockedLots:         strconv.FormatUint(position.YesLockedLots, 10),
+		YesPendingLots:        strconv.FormatUint(position.YesPendingLots, 10),
 		NoFreeLots:            strconv.FormatUint(position.NoFreeLots, 10),
 		NoLockedLots:          strconv.FormatUint(position.NoLockedLots, 10),
-		CollateralFreeUnits:   strconv.FormatUint(position.CollateralFreeUnits, 10),
+		NoPendingLots:         strconv.FormatUint(position.NoPendingLots, 10),
 		CollateralLockedUnits: strconv.FormatUint(position.CollateralLockedUnits, 10),
 	})
 }
@@ -1520,12 +1624,12 @@ func (s *Server) handlePosition(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's trading account balance
 // @Tags Positions
 // @Produce json
-// @Security BearerAuth
+// @Param wallet_address query string false "Wallet address when auth is disabled"
 // @Success 200 {object} walletAccountResponse
 // @Failure 401 {object} errorResponse
 // @Router /api/wallet-account [get]
 func (s *Server) handleWalletAccount(w http.ResponseWriter, r *http.Request) {
-	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, "")
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, strings.TrimSpace(r.URL.Query().Get("wallet_address")))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -1536,9 +1640,11 @@ func (s *Server) handleWalletAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, walletAccountResponse{
-		WalletAddress:        walletAddress,
-		CollateralTotalUnits: strconv.FormatUint(account.CollateralTotalUnits, 10),
-		CollateralFreeUnits:  strconv.FormatUint(account.CollateralFreeUnits, 10),
+		WalletAddress:          walletAddress,
+		CollateralTotalUnits:   strconv.FormatUint(account.CollateralTotalUnits, 10),
+		CollateralFreeUnits:    strconv.FormatUint(account.CollateralFreeUnits, 10),
+		CollateralLockedUnits:  strconv.FormatUint(account.CollateralLockedUnits, 10),
+		CollateralPendingUnits: strconv.FormatInt(account.CollateralPendingUnits, 10),
 	})
 }
 
@@ -1546,15 +1652,19 @@ func (s *Server) handleWalletAccount(w http.ResponseWriter, r *http.Request) {
 // @Summary Get current user's open orders
 // @Tags Orders
 // @Produce json
-// @Security BearerAuth
 // @Param marketId path string true "Market ID"
+// @Param wallet_address query string false "Wallet address when auth is disabled"
 // @Success 200 {object} openOrdersResponse
 // @Failure 401 {object} errorResponse
 // @Router /api/orders/open/{marketId} [get]
 func (s *Server) handleOpenOrders(w http.ResponseWriter, r *http.Request) {
 	marketID, _ := parseMarketID(chi.URLParam(r, "marketId"))
-	user, _ := auth.FromContext(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"orders": s.matching.GetOpenOrders(r.Context(), user.SolanaAddress, marketID), "matching_enabled": s.cfg.NATSURL != ""})
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, strings.TrimSpace(r.URL.Query().Get("wallet_address")))
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"orders": s.matching.GetOpenOrders(r.Context(), walletAddress, marketID), "matching_enabled": s.cfg.NATSURL != ""})
 }
 
 // handleTrades godoc
@@ -1584,25 +1694,32 @@ func (s *Server) handlePriceHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rangeValue := matching.PriceHistoryRange(strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("range"))))
+	rangeValue := query.PriceHistoryRange(strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("range"))))
 	switch rangeValue {
-	case matching.PriceHistoryRange1H, matching.PriceHistoryRange6H, matching.PriceHistoryRange1D,
-		matching.PriceHistoryRange1W, matching.PriceHistoryRange1M, matching.PriceHistoryRangeAll:
+	case query.PriceHistoryRange1H, query.PriceHistoryRange6H, query.PriceHistoryRange1D,
+		query.PriceHistoryRange1W, query.PriceHistoryRange1M, query.PriceHistoryRangeAll:
 	default:
-		rangeValue = matching.PriceHistoryRange1D
+		rangeValue = query.PriceHistoryRange1D
 	}
 	writeJSON(w, http.StatusOK, s.matching.GetPriceHistory(r.Context(), marketID, rangeValue))
 }
 
 func (s *Server) resolveAuthenticatedWalletAddress(r *http.Request, hintedWallet string) (string, error) {
 	user, ok := auth.FromContext(r.Context())
-	if !ok {
-		return "", errors.New("authentication required")
+	if ok {
+		if wallet := strings.TrimSpace(user.SolanaAddress); wallet != "" {
+			return wallet, nil
+		}
+		return "", errors.New("authenticated solana wallet is required")
 	}
-	if wallet := strings.TrimSpace(user.SolanaAddress); wallet != "" {
-		return wallet, nil
+	wallet := strings.TrimSpace(hintedWallet)
+	if wallet == "" {
+		return "", errors.New("wallet address is required")
 	}
-	return "", errors.New("authenticated solana wallet is required")
+	if _, err := gsolana.PublicKeyFromBase58(wallet); err != nil {
+		return "", errors.New("invalid wallet_address")
+	}
+	return wallet, nil
 }
 
 func (s *Server) handleMarketOrderbookWS(w http.ResponseWriter, r *http.Request) {
@@ -1785,7 +1902,6 @@ type OrderIntentBorsh struct {
 
 type RawOrderIntentV1 struct {
 	Version     uint8
-	ChainID     uint16
 	ProgramID   [32]byte
 	Market      [32]byte
 	User        [32]byte
@@ -1861,9 +1977,8 @@ func serializeRawOrderIntentV1(intent *RawOrderIntentV1) ([]byte, error) {
 	if intent == nil {
 		return nil, errors.New("intent is nil")
 	}
-	buf := make([]byte, 0, 134)
+	buf := make([]byte, 0, 132)
 	buf = append(buf, intent.Version)
-	buf = append(buf, uint16ToLEBytes(intent.ChainID)...)
 	buf = append(buf, intent.ProgramID[:]...)
 	buf = append(buf, intent.Market[:]...)
 	buf = append(buf, intent.User[:]...)
@@ -1874,8 +1989,8 @@ func serializeRawOrderIntentV1(intent *RawOrderIntentV1) ([]byte, error) {
 	buf = append(buf, uint64ToLEBytes(intent.LimitPrice)...)
 	buf = append(buf, uint64ToLEBytes(intent.TotalAmount)...)
 	buf = append(buf, uint64ToLEBytes(uint64(intent.ExpiryTs))...)
-	if len(buf) != 134 {
-		return nil, fmt.Errorf("serialized size mismatch: expected 134, got %d", len(buf))
+	if len(buf) != 132 {
+		return nil, fmt.Errorf("serialized size mismatch: expected 132, got %d", len(buf))
 	}
 	return buf, nil
 }
@@ -1893,7 +2008,6 @@ func buildRawOrderIntentBytes(
 ) ([]byte, error) {
 	intent := settlement.OrderIntentV1{
 		Version:     req.Version,
-		ChainID:     req.ChainID,
 		ProgramID:   programID,
 		Market:      marketPubkey,
 		User:        userPubkey,
@@ -1974,12 +2088,9 @@ func validateBorshOrderIntent(req orders.PlaceOrderRequest, authenticatedWallet 
 	if signature == "" {
 		return nil, nil, errors.New("signature is required")
 	}
-	signatureBytes, err := base64.StdEncoding.DecodeString(signature)
+	signatureBytes, err := decodeSignature(signature)
 	if err != nil {
-		return nil, nil, fmt.Errorf("signature must be base64 encoded: %w", err)
-	}
-	if len(signatureBytes) != ed25519.SignatureSize {
-		return nil, nil, errors.New("signature must be 64 bytes")
+		return nil, nil, err
 	}
 
 	// 4. 重建 Borsh 意图并验签
@@ -2088,43 +2199,6 @@ func buildPlaceOrderCommandV1(req orders.PlaceOrderRequest, intentBytes []byte, 
 			Signature:      req.Signature,
 		},
 	}
-}
-
-func validateCreateMarket(req markets.CreateMarketRequest) error {
-	if req.Title == "" {
-		return errors.New("title is required")
-	}
-	if strings.TrimSpace(req.MetadataCID) == "" {
-		return errors.New("metadata_cid is required")
-	}
-	if req.CloseTime.IsZero() {
-		return errors.New("close_time is required")
-	}
-	if req.ClaimDeadlineTime.IsZero() {
-		return errors.New("claim_deadline_time is required")
-	}
-	if !req.ClaimDeadlineTime.After(req.CloseTime) {
-		return errors.New("claim_deadline_time must be later than close_time")
-	}
-	switch req.Resolution.Mode {
-	case markets.ResolutionModeCreator:
-		if req.Resolution.Authority == "" {
-			return errors.New("resolution.authority is required for creator markets")
-		}
-	case markets.ResolutionModePyth:
-		if req.Resolution.OracleFeed == "" {
-			return errors.New("resolution.oracle_feed is required for pyth markets")
-		}
-		if req.ResolveAfterTime.IsZero() {
-			return errors.New("resolve_after_time is required for pyth markets")
-		}
-		if req.Resolution.OracleTarget == 0 {
-			return errors.New("resolution.oracle_target_price is required for pyth markets")
-		}
-	default:
-		return errors.New("resolution.mode must be creator or pyth")
-	}
-	return nil
 }
 
 func parseMarketID(value string) (uint64, error) {

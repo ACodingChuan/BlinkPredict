@@ -33,7 +33,31 @@ INSERT INTO markets (
     $7, $8, $9, $10, $11, $12, $13,
     $14, $15, $16, $17, $18,
     $19, $20, $21, $22, $23, $24, $25, $26
-)`
+) ON CONFLICT (market_id) DO UPDATE SET
+    market_pda = EXCLUDED.market_pda,
+    metadata_cid = EXCLUDED.metadata_cid,
+    metadata_url = EXCLUDED.metadata_url,
+    collateral_mint = EXCLUDED.collateral_mint,
+    title = EXCLUDED.title,
+    description = EXCLUDED.description,
+    category = EXCLUDED.category,
+    image_url = EXCLUDED.image_url,
+    status = EXCLUDED.status,
+    outcome = EXCLUDED.outcome,
+    resolution_mode = EXCLUDED.resolution_mode,
+    resolution_authority = EXCLUDED.resolution_authority,
+    oracle_feed = EXCLUDED.oracle_feed,
+    oracle_condition = EXCLUDED.oracle_condition,
+    oracle_target_price = EXCLUDED.oracle_target_price,
+    oracle_target_expo = EXCLUDED.oracle_target_expo,
+    close_time = EXCLUDED.close_time,
+    resolve_after_time = EXCLUDED.resolve_after_time,
+    claim_deadline_time = EXCLUDED.claim_deadline_time,
+    creator_unclaimed_fee = EXCLUDED.creator_unclaimed_fee,
+    platform_unclaimed_fee = EXCLUDED.platform_unclaimed_fee,
+    resolved_at = EXCLUDED.resolved_at,
+    updated_at = EXCLUDED.updated_at
+`
 	_, err := r.pool.Exec(ctx, q,
 		market.ID,
 		strconv.FormatUint(market.MarketID, 10),

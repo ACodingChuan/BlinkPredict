@@ -11,7 +11,6 @@ import (
 func TestOrderIntentSerializeRoundTrip(t *testing.T) {
 	intent := OrderIntentV1{
 		Version:     1,
-		ChainID:     245,
 		ProgramID:   solana.NewWallet().PublicKey(),
 		Market:      solana.NewWallet().PublicKey(),
 		User:        solana.NewWallet().PublicKey(),
@@ -39,7 +38,6 @@ func TestOrderIntentSerializeRoundTrip(t *testing.T) {
 func TestOrderIntentSerializeMatchesContractFieldLayout(t *testing.T) {
 	intent := OrderIntentV1{
 		Version:     1,
-		ChainID:     245,
 		ProgramID:   solana.MustPublicKeyFromBase58("11111111111111111111111111111112"),
 		Market:      solana.MustPublicKeyFromBase58("11111111111111111111111111111113"),
 		User:        solana.MustPublicKeyFromBase58("11111111111111111111111111111114"),
@@ -60,37 +58,34 @@ func TestOrderIntentSerializeMatchesContractFieldLayout(t *testing.T) {
 	if encoded[0] != intent.Version {
 		t.Fatalf("version offset mismatch: got %d want %d", encoded[0], intent.Version)
 	}
-	if got := uint16(encoded[1]) | uint16(encoded[2])<<8; got != intent.ChainID {
-		t.Fatalf("chain id offset mismatch: got %d want %d", got, intent.ChainID)
-	}
-	if !bytes.Equal(encoded[3:35], intent.ProgramID.Bytes()) {
+	if !bytes.Equal(encoded[1:33], intent.ProgramID.Bytes()) {
 		t.Fatalf("program id offset mismatch")
 	}
-	if !bytes.Equal(encoded[35:67], intent.Market.Bytes()) {
+	if !bytes.Equal(encoded[33:65], intent.Market.Bytes()) {
 		t.Fatalf("market offset mismatch")
 	}
-	if !bytes.Equal(encoded[67:99], intent.User.Bytes()) {
+	if !bytes.Equal(encoded[65:97], intent.User.Bytes()) {
 		t.Fatalf("user offset mismatch")
 	}
-	if got := leu64(encoded[99:107]); got != intent.Nonce {
+	if got := leu64(encoded[97:105]); got != intent.Nonce {
 		t.Fatalf("nonce offset mismatch: got %d want %d", got, intent.Nonce)
 	}
-	if got := Side(encoded[107]); got != intent.Side {
+	if got := Side(encoded[105]); got != intent.Side {
 		t.Fatalf("side offset mismatch: got %d want %d", got, intent.Side)
 	}
-	if got := Outcome(encoded[108]); got != intent.Outcome {
+	if got := Outcome(encoded[106]); got != intent.Outcome {
 		t.Fatalf("outcome offset mismatch: got %d want %d", got, intent.Outcome)
 	}
-	if got := OrderType(encoded[109]); got != intent.OrderType {
+	if got := OrderType(encoded[107]); got != intent.OrderType {
 		t.Fatalf("order type offset mismatch: got %d want %d", got, intent.OrderType)
 	}
-	if got := leu64(encoded[110:118]); got != intent.LimitPrice {
+	if got := leu64(encoded[108:116]); got != intent.LimitPrice {
 		t.Fatalf("limit price offset mismatch: got %d want %d", got, intent.LimitPrice)
 	}
-	if got := leu64(encoded[118:126]); got != intent.TotalAmount {
+	if got := leu64(encoded[116:124]); got != intent.TotalAmount {
 		t.Fatalf("total amount offset mismatch: got %d want %d", got, intent.TotalAmount)
 	}
-	if got := int64(leu64(encoded[126:134])); got != intent.ExpiryTs {
+	if got := int64(leu64(encoded[124:132])); got != intent.ExpiryTs {
 		t.Fatalf("expiry offset mismatch: got %d want %d", got, intent.ExpiryTs)
 	}
 
@@ -106,7 +101,6 @@ func TestOrderIntentSerializeMatchesContractFieldLayout(t *testing.T) {
 func TestOrderIntentMessageIsLowerHexKeccak(t *testing.T) {
 	intent := OrderIntentV1{
 		Version:     1,
-		ChainID:     245,
 		ProgramID:   solana.PublicKey{},
 		Market:      solana.PublicKey{},
 		User:        solana.PublicKey{},

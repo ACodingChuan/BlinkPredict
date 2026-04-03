@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"blinkpredict/banckend/internal/matching"
+	"blinkpredict/banckend/internal/funds"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -19,7 +19,7 @@ import (
 type DepositProjector struct {
 	pool   *pgxpool.Pool
 	redis  *redis.Client
-	wallet *matching.SharedWalletManager
+	wallet *funds.Manager
 	log    *zerolog.Logger
 }
 
@@ -28,7 +28,7 @@ type walletAccountProjection struct {
 	CollateralFreeUnits  uint64
 }
 
-func NewDepositProjector(pool *pgxpool.Pool, redisClient *redis.Client, wallet *matching.SharedWalletManager, logger *zerolog.Logger) *DepositProjector {
+func NewDepositProjector(pool *pgxpool.Pool, redisClient *redis.Client, wallet *funds.Manager, logger *zerolog.Logger) *DepositProjector {
 	return &DepositProjector{
 		pool:   pool,
 		redis:  redisClient,
@@ -59,7 +59,7 @@ func (p *DepositProjector) ApplyDeposit(ctx context.Context, payload DepositSett
 		return err
 	}
 	if inserted && p.wallet != nil {
-		p.wallet.ApplyDeposit(payload.WalletAddress, payload.AmountUnits)
+		p.wallet.ApplyDepositConfirmed(payload.WalletAddress, payload.AmountUnits)
 	}
 	return nil
 }

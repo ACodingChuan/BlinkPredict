@@ -1,91 +1,200 @@
 package logging
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"os"
 	"strings"
-	"sync/atomic"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 )
 
-type Level int32
+type contextKey string
 
 const (
-	LevelDebug Level = iota
-	LevelInfo
-	LevelWarn
-	LevelError
+	requestIDContextKey contextKey = "logging_request_id"
+	traceIDContextKey   contextKey = "logging_trace_id"
 )
 
-var currentLevel atomic.Int32
+var (
+	rootMu     sync.RWMutex
+	rootLogger zerolog.Logger
+)
 
 func init() {
 	Configure("info")
 }
 
 func Configure(level string) {
-	currentLevel.Store(int32(parseLevel(level)))
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+	zerolog.TimestampFieldName = "time"
+	zerolog.ErrorFieldName = "error"
+	zerolog.SetGlobalLevel(parseLevel(level))
+
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger().Level(parseLevel(level))
+
+	rootMu.Lock()
+	rootLogger = logger
+	rootMu.Unlock()
+}
+
+func Root() zerolog.Logger {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
+	return rootLogger
+}
+
+func Component(component string) *zerolog.Logger {
+	logger := Root().With().Str("component", component).Logger()
+	return &logger
 }
 
 type Logger struct {
 	component string
+	logger    zerolog.Logger
 }
 
 func New(component string) *Logger {
-	return &Logger{component: component}
+	return &Logger{component: component, logger: *Component(component)}
 }
 
 func (l *Logger) Debugf(format string, args ...any) {
-	l.logf(LevelDebug, format, args...)
+	l.logger.Debug().Msgf(format, args...)
 }
 
 func (l *Logger) Infof(format string, args ...any) {
-	l.logf(LevelInfo, format, args...)
+	l.logger.Info().Msgf(format, args...)
 }
 
 func (l *Logger) Warnf(format string, args ...any) {
-	l.logf(LevelWarn, format, args...)
+	l.logger.Warn().Msgf(format, args...)
 }
 
 func (l *Logger) Errorf(format string, args ...any) {
-	l.logf(LevelError, format, args...)
+	l.logger.Error().Msgf(format, args...)
 }
 
 func (l *Logger) Fatalf(format string, args ...any) {
-	log.Fatalf("level=FATAL component=%s %s", l.component, fmt.Sprintf(format, args...))
+	l.logger.Fatal().Msgf(format, args...)
 }
 
-func (l *Logger) logf(level Level, format string, args ...any) {
-	if level < Level(currentLevel.Load()) {
-		return
+func NewRequestID() string {
+	return uuid.NewString()
+}
+
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ctx
 	}
-	log.Printf("level=%s component=%s %s", levelString(level), l.component, fmt.Sprintf(format, args...))
+	return context.WithValue(ctx, requestIDContextKey, requestID)
 }
 
-func parseLevel(raw string) Level {
+func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(requestIDContextKey).(string)
+	return strings.TrimSpace(value)
+}
+
+func WithTraceID(ctx context.Context, traceID string) context.Context {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, traceIDContextKey, traceID)
+}
+
+func TraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(traceIDContextKey).(string)
+	return strings.TrimSpace(value)
+}
+
+func WithRequestContext(ctx context.Context, requestID, traceID string) context.Context {
+	ctx = WithRequestID(ctx, requestID)
+	ctx = WithTraceID(ctx, traceID)
+	return ctx
+}
+
+func EventWithContext(ctx context.Context, event *zerolog.Event) *zerolog.Event {
+	if event == nil {
+		return nil
+	}
+	if requestID := RequestIDFromContext(ctx); requestID != "" {
+		event = event.Str("request_id", requestID)
+	}
+	if traceID := TraceIDFromContext(ctx); traceID != "" {
+		event = event.Str("trace_id", traceID)
+	}
+	return event
+}
+
+func LoggerWithContext(ctx context.Context, logger zerolog.Logger) zerolog.Logger {
+	builder := logger.With()
+	if requestID := RequestIDFromContext(ctx); requestID != "" {
+		builder = builder.Str("request_id", requestID)
+	}
+	if traceID := TraceIDFromContext(ctx); traceID != "" {
+		builder = builder.Str("trace_id", traceID)
+	}
+	return builder.Logger()
+}
+
+func FormatArgs(args []any) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	formatted := make([]any, 0, len(args))
+	for _, arg := range args {
+		formatted = append(formatted, formatValue(arg))
+	}
+	return formatted
+}
+
+func formatValue(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case []byte:
+		if len(typed) == 0 {
+			return ""
+		}
+		return string(typed)
+	case fmt.Stringer:
+		return typed.String()
+	case error:
+		return typed.Error()
+	case time.Time:
+		return typed.UTC().Format(time.RFC3339Nano)
+	default:
+		return typed
+	}
+}
+
+func parseLevel(raw string) zerolog.Level {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "trace":
+		return zerolog.TraceLevel
 	case "debug":
-		return LevelDebug
+		return zerolog.DebugLevel
 	case "warn", "warning":
-		return LevelWarn
+		return zerolog.WarnLevel
 	case "error":
-		return LevelError
+		return zerolog.ErrorLevel
+	case "fatal":
+		return zerolog.FatalLevel
+	case "panic":
+		return zerolog.PanicLevel
+	case "disabled", "off":
+		return zerolog.Disabled
 	default:
-		return LevelInfo
-	}
-}
-
-func levelString(level Level) string {
-	switch level {
-	case LevelDebug:
-		return "DEBUG"
-	case LevelWarn:
-		return "WARN"
-	case LevelError:
-		return "ERROR"
-	default:
-		return "INFO"
+		return zerolog.InfoLevel
 	}
 }

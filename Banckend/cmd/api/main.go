@@ -11,7 +11,6 @@ package main
 import (
 	"context"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -22,15 +21,18 @@ import (
 	"blinkpredict/banckend/internal/cache"
 	"blinkpredict/banckend/internal/config"
 	"blinkpredict/banckend/internal/db"
+	"blinkpredict/banckend/internal/depositconfirm"
 	"blinkpredict/banckend/internal/faucet"
+	"blinkpredict/banckend/internal/funds"
 	httpapi "blinkpredict/banckend/internal/http"
 	"blinkpredict/banckend/internal/indexer"
 	"blinkpredict/banckend/internal/logging"
-	"blinkpredict/banckend/internal/marketindexer"
+	"blinkpredict/banckend/internal/marketconfirm"
 	"blinkpredict/banckend/internal/markets"
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/protocol"
 	"blinkpredict/banckend/internal/pusher"
+	"blinkpredict/banckend/internal/query"
 	"blinkpredict/banckend/internal/settlement"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
@@ -38,11 +40,10 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/redis/go-redis/v9"
-	"github.com/rs/zerolog"
 )
 
 var logger = logging.New("main")
-var zerologLogger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+var zerologLogger = logging.Component("main")
 
 func main() {
 	// 加载 .env 文件到环境变量（优先使用工作目录下的 .env）
@@ -59,10 +60,15 @@ func main() {
 	var commandPublisher protocol.CommandPublisher = protocol.DisabledCommandPublisher{}
 	var natsClient *natsjs.Client
 	var redisClient *redis.Client
+	var fundsService *funds.Service
+	var fundsManager *funds.Manager
 	var wsTicketStore *pusher.TicketStore
 	var pusherHub *pusher.Hub
 	var pusherService *pusher.Service
 	var settlementService *settlement.Service
+	var depositConfirmService *depositconfirm.Service
+	var marketConfirmService *marketconfirm.Service
+	var marketProjector *marketconfirm.Projector
 	var marketManager *matching.MarketManager
 	var err error
 	if cfg.NATSURL != "" {
@@ -126,10 +132,12 @@ func main() {
 		})
 	}
 
-	var matchingEngine matching.Engine = matching.NewDisabledEngine()
-	if marketManager != nil {
-		matchingEngine = matching.NewQueryEngine(marketManager)
+	fundsManager = funds.NewManager()
+	if natsClient != nil {
+		fundsService = funds.NewService(natsClient, pool, redisClient, fundsManager)
 	}
+
+	var matchingEngine query.Engine = query.NewDisabledEngine()
 	var marketCache *cache.MarketCache
 	if cfg.RedisURL != "" {
 		opts, err := redis.ParseURL(cfg.RedisURL)
@@ -137,16 +145,20 @@ func main() {
 			logger.Fatalf("redis parse url: %v", err)
 		}
 		redisClient = redis.NewClient(opts)
+		redisClient.AddHook(logging.NewRedisHook("redis"))
 		if err := redisClient.Ping(ctx).Err(); err != nil {
 			logger.Fatalf("redis: %v", err)
 		}
 		defer redisClient.Close()
 		logger.Infof("Redis read model enabled")
 		wsTicketStore = pusher.NewTicketStore(redisClient, 45*time.Second)
-		matchingEngine = matching.NewRedisQueryEngine(redisClient, pool, matchingEngine)
+		matchingEngine = query.NewRedisEngine(redisClient, pool)
+		if fundsService != nil {
+			fundsService = funds.NewService(natsClient, pool, redisClient, fundsManager)
+		}
 
 		// 初始化市场缓存
-		marketCache = cache.NewMarketCache(redisClient, &zerologLogger)
+		marketCache = cache.NewMarketCache(redisClient, zerologLogger)
 		logger.Infof("Market cache initialized")
 	}
 
@@ -156,14 +168,10 @@ func main() {
 		if cfg.VUSDCMint == "" || cfg.GlobalVault == "" {
 			logger.Warnf("Helius webhook enabled but VUSDC_MINT/GLOBAL_VAULT is missing")
 		} else {
-			var sharedWallet *matching.SharedWalletManager
-			if marketManager != nil {
-				sharedWallet = marketManager.SharedWallet()
-			}
-			depositProjector := webhooks.NewDepositProjector(pool, redisClient, sharedWallet, &zerologLogger)
+			depositProjector := webhooks.NewDepositProjector(pool, redisClient, fundsManager, zerologLogger)
 			webhookHandler = webhooks.NewHeliusHandler(
 				depositProjector,
-				&zerologLogger,
+				zerologLogger,
 				cfg.HeliusWebhookSecret,
 				cfg.VUSDCMint,
 				cfg.GlobalVault,
@@ -180,7 +188,7 @@ func main() {
 	if cfg.AlchemySigningKey != "" {
 		alchemyHandler = webhooks.NewAlchemyHandler(
 			natsClient,
-			&zerologLogger,
+			zerologLogger,
 			cfg.AlchemySigningKey,
 			cfg.ProgramID,
 		)
@@ -188,18 +196,12 @@ func main() {
 	} else {
 		logger.Infof("Alchemy webhook disabled (set ALCHEMY_SIGNING_KEY to enable)")
 	}
-	if natsClient != nil {
-		indexConsumer := marketindexer.NewConsumer(natsClient.Conn(), pool, marketRepo, marketCache, &zerologLogger)
-		if err := indexConsumer.Start(ctx); err != nil {
-			logger.Fatalf("market index consumer: %v", err)
-		}
-		logger.Infof("Market index consumer started")
-	}
-	var boot *bootstrap.Coordinator
+	boot := bootstrap.NewGate()
 	if natsClient != nil {
 		pusherHub = pusher.NewHub(cfg, wsTicketStore)
 		pusherService = pusher.NewService(natsClient, pusherHub)
 		pgWriter := writer.New(pool, natsClient, redisClient, "")
+		marketProjector = marketconfirm.NewProjector(natsClient, pool, marketRepo, marketCache)
 		if cfg.SettlementRelayerKeypair != "" && cfg.ProgramID != "" {
 			programID := solana.MustPublicKeyFromBase58(cfg.ProgramID)
 			relayer, err := faucet.LoadKeypair(cfg.SettlementRelayerKeypair)
@@ -208,11 +210,98 @@ func main() {
 			}
 			settlementService = settlement.NewService(natsClient, pool, cfg.SolanaRPCURL, programID, relayer, "")
 		}
-		boot = bootstrap.NewCoordinator(pgWriter, marketManager, pusherService, settlementService, cfg.MatcherTickInterval)
-		if err := boot.Start(ctx); err != nil {
-			logger.Fatalf("bootstrap: %v", err)
+		if pgWriter != nil {
+			boot.Set("writer", bootstrap.StateCatchingUp)
+			logger.Infof("starting writer catch-up")
+			if err := pgWriter.Start(ctx); err != nil {
+				boot.Set("writer", bootstrap.StateFailed)
+				logger.Fatalf("writer: %v", err)
+			}
+			boot.Set("writer", bootstrap.StateReady)
 		}
-		logger.Infof("Bootstrap completed")
+		if fundsService != nil {
+			boot.Set("funds", bootstrap.StateRecovering)
+			logger.Infof("recovering funds snapshots")
+			if err := fundsService.Start(ctx); err != nil {
+				boot.Set("funds", bootstrap.StateFailed)
+				logger.Fatalf("funds: %v", err)
+			}
+			boot.Set("funds", bootstrap.StateReady)
+		}
+		if marketManager != nil {
+			boot.Set("matcher", bootstrap.StateRecovering)
+			logger.Infof("recovering matcher from orders")
+			if err := marketManager.RecoverFromStore(ctx); err != nil {
+				boot.Set("matcher", bootstrap.StateFailed)
+				logger.Fatalf("matcher recover: %v", err)
+			}
+			logger.Infof("running bootstrap tick")
+			if err := marketManager.RunBootstrapTick(ctx); err != nil {
+				boot.Set("matcher", bootstrap.StateFailed)
+				logger.Fatalf("matcher bootstrap tick: %v", err)
+			}
+			go func() {
+				if err := marketManager.StartConsumer(ctx); err != nil {
+					logger.Warnf("matcher consumer stopped: %v", err)
+					boot.Set("matcher", bootstrap.StateFailed)
+				}
+			}()
+			marketManager.StartTickLoop(ctx, cfg.MatcherTickInterval)
+			boot.Set("matcher", bootstrap.StateReady)
+		}
+		if pusherService != nil {
+			boot.Set("pusher", bootstrap.StateStarting)
+			logger.Infof("starting pusher service")
+			if err := pusherService.Start(ctx); err != nil {
+				boot.Set("pusher", bootstrap.StateFailed)
+				logger.Fatalf("pusher: %v", err)
+			}
+			boot.Set("pusher", bootstrap.StateReady)
+		}
+		if cfg.SolanaRPCURL != "" {
+			depositConfirmService = depositconfirm.NewService(natsClient, pool, cfg)
+		}
+		if depositConfirmService != nil {
+			boot.Set("deposit-confirm", bootstrap.StateStarting)
+			logger.Infof("starting deposit confirm service")
+			if err := depositConfirmService.Start(ctx); err != nil {
+				boot.Set("deposit-confirm", bootstrap.StateFailed)
+				logger.Fatalf("deposit confirm: %v", err)
+			}
+			boot.Set("deposit-confirm", bootstrap.StateReady)
+		}
+		if cfg.SolanaRPCURL != "" {
+			marketConfirmService = marketconfirm.NewService(natsClient, pool, cfg)
+		}
+		if marketConfirmService != nil {
+			boot.Set("market-confirm", bootstrap.StateStarting)
+			logger.Infof("starting market confirm service")
+			if err := marketConfirmService.Start(ctx); err != nil {
+				boot.Set("market-confirm", bootstrap.StateFailed)
+				logger.Fatalf("market confirm: %v", err)
+			}
+			boot.Set("market-confirm", bootstrap.StateReady)
+		}
+		if marketProjector != nil {
+			boot.Set("market-projector", bootstrap.StateStarting)
+			logger.Infof("starting market projector")
+			if err := marketProjector.Start(ctx); err != nil {
+				boot.Set("market-projector", bootstrap.StateFailed)
+				logger.Fatalf("market projector: %v", err)
+			}
+			boot.Set("market-projector", bootstrap.StateReady)
+		}
+		if settlementService != nil {
+			boot.Set("settlement", bootstrap.StateStarting)
+			logger.Infof("starting settlement service")
+			if err := settlementService.Start(ctx); err != nil {
+				boot.Set("settlement", bootstrap.StateFailed)
+				logger.Fatalf("settlement: %v", err)
+			}
+			boot.Set("settlement", bootstrap.StateReady)
+		}
+		boot.MarkReady()
+		logger.Infof("bootstrap ready; write traffic enabled")
 	}
 
 	var faucetSvc faucet.Service = faucet.DisabledService{}
@@ -260,7 +349,7 @@ func main() {
 		pool,
 		webhookHandler,
 		alchemyHandler,
-		&zerologLogger,
+		zerologLogger,
 	)
 
 	logger.Infof("BlinkPredict Banckend listening on :%s", cfg.Port)

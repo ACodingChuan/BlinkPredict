@@ -27,7 +27,6 @@ pub enum SettleBranch {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct OrderIntentV1 {
     pub version: u8,
-    pub chain_id: u16,
     pub program_id: Pubkey,
     pub market: Pubkey,
     pub user: Pubkey,
@@ -49,9 +48,13 @@ pub struct OrderState {
     pub order_hash: [u8; 32],
     pub total_amount: u64,
     pub filled_amount: u64,
+    pub paid_cash: u64,
+    pub paid_creator_fee: u64,
+    pub paid_platform_fee: u64,
+    pub cash_remainder: u8,
     pub canceled: u8,
     pub bump: u8,
-    pub _reserved: [u8; 6],
+    pub _reserved: [u8; 5],
 }
 
 impl OrderState {

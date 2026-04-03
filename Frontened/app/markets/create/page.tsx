@@ -3,9 +3,11 @@
 import { Buffer } from "buffer";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import bs58 from "bs58";
 import { useSignAndSendTransaction } from "@/hooks/useWalletTransactions";
 import { Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
+import api from "@/app/utils/axiosInstance";
 console.log("RPC", process.env.NEXT_PUBLIC_RPC_URL, "MINT", process.env.NEXT_PUBLIC_VUSDC_MINT);
 
 type HermesLatestPrice = {
@@ -36,6 +38,9 @@ type FeedCheckState =
       publishTime: number;
     }
   | { status: "invalid"; reason: string };
+
+const maxCoverImageBytes = 2 * 1024 * 1024;
+const maxCoverImageLabel = "2MB";
 
 export default function CreateMarketPage() {
   const router = useRouter();
@@ -264,6 +269,7 @@ export default function CreateMarketPage() {
           <div>
             <label className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
               Cover image
+              <span className="ml-2 text-xs text-rose-600 dark:text-rose-300">Required</span>
             </label>
             <div className="mt-2 flex items-center gap-3">
               <label className="cursor-pointer rounded-full bg-zinc-900 px-4 py-2 text-sm font-semibold text-white dark:bg-zinc-100 dark:text-zinc-900">
@@ -275,8 +281,8 @@ export default function CreateMarketPage() {
                   onChange={async (event) => {
                     const file = event.target.files?.[0];
                     if (!file) return;
-                    if (file.size > 250 * 1024) {
-                      setError("Image too large (max 250KB for v1a).");
+                    if (file.size > maxCoverImageBytes) {
+                      setError(`Image too large (max ${maxCoverImageLabel}).`);
                       return;
                     }
                     const reader = new FileReader();
@@ -311,7 +317,7 @@ export default function CreateMarketPage() {
                 </div>
               ) : (
                 <div className="text-sm text-zinc-500 dark:text-zinc-400">
-                  Optional
+                  Upload a cover image
                 </div>
               )}
             </div>
@@ -504,6 +510,10 @@ export default function CreateMarketPage() {
                   setError("Title is required.");
                   return;
                 }
+                if (!imageDataUrl) {
+                  setError("Cover image is required.");
+                  return;
+                }
                 if (mode === "creator" && !form.description.trim()) {
                   setError("Description is required.");
                   return;
@@ -587,9 +597,7 @@ export default function CreateMarketPage() {
                   creatorAddress = localProvider.publicKey.toBase58();
                 }
 
-                const imageUri = imageDataUrl
-                  ? await pinImageDataUrl(imageDataUrl, pinataJwt)
-                  : "";
+                const imageUri = await pinImageDataUrl(imageDataUrl, pinataJwt);
 
                 const closeISO = new Date(form.close_time).toISOString();
                 const resolveISO = new Date(form.settle_time).toISOString();
@@ -630,6 +638,13 @@ export default function CreateMarketPage() {
                   process.env.NEXT_PUBLIC_PROGRAM_ID ||
                     "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE",
                 );
+                const configPdaRaw = process.env.NEXT_PUBLIC_CONFIG_PDA || "";
+                if (!configPdaRaw) {
+                  setError("NEXT_PUBLIC_CONFIG_PDA is required.");
+                  setLoading(false);
+                  return;
+                }
+                const configPda = new PublicKey(configPdaRaw);
 
                 const priceInt = mode === "pyth" ? BigInt(targetPriceIntAtExpo) : BigInt(0);
                 const priceExpo = mode === "pyth" && feedCheck.status === "valid" ? feedCheck.expo : 0;
@@ -640,6 +655,7 @@ export default function CreateMarketPage() {
 
                 const instruction = await buildCreateMarketInstruction({
                   programId,
+                  configPda,
                   marketId,
                   metadataCid,
                   closeTime: BigInt(Math.floor(new Date(form.close_time).getTime() / 1000)),
@@ -670,6 +686,7 @@ export default function CreateMarketPage() {
                   const signed = await localProvider.signTransaction(tx);
                   const sig = await connection.sendRawTransaction(signed.serialize());
                   await connection.confirmTransaction(sig, "confirmed");
+                  await submitMarketProjection(sig);
                   setSuccessSig(sig);
                 } else {
                   // 先模拟交易以获取详细错误信息
@@ -716,6 +733,7 @@ export default function CreateMarketPage() {
                     if (result?.signature) {
                       const normalizedSignature = normalizeTransactionSignature(result.signature);
                       console.log("Success! Signature:", normalizedSignature);
+                      await submitMarketProjection(normalizedSignature);
                       setSuccessSig(normalizedSignature);
                     } else {
                       console.error("No signature in result:", result);
@@ -752,7 +770,11 @@ function normalizeTransactionSignature(signature: string | Uint8Array): string {
   if (typeof signature === "string") {
     return signature;
   }
-  return Buffer.from(signature).toString("base64");
+  return bs58.encode(signature);
+}
+
+async function submitMarketProjection(signature: string) {
+  await api.post("/markets", { signature });
 }
 
 const Input = ({
@@ -1026,6 +1048,7 @@ function conditionToIndex(condition: "gte" | "gt" | "lt" | "lte"): number {
 
 type CreateMarketInstructionArgs = {
   programId: PublicKey;
+  configPda: PublicKey;
   marketId: bigint;
   metadataCid: string;
   closeTime: bigint;
@@ -1063,6 +1086,7 @@ async function buildCreateMarketInstruction(args: CreateMarketInstructionArgs): 
     programId: args.programId,
     keys: [
       { pubkey: marketPda, isSigner: false, isWritable: true },
+      { pubkey: args.configPda, isSigner: false, isWritable: false },
       { pubkey: args.creator, isSigner: true, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],

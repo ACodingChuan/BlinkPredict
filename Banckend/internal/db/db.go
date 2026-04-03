@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"blinkpredict/banckend/internal/logging"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -11,7 +13,12 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	if databaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
-	pool, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database config: %w", err)
+	}
+	cfg.ConnConfig.Tracer = logging.NewPGXTracer("postgres")
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
@@ -21,4 +28,3 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	}
 	return pool, nil
 }
-

@@ -23,7 +23,6 @@ func makeMatchedOrder(
 ) matching.MatchedOrderV2 {
 	intent := OrderIntentV1{
 		Version:     1,
-		ChainID:     245,
 		ProgramID:   programID,
 		Market:      market,
 		User:        user,

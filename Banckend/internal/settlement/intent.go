@@ -10,7 +10,7 @@ import (
 
 const (
 	OrderIntentVersion = 1
-	OrderIntentSize    = 134
+	OrderIntentSize    = 132
 )
 
 type Side uint8
@@ -36,7 +36,6 @@ const (
 
 type OrderIntentV1 struct {
 	Version     uint8
-	ChainID     uint16
 	ProgramID   solana.PublicKey
 	Market      solana.PublicKey
 	User        solana.PublicKey
@@ -52,7 +51,6 @@ type OrderIntentV1 struct {
 func (o OrderIntentV1) Serialize() []byte {
 	buf := make([]byte, 0, OrderIntentSize)
 	buf = append(buf, o.Version)
-	buf = append(buf, byte(o.ChainID), byte(o.ChainID>>8))
 	buf = append(buf, o.ProgramID.Bytes()...)
 	buf = append(buf, o.Market.Bytes()...)
 	buf = append(buf, o.User.Bytes()...)
@@ -74,8 +72,6 @@ func ParseOrderIntentV1(data []byte) (OrderIntentV1, error) {
 	offset := 0
 	intent.Version = data[offset]
 	offset++
-	intent.ChainID = uint16(data[offset]) | uint16(data[offset+1])<<8
-	offset += 2
 	intent.ProgramID = solana.PublicKeyFromBytes(data[offset : offset+32])
 	offset += 32
 	intent.Market = solana.PublicKeyFromBytes(data[offset : offset+32])

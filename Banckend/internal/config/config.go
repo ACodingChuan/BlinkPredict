@@ -13,6 +13,7 @@ type Config struct {
 	Port                  string
 	DatabaseURL           string
 	SolanaRPCURL          string
+	SolanaWSURL           string
 	ProgramID             string
 	AuthTokenSecret       string
 	LogLevel              string
@@ -63,6 +64,7 @@ func Load() Config {
 		Port:                  getEnv("PORT", "8080"),
 		DatabaseURL:           dbURL,
 		SolanaRPCURL:          getEnv("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
+		SolanaWSURL:           strings.TrimSpace(os.Getenv("SOLANA_WS_URL")),
 		ProgramID:             getEnv("PROGRAM_ID", "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE"),
 		AuthTokenSecret:       getEnv("AUTH_TOKEN_SECRET", "blinkpredict-dev-auth-secret"),
 		LogLevel:              getEnv("LOG_LEVEL", "info"),

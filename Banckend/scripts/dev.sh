@@ -76,7 +76,7 @@ if [[ "${SKIP_SWAGGER}" != "1" ]]; then
   echo "Generating Swagger docs..."
   go run github.com/swaggo/swag/cmd/swag@v1.16.4 init \
     -g main.go \
-    -d cmd/api,internal/http,internal/orders,internal/markets,internal/matching \
+    -d cmd/api,internal/http,internal/orders,internal/markets,internal/matching,internal/query \
     --parseInternal \
     -o docs
   echo

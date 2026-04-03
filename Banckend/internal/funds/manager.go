@@ -1,9 +1,8 @@
-package matching
+package funds
 
 import (
 	"fmt"
 	"hash/fnv"
-	"strconv"
 	"sync"
 )
 
@@ -31,17 +30,39 @@ type WalletSnapshot struct {
 	Position      MarketPosition `json:"position"`
 }
 
+type ReserveOrderInput struct {
+	WalletAddress     string
+	MarketPDA         string
+	OriginalAction    uint8
+	OriginalOutcome   uint8
+	OriginalPriceTick uint8
+	OrderType         uint8
+	QtyLots           uint64
+	SpendAmount       uint64
+}
+
+type ActiveOrder struct {
+	WalletAddress     string
+	MarketPDA         string
+	OriginalAction    uint8
+	OriginalOutcome   uint8
+	OriginalPriceTick uint8
+	OrderType         uint8
+	RemainingQty      uint64
+	RemainingSpend    uint64
+}
+
 type walletShard struct {
 	mu        sync.RWMutex
 	ledgers   map[string]UserWallet
 	positions map[string]MarketPosition
 }
 
-type SharedWalletManager struct {
+type Manager struct {
 	shards []walletShard
 }
 
-func NewSharedWalletManager() *SharedWalletManager {
+func NewManager() *Manager {
 	shards := make([]walletShard, 64)
 	for i := range shards {
 		shards[i] = walletShard{
@@ -49,10 +70,10 @@ func NewSharedWalletManager() *SharedWalletManager {
 			positions: make(map[string]MarketPosition),
 		}
 	}
-	return &SharedWalletManager{shards: shards}
+	return &Manager{shards: shards}
 }
 
-func (m *SharedWalletManager) Snapshot(walletAddress, marketPDA string) WalletSnapshot {
+func (m *Manager) Snapshot(walletAddress, marketPDA string) WalletSnapshot {
 	shard := m.shard(walletAddress)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
@@ -64,49 +85,62 @@ func (m *SharedWalletManager) Snapshot(walletAddress, marketPDA string) WalletSn
 	}
 }
 
-func (m *SharedWalletManager) SeedLedger(walletAddress string, ledger UserWallet) {
+func (m *Manager) Ledger(walletAddress string) UserWallet {
+	shard := m.shard(walletAddress)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.ledgers[walletAddress]
+}
+
+func (m *Manager) Position(walletAddress, marketPDA string) MarketPosition {
+	shard := m.shard(walletAddress)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.positions[positionKey(walletAddress, marketPDA)]
+}
+
+func (m *Manager) SeedLedger(walletAddress string, ledger UserWallet) {
 	shard := m.shard(walletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	shard.ledgers[walletAddress] = ledger
 }
 
-func (m *SharedWalletManager) SeedPosition(walletAddress, marketPDA string, position MarketPosition) {
+func (m *Manager) SeedPosition(walletAddress, marketPDA string, position MarketPosition) {
 	shard := m.shard(walletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	shard.positions[positionKey(walletAddress, marketPDA)] = position
 }
 
-func (m *SharedWalletManager) ApplyChainLedger(walletAddress string, ledger UserWallet) {
+func (m *Manager) ApplyChainLedger(walletAddress string, ledger UserWallet) {
 	m.SeedLedger(walletAddress, ledger)
 }
 
-func (m *SharedWalletManager) ApplyDeposit(walletAddress string, amount uint64) {
-	if amount == 0 {
-		return
-	}
-	shard := m.shard(walletAddress)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	ledger := shard.ledgers[walletAddress]
-	ledger.AvailableUSDC += amount
-	shard.ledgers[walletAddress] = ledger
-}
-
-func (m *SharedWalletManager) ApplyChainPosition(walletAddress, marketPDA string, position MarketPosition) {
+func (m *Manager) ApplyChainPosition(walletAddress, marketPDA string, position MarketPosition) {
 	m.SeedPosition(walletAddress, marketPDA, position)
 }
 
-func (m *SharedWalletManager) DeletePosition(walletAddress, marketPDA string) {
+func (m *Manager) DeletePosition(walletAddress, marketPDA string) {
 	shard := m.shard(walletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	delete(shard.positions, positionKey(walletAddress, marketPDA))
 }
 
-func (m *SharedWalletManager) ReserveOrder(cmd *PlaceOrderCommand) error {
+func (m *Manager) ApplyDepositConfirmed(walletAddress string, amount uint64) {
+	if amount == 0 {
+		return
+	}
+	shard := m.shard(walletAddress)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	ledger := shard.ledgers[walletAddress]
+	ledger.AvailableUSDC += amount
+	shard.ledgers[walletAddress] = ledger
+}
+
+func (m *Manager) ReserveOrder(cmd ReserveOrderInput) error {
 	shard := m.shard(cmd.WalletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -125,13 +159,13 @@ func (m *SharedWalletManager) ReserveOrder(cmd *PlaceOrderCommand) error {
 		ledger.LockedUSDC += reserve
 	case SideSell:
 		switch cmd.OriginalOutcome {
-		case 0:
+		case OutcomeYes:
 			if position.AvailableYesShares < cmd.QtyLots {
 				return fmt.Errorf("insufficient available yes shares: available=%d required=%d", position.AvailableYesShares, cmd.QtyLots)
 			}
 			position.AvailableYesShares -= cmd.QtyLots
 			position.LockedYesShares += cmd.QtyLots
-		case 1:
+		case OutcomeNo:
 			if position.AvailableNoShares < cmd.QtyLots {
 				return fmt.Errorf("insufficient available no shares: available=%d required=%d", position.AvailableNoShares, cmd.QtyLots)
 			}
@@ -149,13 +183,13 @@ func (m *SharedWalletManager) ReserveOrder(cmd *PlaceOrderCommand) error {
 	return nil
 }
 
-func (m *SharedWalletManager) RecoverOrderLock(order *MemoryOrder, marketPDA string) {
+func (m *Manager) RecoverOrderLock(order ActiveOrder) {
 	shard := m.shard(order.WalletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	ledger := shard.ledgers[order.WalletAddress]
-	posKey := positionKey(order.WalletAddress, marketPDA)
+	posKey := positionKey(order.WalletAddress, order.MarketPDA)
 	position := shard.positions[posKey]
 
 	if order.OriginalAction == SideBuy {
@@ -164,7 +198,7 @@ func (m *SharedWalletManager) RecoverOrderLock(order *MemoryOrder, marketPDA str
 		ledger.AvailableUSDC -= lockAmount
 		ledger.LockedUSDC += lockAmount
 	} else if order.OriginalAction == SideSell {
-		if order.OriginalOutcome == 0 {
+		if order.OriginalOutcome == OutcomeYes {
 			lockAmount := minUint64(order.RemainingQty, position.AvailableYesShares)
 			position.AvailableYesShares -= lockAmount
 			position.LockedYesShares += lockAmount
@@ -179,7 +213,7 @@ func (m *SharedWalletManager) RecoverOrderLock(order *MemoryOrder, marketPDA str
 	shard.positions[posKey] = position
 }
 
-func (m *SharedWalletManager) ReleaseOrder(order *MemoryOrder, refundAmount uint64) {
+func (m *Manager) ReleaseOrder(order ActiveOrder, refundAmount uint64) {
 	shard := m.shard(order.WalletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -201,7 +235,7 @@ func (m *SharedWalletManager) ReleaseOrder(order *MemoryOrder, refundAmount uint
 		ledger.LockedUSDC -= unlock
 		ledger.AvailableUSDC += unlock
 	} else {
-		if order.OriginalOutcome == 0 {
+		if order.OriginalOutcome == OutcomeYes {
 			release := minUint64(order.RemainingQty, position.LockedYesShares)
 			position.LockedYesShares -= release
 			position.AvailableYesShares += release
@@ -216,12 +250,40 @@ func (m *SharedWalletManager) ReleaseOrder(order *MemoryOrder, refundAmount uint
 	shard.positions[posKey] = position
 }
 
-func (m *SharedWalletManager) ApplyLocalFill(maker, taker *MemoryOrder, qty uint64, normalizedPrice uint8, matchType string) {
-	m.applyFillForOrder(maker, qty, normalizedPrice, matchType)
-	m.applyFillForOrder(taker, qty, normalizedPrice, matchType)
+func (m *Manager) ApplyMatchPending(maker, taker ActiveOrder, qty uint64, normalizedPrice uint8) {
+	m.applyFillForOrder(maker, qty, normalizedPrice)
+	m.applyFillForOrder(taker, qty, normalizedPrice)
 }
 
-func (m *SharedWalletManager) applyFillForOrder(order *MemoryOrder, qty uint64, normalizedPrice uint8, _ string) {
+func (m *Manager) ApplySettlementConfirmed(walletAddress, marketPDA string) {
+	shard := m.shard(walletAddress)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	ledger := shard.ledgers[walletAddress]
+	posKey := positionKey(walletAddress, marketPDA)
+	position := shard.positions[posKey]
+
+	if ledger.PendingUSDC > 0 {
+		ledger.AvailableUSDC += uint64(ledger.PendingUSDC)
+	}
+	ledger.PendingUSDC = 0
+
+	if position.PendingYesShares > 0 {
+		position.AvailableYesShares += uint64(position.PendingYesShares)
+	}
+	position.PendingYesShares = 0
+
+	if position.PendingNoShares > 0 {
+		position.AvailableNoShares += uint64(position.PendingNoShares)
+	}
+	position.PendingNoShares = 0
+
+	shard.ledgers[walletAddress] = ledger
+	shard.positions[posKey] = position
+}
+
+func (m *Manager) applyFillForOrder(order ActiveOrder, qty uint64, normalizedPrice uint8) {
 	shard := m.shard(order.WalletAddress)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -242,29 +304,22 @@ func (m *SharedWalletManager) applyFillForOrder(order *MemoryOrder, qty uint64, 
 		} else {
 			consume := minUint64(actualUnits, ledger.LockedUSDC)
 			ledger.LockedUSDC -= consume
-			if order.RemainingSpend > 0 && order.RemainingSpend < actualUnits {
-				actualUnits = consume
-			}
+			actualUnits = consume
 		}
 		ledger.PendingUSDC -= int64(actualUnits)
-		if order.OriginalOutcome == 0 {
-			position.AvailableYesShares += qty
+		if order.OriginalOutcome == OutcomeYes {
 			position.PendingYesShares += int64(qty)
 		} else {
-			position.AvailableNoShares += qty
 			position.PendingNoShares += int64(qty)
 		}
 	} else {
-		if order.OriginalOutcome == 0 {
+		if order.OriginalOutcome == OutcomeYes {
 			consume := minUint64(qty, position.LockedYesShares)
 			position.LockedYesShares -= consume
-			position.PendingYesShares -= int64(consume)
 		} else {
 			consume := minUint64(qty, position.LockedNoShares)
 			position.LockedNoShares -= consume
-			position.PendingNoShares -= int64(consume)
 		}
-		ledger.AvailableUSDC += actualUnits
 		ledger.PendingUSDC += int64(actualUnits)
 	}
 
@@ -272,7 +327,7 @@ func (m *SharedWalletManager) applyFillForOrder(order *MemoryOrder, qty uint64, 
 	shard.positions[posKey] = position
 }
 
-func (m *SharedWalletManager) shard(walletAddress string) *walletShard {
+func (m *Manager) shard(walletAddress string) *walletShard {
 	idx := shardIndex(walletAddress) % uint32(len(m.shards))
 	return &m.shards[idx]
 }
@@ -287,14 +342,14 @@ func positionKey(walletAddress, marketPDA string) string {
 	return walletAddress + "|" + marketPDA
 }
 
-func requiredReserveUnits(cmd *PlaceOrderCommand) uint64 {
+func requiredReserveUnits(cmd ReserveOrderInput) uint64 {
 	if cmd.OrderType == OrderTypeMarket {
 		return cmd.SpendAmount
 	}
 	return reserveUnitsForLots(cmd.QtyLots, cmd.OriginalPriceTick)
 }
 
-func requiredReserveUnitsFromOrder(order *MemoryOrder) uint64 {
+func requiredReserveUnitsFromOrder(order ActiveOrder) uint64 {
 	if order.OrderType == OrderTypeMarket {
 		return order.RemainingSpend
 	}
@@ -305,8 +360,8 @@ func reserveUnitsForLots(qtyLots uint64, priceTick uint8) uint64 {
 	return ceilMulDiv(qtyLots, uint64(priceTick), 100)
 }
 
-func actualUnitsForOrder(order *MemoryOrder, qty uint64, normalizedPrice uint8) uint64 {
-	if order.OriginalOutcome == 1 {
+func actualUnitsForOrder(order ActiveOrder, qty uint64, normalizedPrice uint8) uint64 {
+	if order.OriginalOutcome == OutcomeNo {
 		return ceilMulDiv(qty, uint64(100-normalizedPrice), 100)
 	}
 	return ceilMulDiv(qty, uint64(normalizedPrice), 100)
@@ -327,9 +382,13 @@ func minUint64(a, b uint64) uint64 {
 	return b
 }
 
-func marketPDAForOrder(order *MemoryOrder, fallbackMarketID uint64) string {
-	if order.MarketPDA != "" {
-		return order.MarketPDA
-	}
-	return strconv.FormatUint(fallbackMarketID, 10)
-}
+const (
+	SideBuy  uint8 = 0
+	SideSell uint8 = 1
+
+	OutcomeYes uint8 = 0
+	OutcomeNo  uint8 = 1
+
+	OrderTypeLimit  uint8 = 0
+	OrderTypeMarket uint8 = 1
+)

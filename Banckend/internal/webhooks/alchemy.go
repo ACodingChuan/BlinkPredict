@@ -1,5 +1,8 @@
 package webhooks
 
+// Deprecated: market creation no longer depends on Alchemy webhook ingestion.
+// This handler remains only for legacy/non-market event paths during transition.
+
 import (
 	"context"
 	"crypto/hmac"

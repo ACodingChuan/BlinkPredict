@@ -1,8 +1,6 @@
 package matching
 
-import (
-	"blinkpredict/banckend/internal/logging"
-)
+import "blinkpredict/banckend/internal/logging"
 
 var bookLogger = logging.New("matcher-book")
 
@@ -65,25 +63,21 @@ func (ob *FixedArrayOrderBook) RestoreOrder(order *MemoryOrder) {
 	}
 }
 
-func (ob *FixedArrayOrderBook) ProcessCommand(cmd Command, wallet *SharedWalletManager, batch *pendingBatch) {
+func (ob *FixedArrayOrderBook) ProcessCommand(cmd Command, batch *pendingBatch) {
 	ob.CurrentTime = cmd.GetTimestamp()
 	switch c := cmd.(type) {
 	case *PlaceOrderCommand:
-		ob.handlePlaceOrder(c, wallet, batch)
+		ob.handlePlaceOrder(c, batch)
 	case *TickCommand:
-		ob.handleTick(c, wallet, batch)
+		ob.handleTick(c, batch)
 	case *HaltMarketCommand:
 		ob.handleHalt(c, batch)
 	}
 }
 
-func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, wallet *SharedWalletManager, batch *pendingBatch) {
+func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, batch *pendingBatch) {
 	if !ob.IsActive {
 		batch.addOrderUpdateForCommand(cmd, "rejected", cmd.QtyLots, cmd.SpendAmount, 0, "market_halted")
-		return
-	}
-	if err := wallet.ReserveOrder(cmd); err != nil {
-		batch.addOrderUpdateForCommand(cmd, "rejected", cmd.QtyLots, cmd.SpendAmount, 0, "insufficient_balance")
 		return
 	}
 
@@ -91,9 +85,9 @@ func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, wallet *
 	taker.InitFromCmd(cmd)
 
 	if taker.Side == SideBuy {
-		ob.matchAsks(taker, wallet, batch)
+		ob.matchAsks(taker, batch)
 	} else {
-		ob.matchBids(taker, wallet, batch)
+		ob.matchBids(taker, batch)
 	}
 
 	if taker.IsFilled() {
@@ -104,7 +98,6 @@ func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, wallet *
 
 	if taker.OrderType == OrderTypeMarket {
 		refund := taker.RemainingSpend
-		wallet.ReleaseOrder(taker, refund)
 		batch.addOrderUpdateForOrder(taker, "canceled", taker.RemainingQty, taker.RemainingSpend, refund, "market_unfilled")
 		ReleaseOrder(taker)
 		return
@@ -113,7 +106,7 @@ func (ob *FixedArrayOrderBook) handlePlaceOrder(cmd *PlaceOrderCommand, wallet *
 	ob.addOrderToBook(taker, batch)
 }
 
-func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, wallet *SharedWalletManager, batch *pendingBatch) {
+func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, batch *pendingBatch) {
 	targetPrice := ob.BestAskPrice
 	if targetPrice == 0 {
 		for p := uint8(1); p <= 99; p++ {
@@ -135,12 +128,12 @@ func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, wallet *SharedWalle
 		for maker != nil && !taker.IsFilled() {
 			nextMaker := maker.Next
 			if maker.ExpireTime > 0 && ob.CurrentTime >= maker.ExpireTime {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "expired", "expired")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, "expired", "expired")
 				maker = nextMaker
 				continue
 			}
 			if maker.WalletAddress == taker.WalletAddress {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "canceled", "self_trade_prevention")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, "canceled", "self_trade_prevention")
 				maker = nextMaker
 				continue
 			}
@@ -169,11 +162,10 @@ func (ob *FixedArrayOrderBook) matchAsks(taker *MemoryOrder, wallet *SharedWalle
 
 			maker.RemainingQty -= matchQty
 			level.TotalVolume -= matchQty
-			wallet.ApplyLocalFill(maker, taker, matchQty, targetPrice, classifyMatchType(maker, taker))
 			batch.addFill(maker, taker, targetPrice, matchQty)
 
 			if maker.RemainingQty == 0 {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, wallet, batch, "filled", "")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideSell, batch, "filled", "")
 			} else {
 				batch.addOrderUpdateForOrder(maker, "partially_filled", maker.RemainingQty, maker.RemainingSpend, 0, "")
 			}
@@ -198,7 +190,7 @@ func lotsForSpend(spendAmount uint64, priceTick uint8) uint64 {
 	return (spendAmount * 100) / uint64(priceTick)
 }
 
-func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, wallet *SharedWalletManager, batch *pendingBatch) {
+func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, batch *pendingBatch) {
 	targetPrice := ob.BestBidPrice
 	if targetPrice == 0 {
 		for p := uint8(99); p >= 1; p-- {
@@ -225,12 +217,12 @@ func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, wallet *SharedWalle
 		for maker != nil && !taker.IsFilled() {
 			nextMaker := maker.Next
 			if maker.ExpireTime > 0 && ob.CurrentTime >= maker.ExpireTime {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "expired", "expired")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, "expired", "expired")
 				maker = nextMaker
 				continue
 			}
 			if maker.WalletAddress == taker.WalletAddress {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "canceled", "self_trade_prevention")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, "canceled", "self_trade_prevention")
 				maker = nextMaker
 				continue
 			}
@@ -258,11 +250,10 @@ func (ob *FixedArrayOrderBook) matchBids(taker *MemoryOrder, wallet *SharedWalle
 			}
 			maker.RemainingQty -= matchQty
 			level.TotalVolume -= matchQty
-			wallet.ApplyLocalFill(maker, taker, matchQty, targetPrice, classifyMatchType(maker, taker))
 			batch.addFill(maker, taker, targetPrice, matchQty)
 
 			if maker.RemainingQty == 0 {
-				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, wallet, batch, "filled", "")
+				ob.removeAndRecycleMaker(maker, level, targetPrice, SideBuy, batch, "filled", "")
 			} else {
 				batch.addOrderUpdateForOrder(maker, "partially_filled", maker.RemainingQty, maker.RemainingSpend, 0, "")
 			}
@@ -291,7 +282,7 @@ func lotsForOrderSpend(order *MemoryOrder, spendAmount uint64, normalizedPrice u
 	return lotsForSpend(spendAmount, effectivePrice)
 }
 
-func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *PriceLevel, price uint8, side uint8, wallet *SharedWalletManager, batch *pendingBatch, status, reason string) {
+func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *PriceLevel, price uint8, side uint8, batch *pendingBatch, status, reason string) {
 	if maker.Prev != nil {
 		maker.Prev.Next = maker.Next
 	} else {
@@ -304,9 +295,6 @@ func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *
 	}
 	level.TotalVolume -= maker.RemainingQty
 	delete(ob.Orders, maker.OrderID)
-	if status == "canceled" || status == "expired" || status == "rejected" {
-		wallet.ReleaseOrder(maker, 0)
-	}
 	batch.addOrderUpdateForOrder(maker, status, maker.RemainingQty, maker.RemainingSpend, 0, reason)
 	ReleaseOrder(maker)
 }
@@ -369,14 +357,14 @@ func (ob *FixedArrayOrderBook) updateBestBid(startPrice uint8) {
 	}
 }
 
-func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, wallet *SharedWalletManager, batch *pendingBatch) {
+func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, batch *pendingBatch) {
 	ob.CurrentTime = cmd.Timestamp
 	changed := false
 	for p := uint8(1); p <= 99; p++ {
-		if ob.sweepLevelO1(ob.Bids[p], p, SideBuy, wallet, batch) {
+		if ob.sweepLevelO1(ob.Bids[p], p, SideBuy, batch) {
 			changed = true
 		}
-		if ob.sweepLevelO1(ob.Asks[p], p, SideSell, wallet, batch) {
+		if ob.sweepLevelO1(ob.Asks[p], p, SideSell, batch) {
 			changed = true
 		}
 	}
@@ -386,7 +374,7 @@ func (ob *FixedArrayOrderBook) handleTick(cmd *TickCommand, wallet *SharedWallet
 	}
 }
 
-func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, wallet *SharedWalletManager, batch *pendingBatch) bool {
+func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side uint8, batch *pendingBatch) bool {
 	if level == nil || level.Head == nil {
 		return false
 	}
@@ -395,7 +383,7 @@ func (ob *FixedArrayOrderBook) sweepLevelO1(level *PriceLevel, price uint8, side
 	for curr != nil {
 		next := curr.Next
 		if curr.ExpireTime > 0 && ob.CurrentTime >= curr.ExpireTime {
-			ob.removeAndRecycleMaker(curr, level, price, side, wallet, batch, "expired", "expired")
+			ob.removeAndRecycleMaker(curr, level, price, side, batch, "expired", "expired")
 			removed = true
 			curr = next
 		} else {

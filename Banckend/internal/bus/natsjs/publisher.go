@@ -22,12 +22,24 @@ func NewEventPublisher(client *Client) *EventPublisher {
 	return &EventPublisher{client: client}
 }
 
+func (p *CommandPublisher) PublishSubmitOrder(ctx context.Context, env protocol.CommandEnvelope[protocol.PlaceOrderCommand]) error {
+	return p.client.publishJSON(ctx, protocol.SubjectOrderSubmit, env.IdempotencyKey, env)
+}
+
 func (p *CommandPublisher) PublishPlaceOrder(ctx context.Context, env protocol.CommandEnvelope[protocol.PlaceOrderCommand]) error {
 	return p.client.publishJSON(ctx, protocol.SubjectPlaceOrder, env.IdempotencyKey, env)
 }
 
 func (p *CommandPublisher) PublishCancelOrder(ctx context.Context, env protocol.CommandEnvelope[protocol.CancelOrderCommand]) error {
 	return p.client.publishJSON(ctx, protocol.SubjectCancelOrder, env.ID, env)
+}
+
+func (p *CommandPublisher) PublishDepositConfirm(ctx context.Context, cmd protocol.DepositConfirmCommand) error {
+	return p.client.publishJSON(ctx, protocol.SubjectDepositConfirm, cmd.Signature, cmd)
+}
+
+func (p *CommandPublisher) PublishMarketConfirm(ctx context.Context, cmd protocol.MarketConfirmCommand) error {
+	return p.client.publishJSON(ctx, protocol.SubjectMarketConfirm, cmd.Signature, cmd)
 }
 
 var _ protocol.CommandPublisher = (*CommandPublisher)(nil)

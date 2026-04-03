@@ -1,5 +1,7 @@
 package webhooks
 
+// Deprecated: MarketCreated webhook classification is no longer part of the market primary path.
+
 import (
 	"crypto/sha256"
 	"encoding/base64"

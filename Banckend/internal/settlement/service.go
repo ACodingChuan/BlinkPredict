@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"blinkpredict/banckend/internal/bus/natsjs"
@@ -43,7 +44,7 @@ func NewService(client *natsjs.Client, pool *pgxpool.Pool, rpcURL string, progra
 	if consumerName == "" {
 		consumerName = defaultConsumerName
 	}
-	rpcClient := rpc.New(rpcURL)
+	rpcClient := logging.NewSolanaRPCClient("settlement-rpc", rpcURL)
 	return &Service{
 		consumerName: consumerName,
 		client:       client,
@@ -178,6 +179,99 @@ func (s *Service) handleMessage(ctx context.Context, msg *nats.Msg) {
 		_ = msg.NakWithDelay(2 * time.Second)
 		return
 	}
-	serviceLogger.Infof("submitted settlement tx market=%d sig=%s fills=%d inits=%d", event.MarketID, sig.String(), len(batch.Fills), len(plan.NeedInit))
+	if err := s.waitForConfirmation(ctx, sig, 45*time.Second); err != nil {
+		serviceLogger.Warnf("settlement confirmation failed market=%d sig=%s err=%v", event.MarketID, sig.String(), err)
+		_ = msg.NakWithDelay(2 * time.Second)
+		return
+	}
+	if err := s.persistUserPositionObservations(ctx, plan, sig.String()); err != nil {
+		serviceLogger.Warnf("persist user position observations failed market=%d sig=%s err=%v", event.MarketID, sig.String(), err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+	if err := s.publishSettlementConfirmed(ctx, batch, sig.String()); err != nil {
+		serviceLogger.Warnf("publish settlement confirmation failed market=%d sig=%s err=%v", event.MarketID, sig.String(), err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+	serviceLogger.Infof("confirmed settlement tx market=%d sig=%s fills=%d inits=%d", event.MarketID, sig.String(), len(batch.Fills), len(plan.NeedInit))
 	_ = msg.Ack()
+}
+
+func (s *Service) waitForConfirmation(ctx context.Context, sig solana.Signature, timeout time.Duration) error {
+	if s.rpc == nil {
+		return fmt.Errorf("rpc client is not configured")
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		result, err := s.rpc.GetSignatureStatuses(deadlineCtx, true, sig)
+		if err == nil && result != nil && len(result.Value) > 0 && result.Value[0] != nil {
+			status := result.Value[0]
+			if status.Err != nil {
+				return fmt.Errorf("transaction execution failed: %v", status.Err)
+			}
+			if status.ConfirmationStatus == rpc.ConfirmationStatusConfirmed || status.ConfirmationStatus == rpc.ConfirmationStatusFinalized {
+				return nil
+			}
+		}
+
+		select {
+		case <-deadlineCtx.Done():
+			return deadlineCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Service) persistUserPositionObservations(ctx context.Context, plan UserPositionInitPlan, txSig string) error {
+	if s.repo == nil {
+		return nil
+	}
+	records := make([]UserPositionAccountRecord, 0, len(plan.AlreadyExists)+len(plan.NeedInit))
+	for _, entry := range plan.AlreadyExists {
+		s.registry.MarkExists(entry.MarketID, entry.Wallet)
+		records = append(records, UserPositionAccountRecord{
+			MarketID:        entry.MarketID,
+			WalletAddress:   entry.Wallet,
+			UserPositionPDA: entry.PositionPDA.String(),
+		})
+	}
+	relayer := s.submitter.Relayer.PublicKey().String()
+	for _, entry := range plan.NeedInit {
+		s.registry.MarkExists(entry.MarketID, entry.Wallet)
+		records = append(records, UserPositionAccountRecord{
+			MarketID:         entry.MarketID,
+			WalletAddress:    entry.Wallet,
+			UserPositionPDA:  entry.PositionPDA.String(),
+			CreatedByRelayer: relayer,
+			CreatedTxSig:     txSig,
+		})
+	}
+	return s.repo.UpsertObserved(ctx, records)
+}
+
+func (s *Service) publishSettlementConfirmed(ctx context.Context, batch SubmissionBatch, txSig string) error {
+	if s.client == nil {
+		return nil
+	}
+	wallets := make([]string, 0, len(batch.UniqueUsers))
+	for _, user := range batch.UniqueUsers {
+		wallets = append(wallets, user.String())
+	}
+	sort.Strings(wallets)
+	event := protocol.SettlementConfirmedEvent{
+		EventID:               fmt.Sprintf("settlement-confirmed:%d:%s", batch.MarketID, txSig),
+		SchemaVersion:         1,
+		MarketID:              batch.MarketID,
+		MarketPDA:             batch.MarketPDA.String(),
+		SettlementTxSignature: txSig,
+		Wallets:               wallets,
+		ConfirmedAt:           time.Now().UTC().Unix(),
+	}
+	return s.client.PublishJSON(ctx, protocol.SubjectSettlementConfirmedMarket(batch.MarketID), txSig, event)
 }

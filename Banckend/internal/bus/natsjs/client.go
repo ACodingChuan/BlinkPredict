@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"blinkpredict/banckend/internal/logging"
+
 	"github.com/nats-io/nats.go"
 )
 
@@ -23,6 +25,8 @@ type Client struct {
 	js  nats.JetStreamContext
 }
 
+var logger = logging.New("nats")
+
 func New(cfg Config) (*Client, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("nats url is required")
@@ -37,10 +41,29 @@ func New(cfg Config) (*Client, error) {
 		cfg.WhkStream = "AP_WHK"
 	}
 
-	nc, err := nats.Connect(cfg.URL)
+	nc, err := nats.Connect(
+		cfg.URL,
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			logger.Warnf("nats disconnected err=%v", err)
+		}),
+		nats.ReconnectHandler(func(conn *nats.Conn) {
+			logger.Infof("nats reconnected url=%s", conn.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			logger.Warnf("nats connection closed")
+		}),
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			subject := ""
+			if sub != nil {
+				subject = sub.Subject
+			}
+			logger.Warnf("nats async error subject=%s err=%v", subject, err)
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("connect nats: %w", err)
 	}
+	logger.Infof("nats connected url=%s", cfg.URL)
 
 	opts := make([]nats.JSOpt, 0, 1)
 	if cfg.Domain != "" {
@@ -57,6 +80,7 @@ func New(cfg Config) (*Client, error) {
 
 func (c *Client) Close() {
 	if c.nc != nil {
+		logger.Infof("nats client closing")
 		c.nc.Close()
 	}
 }
@@ -104,6 +128,7 @@ func (c *Client) ensureStream(name string, subjects []string, retention nats.Ret
 		if _, err := c.js.UpdateStream(&current); err != nil {
 			return fmt.Errorf("update stream %s: %w", name, err)
 		}
+		logger.Infof("nats stream updated name=%s subjects=%v retention=%d", name, subjects, retention)
 		return nil
 	}
 	if err != nats.ErrStreamNotFound {
@@ -114,6 +139,7 @@ func (c *Client) ensureStream(name string, subjects []string, retention nats.Ret
 	if err != nil {
 		return fmt.Errorf("add stream %s: %w", name, err)
 	}
+	logger.Infof("nats stream added name=%s subjects=%v retention=%d", name, subjects, retention)
 	return nil
 }
 
@@ -130,6 +156,12 @@ func (c *Client) publishJSON(ctx context.Context, subject string, msgID string, 
 	if _, err := c.js.PublishMsg(msg, nats.Context(ctx)); err != nil {
 		return fmt.Errorf("publish %s: %w", subject, err)
 	}
+	logging.EventWithContext(ctx, logging.Component("nats").Info()).
+		Str("kind", "nats_publish").
+		Str("subject", subject).
+		Str("msg_id", msgID).
+		Str("payload", string(body)).
+		Msg("jetstream publish completed")
 	return nil
 }
 
@@ -148,5 +180,6 @@ func (c *Client) PublishCoreJSON(subject string, payload any) error {
 	if err := c.nc.Publish(subject, body); err != nil {
 		return fmt.Errorf("publish core %s: %w", subject, err)
 	}
+	logger.Infof("nats core publish subject=%s payload=%s", subject, string(body))
 	return nil
 }

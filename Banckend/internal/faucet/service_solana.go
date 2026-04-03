@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"blinkpredict/banckend/internal/logging"
+
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/associated-token-account"
 	"github.com/gagliardetto/solana-go/programs/token"
@@ -76,7 +78,7 @@ func NewSolanaService(cfg SolanaServiceConfig, repo ClaimsRepository) (*SolanaSe
 	}
 	return &SolanaService{
 		cfg:  cfg,
-		rpc:  rpc.New(cfg.RPCURL),
+		rpc:  logging.NewSolanaRPCClient("faucet-rpc", cfg.RPCURL),
 		ws:   wsClient,
 		repo: repo,
 	}, nil

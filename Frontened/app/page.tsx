@@ -65,6 +65,7 @@ export default function HomePage() {
             <h2 className="mt-4 max-w-2xl text-4xl font-semibold tracking-tight text-zinc-950 dark:text-zinc-50">A Solana prediction market shell built for creator-resolved and Pyth-secured markets.</h2>
             <div className="mt-6 flex flex-wrap gap-3">
               <Link className="rounded-full bg-emerald-600 px-5 py-3 text-sm font-semibold text-white" href="/markets/create">Create market</Link>
+              <Link className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 dark:border-zinc-700 dark:text-zinc-200" href="/dev/trade">Dev trade sandbox</Link>
               {authenticated && user ? (
                 <button
                   className="rounded-full border border-zinc-300 px-5 py-3 text-sm font-semibold text-zinc-700 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200"

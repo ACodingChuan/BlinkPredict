@@ -7,30 +7,25 @@ export const ORDER_INTENT_VERSION = 1;
 
 export interface OrderIntentFields {
   version: number;           // u8
-  chainId: number;           // u16
   programId: Uint8Array;     // [u8; 32]
   market: Uint8Array;        // [u8; 32]
   user: Uint8Array;          // [u8; 32]
+  nonce: BN;                 // u64
   side: number;              // u8: 0=Buy, 1=Sell
   outcome: number;           // u8: 0=Yes, 1=No
   orderType: number;         // u8: 0=Limit, 1=Market
   limitPrice: BN;            // u64 (price tick: 1..99, cents/share)
   totalAmount: BN;           // u64 (share lots or spend cents, both scaled by 100)
-  nonce: BN;                 // u64
   expiryTs: BN;              // i64
 }
 
-// 固定长度 134 bytes
+// 固定长度 132 bytes
 export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
-  const buffer = new Uint8Array(134);
+  const buffer = new Uint8Array(132);
   let offset = 0;
 
   buffer[offset] = intent.version;
   offset += 1;
-
-  const chainIdBytes = new BN(intent.chainId).toArray("le", 2);
-  buffer.set(chainIdBytes, offset);
-  offset += 2;
 
   buffer.set(intent.programId, offset);
   offset += 32;
@@ -40,6 +35,9 @@ export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
 
   buffer.set(intent.user, offset);
   offset += 32;
+
+  buffer.set(intent.nonce.toArray("le", 8), offset);
+  offset += 8;
 
   buffer[offset] = intent.side;
   offset += 1;
@@ -54,9 +52,6 @@ export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
   offset += 8;
 
   buffer.set(intent.totalAmount.toArray("le", 8), offset);
-  offset += 8;
-
-  buffer.set(intent.nonce.toArray("le", 8), offset);
   offset += 8;
 
   buffer.set(intent.expiryTs.toArray("le", 8), offset);
@@ -83,7 +78,6 @@ export function generateSecureNonce(): BN {
 
 export interface RawBuildOrderIntentParams {
   version?: number;
-  chainId: number;
   programId: PublicKey;
   market: PublicKey;
   user: PublicKey;
@@ -106,16 +100,15 @@ export function buildOrderIntent(params: BuildOrderIntentParams): {
   const nonce = params.nonce || generateSecureNonce();
   const intent: OrderIntentFields = {
     version: params.version ?? ORDER_INTENT_VERSION,
-    chainId: params.chainId,
     programId: params.programId.toBytes(),
     market: params.market.toBytes(),
     user: params.user.toBytes(),
+    nonce,
     side: params.side === "buy" ? 0 : 1,
     outcome: params.outcome === "yes" ? 0 : 1,
     orderType: params.orderType === "limit" ? 0 : 1,
     limitPrice: new BN(params.limitPrice),
     totalAmount: new BN(params.totalAmount),
-    nonce,
     expiryTs: new BN(params.expiryTs),
   };
 

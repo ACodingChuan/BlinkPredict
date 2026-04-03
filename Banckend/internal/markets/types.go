@@ -61,16 +61,7 @@ type Market struct {
 }
 
 type CreateMarketRequest struct {
-	Title             string           `json:"title"`
-	Description       string           `json:"description"`
-	Category          string           `json:"category"`
-	ImageURL          string           `json:"image_url"`
-	MetadataCID       string           `json:"metadata_cid"`
-	MetadataURL       string           `json:"metadata_url"`
-	CloseTime         time.Time        `json:"close_time"`
-	ResolveAfterTime  time.Time        `json:"resolve_after_time"`
-	ClaimDeadlineTime time.Time        `json:"claim_deadline_time"`
-	Resolution        ResolutionConfig `json:"resolution"`
+	Signature string `json:"signature"`
 }
 
 type ResolveMarketRequest struct {

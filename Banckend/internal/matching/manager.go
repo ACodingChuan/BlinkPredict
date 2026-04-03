@@ -18,6 +18,8 @@ import (
 
 var logger = logging.New("matcher")
 
+const matcherReservedConsumer = "matcher-reserved-primary"
+
 type ManagerConfig struct {
 	Batch BatchConfig
 }
@@ -26,7 +28,6 @@ type ManagerConfig struct {
 type MarketManager struct {
 	client      *natsjs.Client
 	pool        *pgxpool.Pool
-	wallet      *SharedWalletManager
 	batchConfig BatchConfig
 	mu          sync.RWMutex
 	actors      map[uint64]*MarketActor
@@ -41,14 +42,9 @@ func NewMarketManager(client *natsjs.Client, pool *pgxpool.Pool, cfg ManagerConf
 	return &MarketManager{
 		client:      client,
 		pool:        pool,
-		wallet:      NewSharedWalletManager(),
 		batchConfig: batchCfg,
 		actors:      make(map[uint64]*MarketActor),
 	}
-}
-
-func (m *MarketManager) SharedWallet() *SharedWalletManager {
-	return m.wallet
 }
 
 // GetOrCreateMarket 获取或创建市场Actor（动态寻址）
@@ -89,7 +85,7 @@ func (m *MarketManager) listActors() []*MarketActor {
 
 // StartConsumer 启动NATS消费者（防撑爆与人质劫持）
 func (m *MarketManager) StartConsumer(ctx context.Context) error {
-	sub, err := m.client.JetStream().QueueSubscribe(protocol.SubjectPlaceOrder, "matcher_group", func(msg *nats.Msg) {
+	sub, err := m.client.JetStream().QueueSubscribe(protocol.SubjectOrderReservedV1+".*", "matcher_group", func(msg *nats.Msg) {
 		wrapper, err := m.parseCommandFromJSON(msg.Data)
 		if err != nil {
 			logger.Warnf("failed to parse command: %v", err)
@@ -108,12 +104,12 @@ func (m *MarketManager) StartConsumer(ctx context.Context) error {
 			logger.Warnf("backpressure market=%d channel full, rejecting message", actor.MarketID)
 			msg.Nak()
 		}
-	}, nats.Durable("matcher_consumer"))
+	}, nats.Durable(matcherReservedConsumer), nats.ManualAck(), nats.DeliverNew())
 	if err != nil {
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
 
-	logger.Infof("Matcher consumer started on subject: %s", protocol.SubjectPlaceOrder)
+	logger.Infof("Matcher consumer started on subject: %s.*", protocol.SubjectOrderReservedV1)
 
 	<-ctx.Done()
 	_ = sub.Unsubscribe()
@@ -149,7 +145,7 @@ func (m *MarketManager) runMatcherEngine(actor *MarketActor) {
 				actor.Pending = newPendingBatch(actor.MarketID, actor.MarketPDA, time.Now().UTC())
 			}
 			actor.Pending.includeWrapper(wrapper, time.Now().UTC())
-			actor.Book.ProcessCommand(wrapper.Cmd, m.wallet, actor.Pending)
+			actor.Book.ProcessCommand(wrapper.Cmd, actor.Pending)
 			if actor.Pending.shouldFlush(time.Now().UTC(), m.batchConfig, false) {
 				_ = m.flushActorBatch(actor, time.Now().UTC())
 			}
@@ -209,9 +205,6 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 	if m.pool == nil {
 		return nil
 	}
-	if err := m.hydrateWalletBase(ctx); err != nil {
-		return err
-	}
 	rows, err := m.pool.Query(ctx, `
         SELECT
             o.order_id,
@@ -223,7 +216,7 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
             o.side,
             o.order_type,
             o.price_tick,
-            o.initial_spend_amount,
+            o.remaining_spend_amount,
             o.remaining_qty,
             o.expire_time,
             o.signature,
@@ -254,7 +247,7 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 			side              int16
 			orderType         int16
 			priceTick         int16
-			initialSpend      int64
+			remainingSpend    int64
 			remainingQty      int64
 			expireTime        int64
 			signature         string
@@ -265,7 +258,7 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 		)
 		if err := rows.Scan(
 			&orderID, &marketIDStr, &walletAddress, &originalAction, &originalOutcome, &originalPriceTick,
-			&side, &orderType, &priceTick, &initialSpend, &remainingQty, &expireTime, &signature,
+			&side, &orderType, &priceTick, &remainingSpend, &remainingQty, &expireTime, &signature,
 			&intentHex, &nonce, &marketPDA, &closeTime,
 		); err != nil {
 			return err
@@ -287,14 +280,13 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 		order.Side = uint8(side)
 		order.OrderType = uint8(orderType)
 		order.PriceTick = uint8(priceTick)
-		order.RemainingSpend = uint64(initialSpend)
+		order.RemainingSpend = uint64(remainingSpend)
 		order.RemainingQty = uint64(remainingQty)
 		order.ExpireTime = expireTime
 		order.Signature = signature
 		order.IntentBytesHex = intentHex
 		order.Nonce = uint64(nonce)
 		actor.Book.RestoreOrder(order)
-		m.wallet.RecoverOrderLock(order, marketPDA)
 	}
 	if rows.Err() != nil {
 		return rows.Err()
@@ -305,99 +297,12 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 	return nil
 }
 
-func (m *MarketManager) hydrateWalletBase(ctx context.Context) error {
-	walletRows, err := m.pool.Query(ctx, `
-		SELECT wallet_address, collateral_free_units
-		FROM wallet_accounts
-	`)
-	if err != nil {
-		return err
-	}
-	defer walletRows.Close()
-
-	for walletRows.Next() {
-		var (
-			walletAddress string
-			freeUnits     int64
-		)
-		if err := walletRows.Scan(&walletAddress, &freeUnits); err != nil {
-			return err
-		}
-		if freeUnits < 0 {
-			freeUnits = 0
-		}
-		m.wallet.SeedLedger(walletAddress, UserWallet{
-			AvailableUSDC: uint64(freeUnits),
-		})
-	}
-	if err := walletRows.Err(); err != nil {
-		return err
-	}
-
-	positionRows, err := m.pool.Query(ctx, `
-		SELECT
-			p.market_id,
-			p.wallet_address,
-			COALESCE(mk.market_pda, ''),
-			p.yes_free_lots,
-			p.yes_locked_lots,
-			p.no_free_lots,
-			p.no_locked_lots
-		FROM positions p
-		JOIN markets mk ON mk.market_id = p.market_id
-	`)
-	if err != nil {
-		return err
-	}
-	defer positionRows.Close()
-
-	for positionRows.Next() {
-		var (
-			marketIDStr   string
-			walletAddress string
-			marketPDA     string
-			yesFreeLots   int64
-			yesLockedLots int64
-			noFreeLots    int64
-			noLockedLots  int64
-		)
-		if err := positionRows.Scan(
-			&marketIDStr,
-			&walletAddress,
-			&marketPDA,
-			&yesFreeLots,
-			&yesLockedLots,
-			&noFreeLots,
-			&noLockedLots,
-		); err != nil {
-			return err
-		}
-		if marketPDA == "" {
-			marketPDA = marketIDStr
-		}
-		totalYes := clampNonNegative(yesFreeLots) + clampNonNegative(yesLockedLots)
-		totalNo := clampNonNegative(noFreeLots) + clampNonNegative(noLockedLots)
-		m.wallet.SeedPosition(walletAddress, marketPDA, MarketPosition{
-			AvailableYesShares: totalYes,
-			AvailableNoShares:  totalNo,
-		})
-	}
-	return positionRows.Err()
-}
-
-func clampNonNegative(v int64) uint64 {
-	if v <= 0 {
-		return 0
-	}
-	return uint64(v)
-}
-
 func (m *MarketManager) RunBootstrapTick(ctx context.Context) error {
 	now := time.Now().UTC().Unix()
 	_ = ctx
 	for _, actor := range m.listActors() {
 		batch := newPendingBatch(actor.MarketID, actor.MarketPDA, time.Now().UTC())
-		actor.Book.ProcessCommand(&TickCommand{MarketID: actor.MarketID, Timestamp: now}, m.wallet, batch)
+		actor.Book.ProcessCommand(&TickCommand{MarketID: actor.MarketID, Timestamp: now}, batch)
 		if batch.hasPayload() {
 			if err := m.publishMatchBatch(batch.freeze(time.Now().UTC())); err != nil {
 				return err
@@ -420,7 +325,7 @@ func (m *MarketManager) StartTickLoop(ctx context.Context, interval time.Duratio
 				now := time.Now().UTC().Unix()
 				for _, actor := range m.listActors() {
 					batch := newPendingBatch(actor.MarketID, actor.MarketPDA, time.Now().UTC())
-					actor.Book.ProcessCommand(&TickCommand{MarketID: actor.MarketID, Timestamp: now}, m.wallet, batch)
+					actor.Book.ProcessCommand(&TickCommand{MarketID: actor.MarketID, Timestamp: now}, batch)
 					if batch.hasPayload() {
 						if err := m.publishMatchBatch(batch.freeze(time.Now().UTC())); err != nil {
 							logger.Warnf("tick publish failed market=%d err=%v", actor.MarketID, err)
