@@ -1,8 +1,8 @@
 "use client";
 
-import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "@/app/utils/axiosInstance";
-import { OpenOrderItem, OpenOrdersResponse, UserOrderSocketMessage } from "@/types/market";
+import { OpenOrderItem, OpenOrdersResponse } from "@/types/market";
 import { usePrivy } from "@/lib/auth-client";
 import { toast } from "sonner";
 
@@ -12,7 +12,6 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
   const [matchingEnabled, setMatchingEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string>("");
-  const [socketState, setSocketState] = useState<"connecting" | "live" | "offline">("connecting");
 
   const hasOrders = useMemo(() => orders.length > 0, [orders]);
 
@@ -43,68 +42,16 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
   );
 
   useEffect(() => {
-    let active = true;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let resyncTimer: ReturnType<typeof setInterval> | null = null;
-
+    if (!user) return;
     void loadOrders();
 
-    const connect = async () => {
-      if (!active || !user) return;
-      try {
-        setSocketState("connecting");
-        const token = await getAccessToken();
-        if (!token) {
-          setSocketState("offline");
-          return;
-        }
-        const { data } = await api.post<{ ticket: string }>("/ws-ticket", {}, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        ws = new WebSocket(buildUserWSURL(data.ticket));
-        ws.onopen = () => {
-          if (!active) return;
-          setSocketState("live");
-        };
-        ws.onmessage = (event) => {
-          try {
-            const payload = JSON.parse(event.data) as Partial<UserOrderSocketMessage>;
-            if (payload.type !== "user.order.updated" || payload.market_id !== marketId || !payload.payload?.order_id) return;
-            applyOrderPatch(payload as UserOrderSocketMessage, setOrders);
-            setLastUpdatedAt(new Date().toISOString());
-          } catch (error) {
-            console.error("user orders websocket parse failed", error);
-          }
-        };
-        ws.onerror = () => {
-          if (!active) return;
-          setSocketState("offline");
-        };
-        ws.onclose = () => {
-          if (!active) return;
-          setSocketState("offline");
-          reconnectTimer = setTimeout(() => {
-            void connect();
-          }, 1200);
-        };
-      } catch (error) {
-        console.error("connect user websocket failed", error);
-        setSocketState("offline");
-        reconnectTimer = setTimeout(() => {
-          void connect();
-        }, 3000);
-      }
-    };
-
-    void connect();
-    resyncTimer = setInterval(() => {
-      if (!active || document.visibilityState !== "visible") return;
+    const pollTimer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       void loadOrders({ silent: true });
-    }, 60000);
+    }, 15000);
 
     const handleVisibilityChange = () => {
-      if (!active || document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible") return;
       void loadOrders({ silent: true });
     };
 
@@ -112,14 +59,11 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
-      active = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (resyncTimer) clearInterval(resyncTimer);
-      ws?.close();
+      clearInterval(pollTimer);
       window.removeEventListener("focus", handleVisibilityChange);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [getAccessToken, loadOrders, marketId, user]);
+  }, [loadOrders, user]);
 
   useEffect(() => {
     if (!refreshKey || !user) return;
@@ -164,7 +108,7 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
   return (
     <div className="overflow-x-auto rounded-2xl border border-zinc-200 dark:border-zinc-800">
       <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400">
-        <span>{socketState === "live" ? "Private websocket live" : `Private websocket ${socketState}`}</span>
+        <span>HTTP polling every 15s</span>
         <span>{lastUpdatedAt ? `Updated ${formatTime(lastUpdatedAt)}` : "Waiting for first sync"}</span>
       </div>
       <table className="w-full text-left text-sm">
@@ -204,45 +148,6 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
     </div>
   );
 };
-
-function buildUserWSURL(ticket: string): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080/api";
-  const parsed = new URL(apiBase, window.location.origin);
-  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-  return `${wsProtocol}//${parsed.host}/ws/orders?ticket=${encodeURIComponent(ticket)}`;
-}
-
-function applyOrderPatch(
-  payload: UserOrderSocketMessage,
-  setOrders: Dispatch<SetStateAction<OpenOrderItem[]>>,
-) {
-  const terminalStatuses = new Set(["filled", "canceled", "expired", "rejected"]);
-  setOrders((items) => {
-    if (terminalStatuses.has(payload.payload.status)) {
-      return items.filter((item) => item.id !== payload.payload.order_id);
-    }
-    const nextItem: OpenOrderItem = {
-      id: payload.payload.order_id,
-      side: payload.payload.original_action,
-      outcome: payload.payload.original_outcome,
-      price: payload.payload.original_price_tick,
-      quantity: payload.payload.remaining_qty_lots,
-      status: payload.payload.status,
-    };
-    const existing = items.find((item) => item.id === payload.payload.order_id);
-    if (!existing) {
-      return [nextItem, ...items];
-    }
-    return items.map((item) =>
-      item.id === payload.payload.order_id
-        ? {
-            ...item,
-            ...Object.fromEntries(Object.entries(nextItem).filter(([, value]) => value !== undefined && value !== "")),
-          }
-        : item,
-    );
-  });
-}
 
 function formatTime(value: string): string {
   const parsed = new Date(value);

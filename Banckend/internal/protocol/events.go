@@ -7,10 +7,10 @@ import (
 )
 
 const (
-	EventTypeOrderAccepted = "evt.order.accepted.v1"
-	EventTypeOrderClosed   = "evt.order.closed.v1"
-	EventTypeTradeExecuted = "evt.trade.executed.v1"
-	EventTypeOrderbook     = "evt.orderbook.updated.v1"
+	EventTypeOrderAccepted = "evt.order.accepted"
+	EventTypeOrderClosed   = "evt.order.closed"
+	EventTypeTradeExecuted = "evt.trade.executed"
+	EventTypeOrderbook     = "evt.orderbook.updated"
 )
 
 const (
@@ -19,15 +19,41 @@ const (
 	SubjectTradeExecuted = "evt.trade.executed"
 	SubjectOrderbook     = "evt.orderbook.updated"
 	SubjectBatchTrades   = "evt.trades"
-	SubjectMatchBatchV2  = "evt.match.batch.v2"
+
+	// SubjectMarketDelta is the durable public market-data batch emitted by matcher.
+	// Consumers: writer and any future projection/read-side workers.
+	SubjectMarketDelta = "evt.market.delta"
+
+	// SubjectMatchExecution is the durable execution batch emitted only when fills>0.
+	// Consumers: funds and settlement.
+	SubjectMatchExecution = "evt.match.execution"
+
+	// SubjectMarketDeltaHot is the low-latency core-NATS fanout for pusher only.
+	SubjectMarketDeltaHot = "hot.market.delta"
+
+	// SubjectOrderReleased is published by matcher when an order is canceled, expired, or rejected.
+	// Per spec §5.3: consumers = funds / writer.
+	SubjectOrderReleased = "evt.order.released"
 )
 
 func SubjectBatchTradesMarket(marketID uint64) string {
 	return fmt.Sprintf("%s.%d", SubjectBatchTrades, marketID)
 }
 
-func SubjectMatchBatchV2Market(marketID uint64) string {
-	return fmt.Sprintf("%s.%d", SubjectMatchBatchV2, marketID)
+func SubjectMarketDeltaMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectMarketDelta, marketID)
+}
+
+func SubjectMatchExecutionMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectMatchExecution, marketID)
+}
+
+func SubjectMarketDeltaHotMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectMarketDeltaHot, marketID)
+}
+
+func SubjectOrderReleasedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectOrderReleased, marketID)
 }
 
 type OrderStatus string

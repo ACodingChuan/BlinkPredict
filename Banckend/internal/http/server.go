@@ -132,13 +132,13 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/trades/{marketId}", s.handleTrades)
 	r.Get("/api/price-history/{marketId}", s.handlePriceHistory)
 	r.Get("/ws/markets/{marketId}", s.handleMarketOrderbookWS)
-	r.Get("/ws/orders", s.handleUserOrdersWS)
-	r.Get("/ws/users/me", s.handleUserOrdersWS)
 
-	// Helius Webhook (不需要认证)
-	r.Post("/api/webhooks/helius", s.handleHeliusWebhook)
-	// Alchemy Webhook (不需要认证)
-	r.Post("/api/webhooks/alchemy", s.handleAlchemyWebhook)
+	if s.webhookHandler != nil {
+		r.Post("/api/webhooks/helius", s.handleHeliusWebhook)
+	}
+	if s.alchemyWebhookHandler != nil {
+		r.Post("/api/webhooks/alchemy", s.handleAlchemyWebhook)
+	}
 	r.Post("/api/markets", s.handleCreateMarket)
 	r.Post("/api/faucet/claim", s.handleFaucetClaim)
 	r.Post("/api/deposits", s.handleSubmitDeposit)
@@ -151,7 +151,6 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/orders/split", s.handleSplit)
 		r.Post("/api/orders/merge", s.handleMerge)
 		r.Post("/api/claims", s.handleClaim)
-		r.Post("/api/ws-ticket", s.handleCreateWSTicket)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -2221,6 +2220,10 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 // handleHeliusWebgodot 处理 Helius webhook 请求
 func (s *Server) handleHeliusWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.webhookHandler == nil {
+		writeError(w, http.StatusNotImplemented, "webhook ingress disabled")
+		return
+	}
 	s.logger.Info().Str("remote_addr", r.RemoteAddr).Str("path", r.URL.Path).Msg("Helius webhook request received")
 	s.webhookHandler.HandleWebhook(w, r)
 }

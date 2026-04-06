@@ -9,26 +9,28 @@ import (
 )
 
 const (
-	CommandTypePlaceOrder     = "cmd.order.place.v1"
-	CommandTypeSubmitOrder    = "cmd.order.submit.v1"
-	CommandTypeCancelOrder    = "cmd.order.cancel.v1"
-	CommandTypeDepositConfirm = "cmd.tx.confirm.deposit.v1"
-	CommandTypeMarketConfirm  = "cmd.tx.confirm.market_create.v1"
+	CommandTypePlaceOrder     = "cmd.order.place"
+	CommandTypeSubmitOrder    = "cmd.order.submit"
+	CommandTypeCancelOrder    = "cmd.order.cancel"
+	CommandTypeDepositConfirm = "cmd.tx.confirm.deposit"
+	CommandTypeMarketConfirm  = "cmd.tx.confirm.market_create"
 )
 
 const (
-	SubjectPlaceOrder         = "cmd.order.place"
-	SubjectOrderSubmit        = "cmd.order.submit"
-	SubjectCancelOrder        = "cmd.order.cancel"
-	SubjectDepositConfirm     = "cmd.tx.confirm.deposit.v1"
-	SubjectMarketConfirm      = "cmd.tx.confirm.market_create.v1"
-	SubjectOrderReservedV1    = "evt.order.reserved.v1"
-	SubjectOrderReserveReject = "evt.order.reserve_rejected.v1"
-	SubjectSettlementConfirm  = "evt.settlement.confirmed.v1"
-	SubjectDepositConfirmed   = "evt.deposit.confirmed.v1"
-	SubjectDepositFailed      = "evt.deposit.failed.v1"
-	SubjectMarketConfirmed    = "evt.market.confirmed.v1"
-	SubjectMarketFailed       = "evt.market.failed.v1"
+	SubjectPlaceOrder           = "cmd.order.place"
+	SubjectOrderSubmit          = "cmd.order.submit"
+	SubjectCancelOrder          = "cmd.order.cancel"
+	SubjectDepositConfirm       = "cmd.tx.confirm.deposit"
+	SubjectMarketConfirm        = "cmd.tx.confirm.market_create"
+	SubjectOrderReserved        = "evt.order.reserved"
+	SubjectOrderReserveRejected = "evt.order.reserve_rejected"
+	SubjectSettlementSubmitted  = "evt.settlement.submitted"
+	SubjectSettlementConfirmed  = "evt.settlement.confirmed"
+	SubjectSettlementFailed     = "evt.settlement.failed"
+	SubjectDepositConfirmed     = "evt.deposit.confirmed"
+	SubjectDepositFailed        = "evt.deposit.failed"
+	SubjectMarketConfirmed      = "evt.market.confirmed"
+	SubjectMarketFailed         = "evt.market.failed"
 )
 
 var ErrCommandBusDisabled = errors.New("command bus is not configured")
@@ -169,14 +171,69 @@ type OrderReserveRejectedEvent struct {
 	CreatedAt      int64  `json:"created_at"`
 }
 
+// OrderReleasedEvent is published by matcher (evt.order.released.{market_id}) when
+// an order's lifecycle ends due to cancellation, expiry, or rejection.
+// Funds consumes this to release locked USDC/lots back to available.
+// Writer consumes this to update orders.status and Redis read models.
+type OrderReleasedEvent struct {
+	// MatchEventID links this release to the match batch context (may be empty for pure cancel)
+	MatchEventID      string `json:"match_event_id,omitempty"`
+	OrderID           uint64 `json:"order_id"`
+	MarketID          uint64 `json:"market_id"`
+	MarketPDA         string `json:"market_pda"`
+	WalletAddress     string `json:"wallet_address"`
+	OriginalAction    string `json:"original_action"`  // "buy" | "sell"
+	OriginalOutcome   string `json:"original_outcome"` // "yes" | "no"
+	OriginalPriceTick uint8  `json:"original_price_tick"`
+	OrderType         string `json:"order_type"` // "limit" | "market"
+	// RemainingQtyLots is the un-filled lots to release (for sell orders)
+	RemainingQtyLots uint64 `json:"remaining_qty_lots"`
+	// RefundAmount is the USDC to return to available (for buy orders)
+	RefundAmount uint64 `json:"refund_amount"`
+	// Status = "canceled" | "expired" | "rejected"
+	Status     string `json:"status"`
+	ReasonCode string `json:"reason_code,omitempty"`
+	ReleasedAt int64  `json:"released_at"`
+}
+
+type SettlementSubmittedEvent struct {
+	EventID              string   `json:"event_id"`
+	SchemaVersion        int      `json:"schema_version"`
+	MatchEventID         string   `json:"match_event_id"`
+	MarketID             uint64   `json:"market_id"`
+	MarketPDA            string   `json:"market_pda"`
+	TxSignature          string   `json:"tx_signature"`
+	RetryCount           int      `json:"retry_count"`
+	LastValidBlockHeight uint64   `json:"last_valid_block_height"`
+	Wallets              []string `json:"wallets"`
+	SubmittedAt          int64    `json:"submitted_at"`
+}
+
 type SettlementConfirmedEvent struct {
 	EventID               string   `json:"event_id"`
 	SchemaVersion         int      `json:"schema_version"`
+	MatchEventID          string   `json:"match_event_id"`
 	MarketID              uint64   `json:"market_id"`
 	MarketPDA             string   `json:"market_pda"`
+	TxSignature           string   `json:"tx_signature"`
 	SettlementTxSignature string   `json:"settlement_tx_signature"`
+	RetryCount            int      `json:"retry_count"`
+	Slot                  uint64   `json:"slot"`
 	Wallets               []string `json:"wallets"`
 	ConfirmedAt           int64    `json:"confirmed_at"`
+}
+
+type SettlementFailedEvent struct {
+	EventID       string   `json:"event_id"`
+	SchemaVersion int      `json:"schema_version"`
+	MatchEventID  string   `json:"match_event_id"`
+	MarketID      uint64   `json:"market_id"`
+	MarketPDA     string   `json:"market_pda"`
+	TxSignature   string   `json:"tx_signature"`
+	RetryCount    int      `json:"retry_count"`
+	ReasonCode    string   `json:"reason_code"`
+	Wallets       []string `json:"wallets"`
+	FailedAt      int64    `json:"failed_at"`
 }
 
 type CommandPublisher interface {
@@ -210,15 +267,23 @@ func (DisabledCommandPublisher) PublishMarketConfirm(context.Context, MarketConf
 }
 
 func SubjectOrderReservedMarket(marketID uint64) string {
-	return fmt.Sprintf("%s.%d", SubjectOrderReservedV1, marketID)
+	return fmt.Sprintf("%s.%d", SubjectOrderReserved, marketID)
 }
 
 func SubjectOrderReserveRejectedMarket(marketID uint64) string {
-	return fmt.Sprintf("%s.%d", SubjectOrderReserveReject, marketID)
+	return fmt.Sprintf("%s.%d", SubjectOrderReserveRejected, marketID)
 }
 
 func SubjectSettlementConfirmedMarket(marketID uint64) string {
-	return fmt.Sprintf("%s.%d", SubjectSettlementConfirm, marketID)
+	return fmt.Sprintf("%s.%d", SubjectSettlementConfirmed, marketID)
+}
+
+func SubjectSettlementSubmittedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectSettlementSubmitted, marketID)
+}
+
+func SubjectSettlementFailedMarket(marketID uint64) string {
+	return fmt.Sprintf("%s.%d", SubjectSettlementFailed, marketID)
 }
 
 func ValidatePlaceOrderCommand(cmd PlaceOrderCommand) error {

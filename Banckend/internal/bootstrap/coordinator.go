@@ -5,8 +5,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"blinkpredict/banckend/internal/depositconfirm"
 	"blinkpredict/banckend/internal/funds"
 	"blinkpredict/banckend/internal/logging"
+	"blinkpredict/banckend/internal/marketconfirm"
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/pusher"
 	"blinkpredict/banckend/internal/settlement"
@@ -16,18 +18,24 @@ import (
 var logger = logging.New("bootstrap")
 
 type Coordinator struct {
-	writer          *writer.Writer
-	funds           *funds.Service
-	matcher         *matching.MarketManager
-	pusher          *pusher.Service
-	settlement      *settlement.Service
-	writerState     atomic.Int32
-	fundsState      atomic.Int32
-	matcherState    atomic.Int32
-	pusherState     atomic.Int32
-	settlementState atomic.Int32
-	writeReady      atomic.Bool
-	tickInterval    time.Duration
+	writer             *writer.Writer
+	funds              *funds.Service
+	matcher            *matching.MarketManager
+	pusher             *pusher.Service
+	depositConfirm     *depositconfirm.Service
+	marketConfirm      *marketconfirm.Service
+	marketProjector    *marketconfirm.Projector
+	settlement         *settlement.Service
+	writerState        atomic.Int32
+	fundsState         atomic.Int32
+	matcherState       atomic.Int32
+	pusherState        atomic.Int32
+	depositState       atomic.Int32
+	marketConfirmState atomic.Int32
+	projectorState     atomic.Int32
+	settlementState    atomic.Int32
+	writeReady         atomic.Bool
+	tickInterval       time.Duration
 }
 
 type ModuleState string
@@ -41,76 +49,104 @@ const (
 	StateFailed     ModuleState = "failed"
 )
 
-func NewCoordinator(writer *writer.Writer, fundsSvc *funds.Service, matcher *matching.MarketManager, pusher *pusher.Service, settlementSvc *settlement.Service, tickInterval time.Duration) *Coordinator {
+func NewCoordinator(
+	writerSvc *writer.Writer,
+	fundsSvc *funds.Service,
+	matcher *matching.MarketManager,
+	pusherSvc *pusher.Service,
+	depositSvc *depositconfirm.Service,
+	marketConfirmSvc *marketconfirm.Service,
+	marketProjector *marketconfirm.Projector,
+	settlementSvc *settlement.Service,
+	tickInterval time.Duration,
+) *Coordinator {
 	return &Coordinator{
-		writer:       writer,
-		funds:        fundsSvc,
-		matcher:      matcher,
-		pusher:       pusher,
-		settlement:   settlementSvc,
-		tickInterval: tickInterval,
+		writer:          writerSvc,
+		funds:           fundsSvc,
+		matcher:         matcher,
+		pusher:          pusherSvc,
+		depositConfirm:  depositSvc,
+		marketConfirm:   marketConfirmSvc,
+		marketProjector: marketProjector,
+		settlement:      settlementSvc,
+		tickInterval:    tickInterval,
 	}
 }
 
 func (c *Coordinator) Start(ctx context.Context) error {
 	if c.writer != nil {
-		c.writerState.Store(int32(StateCatchingUpIndex()))
-		logger.Infof("starting writer catch-up")
-		if err := c.writer.Start(ctx); err != nil {
-			c.writerState.Store(int32(StateFailedIndex()))
+		if err := c.startModule(&c.writerState, StateCatchingUpIndex(), "writer", "starting writer catch-up", func() error {
+			return c.writer.Start(ctx)
+		}); err != nil {
 			return err
 		}
-		c.writerState.Store(int32(StateReadyIndex()))
 	}
 	if c.funds != nil {
-		c.fundsState.Store(int32(StateRecoveringIndex()))
-		logger.Infof("recovering funds snapshots")
-		if err := c.funds.Start(ctx); err != nil {
-			c.fundsState.Store(int32(StateFailedIndex()))
+		if err := c.startModule(&c.fundsState, StateRecoveringIndex(), "funds", "recovering funds snapshots", func() error {
+			return c.funds.Start(ctx)
+		}); err != nil {
 			return err
 		}
-		c.fundsState.Store(int32(StateReadyIndex()))
 	}
 	if c.matcher != nil {
-		c.matcherState.Store(int32(StateRecoveringIndex()))
-		logger.Infof("recovering matcher from orders")
-		if err := c.matcher.RecoverFromStore(ctx); err != nil {
-			c.matcherState.Store(int32(StateFailedIndex()))
+		if err := c.startModule(&c.matcherState, StateRecoveringIndex(), "matcher", "recovering matcher from orders", func() error {
+			return c.matcher.Start(ctx, c.tickInterval)
+		}); err != nil {
 			return err
 		}
-		logger.Infof("running bootstrap tick")
-		if err := c.matcher.RunBootstrapTick(ctx); err != nil {
-			c.matcherState.Store(int32(StateFailedIndex()))
-			return err
-		}
-		go func() {
-			if err := c.matcher.StartConsumer(ctx); err != nil {
-				logger.Warnf("matcher consumer stopped: %v", err)
-			}
-		}()
-		c.matcher.StartTickLoop(ctx, c.tickInterval)
-		c.matcherState.Store(int32(StateReadyIndex()))
 	}
 	if c.pusher != nil {
-		c.pusherState.Store(int32(StateStartingIndex()))
-		logger.Infof("starting pusher service")
-		if err := c.pusher.Start(ctx); err != nil {
-			c.pusherState.Store(int32(StateFailedIndex()))
+		if err := c.startModule(&c.pusherState, StateStartingIndex(), "pusher", "starting pusher service", func() error {
+			return c.pusher.Start(ctx)
+		}); err != nil {
 			return err
 		}
-		c.pusherState.Store(int32(StateReadyIndex()))
+	}
+	if c.depositConfirm != nil {
+		if err := c.startModule(&c.depositState, StateStartingIndex(), "deposit-confirm", "starting deposit confirm service", func() error {
+			return c.depositConfirm.Start(ctx)
+		}); err != nil {
+			return err
+		}
+	}
+	if c.marketConfirm != nil {
+		if err := c.startModule(&c.marketConfirmState, StateStartingIndex(), "market-confirm", "starting market confirm service", func() error {
+			return c.marketConfirm.Start(ctx)
+		}); err != nil {
+			return err
+		}
+	}
+	if c.marketProjector != nil {
+		if err := c.startModule(&c.projectorState, StateStartingIndex(), "market-projector", "starting market projector", func() error {
+			return c.marketProjector.Start(ctx)
+		}); err != nil {
+			return err
+		}
 	}
 	if c.settlement != nil {
-		c.settlementState.Store(int32(StateStartingIndex()))
-		logger.Infof("starting settlement service")
-		if err := c.settlement.Start(ctx); err != nil {
-			c.settlementState.Store(int32(StateFailedIndex()))
+		if err := c.startModule(&c.settlementState, StateStartingIndex(), "settlement", "starting settlement service", func() error {
+			return c.settlement.Start(ctx)
+		}); err != nil {
 			return err
 		}
-		c.settlementState.Store(int32(StateReadyIndex()))
 	}
 	c.writeReady.Store(true)
 	logger.Infof("bootstrap ready; write traffic enabled")
+	return nil
+}
+
+func (c *Coordinator) startModule(state *atomic.Int32, startState int, module string, message string, startFn func() error) error {
+	if startFn == nil {
+		return nil
+	}
+	state.Store(int32(startState))
+	logger.Infof("%s", message)
+	if err := startFn(); err != nil {
+		state.Store(int32(StateFailedIndex()))
+		logger.Warnf("%s start failed: %v", module, err)
+		return err
+	}
+	state.Store(int32(StateReadyIndex()))
 	return nil
 }
 
@@ -124,6 +160,9 @@ func (c *Coordinator) Status() map[string]any {
 		"funds":               stateFromIndex(c.fundsState.Load()),
 		"matcher":             stateFromIndex(c.matcherState.Load()),
 		"pusher":              stateFromIndex(c.pusherState.Load()),
+		"deposit-confirm":     stateFromIndex(c.depositState.Load()),
+		"market-confirm":      stateFromIndex(c.marketConfirmState.Load()),
+		"market-projector":    stateFromIndex(c.projectorState.Load()),
 		"settlement":          stateFromIndex(c.settlementState.Load()),
 		"gateway_write_ready": c.writeReady.Load(),
 	}

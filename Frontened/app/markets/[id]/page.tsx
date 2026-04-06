@@ -10,6 +10,7 @@ import { Orderbook } from "@/components/market/orderbook";
 import { PriceChart } from "@/components/market/price-chart";
 import { UserMarketTabs } from "@/components/market/user-market-tabs";
 import { useTrading } from "@/hooks/useTrading";
+import { useMarketPublicFeed } from "@/hooks/useMarketPublicFeed";
 import { useUSDCBalance } from "@/hooks/useUSDCBalance";
 import { Market, MarketMetadataDoc, MarketResponse } from "@/types/market";
 
@@ -21,6 +22,7 @@ export default function MarketDetailPage() {
   const { user, login, getAccessToken } = usePrivy();
   const { balance } = useUSDCBalance();
   const { placeOrder, loading: tradeLoading } = useTrading();
+  const marketFeed = useMarketPublicFeed(id);
 
   const [market, setMarket] = useState<Market | null>(null);
   const [metadata, setMetadata] = useState<MarketMetadataDoc | null>(null);
@@ -127,9 +129,16 @@ export default function MarketDetailPage() {
               </div>
             </section>
 
-            <PriceChart market={market} outcome={outcome} />
-            <Orderbook outcome={outcome} marketId={market.market_id} />
-            <UserMarketTabs marketId={market.market_id} refreshKey={lastOrderID} />
+            <PriceChart market={market} outcome={outcome} points={marketFeed.priceHistory} socketState={marketFeed.socketState} loading={marketFeed.loading} />
+            <Orderbook outcome={outcome} snapshot={marketFeed.orderbook} socketState={marketFeed.socketState} loading={marketFeed.loading} />
+            <UserMarketTabs
+              marketId={market.market_id}
+              refreshKey={lastOrderID}
+              trades={marketFeed.trades}
+              publicSocketState={marketFeed.socketState}
+              publicLoading={marketFeed.loading}
+              matchingEnabled={marketFeed.orderbook.matching_enabled}
+            />
 
             <section className="rounded-[28px] border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
               <h2 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Rules</h2>

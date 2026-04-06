@@ -50,6 +50,29 @@ func (r *Repository) Load(ctx context.Context, signature string) (Submission, er
 	return scanSubmission(row)
 }
 
+func (r *Repository) ListActive(ctx context.Context) ([]Submission, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT signature, wallet_address, amount_units, status, failure_reason, slot
+		FROM deposit_submissions
+		WHERE status IN ('submitted', 'watching')
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]Submission, 0)
+	for rows.Next() {
+		item, err := scanSubmission(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 func (r *Repository) MarkWatching(ctx context.Context, signature string) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE deposit_submissions

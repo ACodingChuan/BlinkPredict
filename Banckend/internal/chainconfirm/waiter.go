@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"blinkpredict/banckend/internal/logging"
 
 	solana "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	rpcws "github.com/gagliardetto/solana-go/rpc/ws"
 	"github.com/rs/zerolog"
 )
 
@@ -25,12 +23,20 @@ type Waiter struct {
 	rpc   *rpc.Client
 	wsURL string
 	log   string
-	mu    sync.Mutex
-	ws    *rpcws.Client
+	rt    WSRouter
 }
 
-func NewWaiter(rpcClient *rpc.Client, wsURL string, rpcURL string) *Waiter {
-	return &Waiter{rpc: rpcClient, wsURL: deriveWSURL(wsURL, rpcURL), log: "chainconfirm"}
+func NewWaiter(rpcClient *rpc.Client, wsURL string, rpcURL string, routers ...WSRouter) *Waiter {
+	var router WSRouter
+	if len(routers) > 0 {
+		router = routers[0]
+	}
+	return &Waiter{
+		rpc:   rpcClient,
+		wsURL: deriveWSURL(wsURL, rpcURL),
+		log:   "chainconfirm",
+		rt:    router,
+	}
 }
 
 func (w *Waiter) WaitForConfirmed(ctx context.Context, signature solana.Signature) (Result, error) {
@@ -49,49 +55,69 @@ func (w *Waiter) WaitForConfirmed(ctx context.Context, signature solana.Signatur
 		})
 		return status, nil
 	}
-	if strings.TrimSpace(w.wsURL) == "" {
-		return w.waitWithHTTPFallback(ctx, signature, fmt.Errorf("solana ws url is not configured"))
-	}
-
-	res, err := w.waitViaWS(ctx, signature)
-	if err == nil {
-		logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm websocket hit", map[string]any{
+	if w.rt != nil {
+		res, err := w.waitViaRouter(ctx, signature)
+		if err == nil {
+			logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm websocket hit", map[string]any{
+				"signature": signature.String(),
+				"slot":      res.Slot,
+				"status":    res.ConfirmationStatus,
+			})
+			return res, nil
+		}
+		logging.LogWS(w.log, ctx, zerolog.WarnLevel, "chain confirm websocket failed; fallback to http polling", map[string]any{
 			"signature": signature.String(),
-			"slot":      res.Slot,
-			"status":    res.ConfirmationStatus,
+			"error":     err.Error(),
 		})
-		return res, nil
 	}
-	logging.LogWS(w.log, ctx, zerolog.WarnLevel, "chain confirm websocket failed; retrying", map[string]any{
-		"signature": signature.String(),
-		"error":     err.Error(),
-	})
-	w.resetClient()
-	res, retryErr := w.waitViaWS(ctx, signature)
-	if retryErr == nil {
-		logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm websocket retry hit", map[string]any{
-			"signature": signature.String(),
-			"slot":      res.Slot,
-			"status":    res.ConfirmationStatus,
-		})
-		return res, nil
-	}
-	logging.LogWS(w.log, ctx, zerolog.WarnLevel, "chain confirm websocket retry failed; fallback to http", map[string]any{
-		"signature": signature.String(),
-		"error":     retryErr.Error(),
-	})
-	return w.waitWithHTTPFallback(ctx, signature, retryErr)
+	return w.waitWithHTTPPolling(ctx, signature)
 }
 
-func (w *Waiter) waitWithHTTPFallback(ctx context.Context, signature solana.Signature, triggerErr error) (Result, error) {
-	status, ok, err := w.checkStatus(ctx, signature)
-	if err == nil && ok {
-		return status, nil
-	}
+func (w *Waiter) waitViaRouter(ctx context.Context, signature solana.Signature) (Result, error) {
+	ch := make(chan SignatureResult, 1)
+	unsubscribe, err := w.rt.SubscribeSignature(signature.String(), "chainconfirm:"+signature.String(), "confirm_waiter", ch)
 	if err != nil {
-		return Result{}, fmt.Errorf("confirm via ws failed (%v), fallback status check failed: %w", triggerErr, err)
+		return Result{}, err
 	}
-	return Result{}, fmt.Errorf("confirm via ws failed (%v), signature still unconfirmed", triggerErr)
+	defer unsubscribe()
+	select {
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	case res := <-ch:
+		if strings.TrimSpace(res.ErrText) != "" {
+			return Result{}, fmt.Errorf("signature %s confirmed with chain error: %s", signature.String(), res.ErrText)
+		}
+		return Result{
+			Signature:          res.Signature,
+			Slot:               res.Slot,
+			ConfirmationStatus: res.ConfirmationStatus,
+		}, nil
+	}
+}
+
+func (w *Waiter) waitWithHTTPPolling(ctx context.Context, signature solana.Signature) (Result, error) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		status, ok, err := w.checkStatus(ctx, signature)
+		if err == nil && ok {
+			return status, nil
+		}
+		if err != nil {
+			logging.LogWS(w.log, ctx, zerolog.WarnLevel, "chain confirm http polling failed", map[string]any{
+				"signature": signature.String(),
+				"error":     err.Error(),
+			})
+		}
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return Result{}, fmt.Errorf("signature still unconfirmed before timeout; last poll error: %w", err)
+			}
+			return Result{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (w *Waiter) checkStatus(ctx context.Context, signature solana.Signature) (Result, bool, error) {
@@ -139,57 +165,4 @@ func WithTimeout(parent context.Context, timeout time.Duration) (context.Context
 		}
 	}
 	return context.WithTimeout(parent, timeout)
-}
-
-func (w *Waiter) waitViaWS(ctx context.Context, signature solana.Signature) (Result, error) {
-	client, err := w.getClient(ctx)
-	if err != nil {
-		return Result{}, err
-	}
-	logging.LogWS(w.log, ctx, zerolog.InfoLevel, "signature subscribe start", map[string]any{
-		"signature": signature.String(),
-	})
-	sub, err := client.SignatureSubscribe(signature, rpc.CommitmentConfirmed)
-	if err != nil {
-		return Result{}, err
-	}
-	defer sub.Unsubscribe()
-
-	res, err := sub.Recv(ctx)
-	if err != nil {
-		return Result{}, err
-	}
-	if res == nil {
-		return Result{}, fmt.Errorf("empty signature subscription result")
-	}
-	if res.Value.Err != nil {
-		return Result{}, fmt.Errorf("signature %s confirmed with chain error: %v", signature.String(), res.Value.Err)
-	}
-	return Result{Signature: signature.String(), Slot: res.Context.Slot, ConfirmationStatus: string(rpc.CommitmentConfirmed)}, nil
-}
-
-func (w *Waiter) getClient(ctx context.Context) (*rpcws.Client, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.ws != nil {
-		return w.ws, nil
-	}
-	logging.LogWS(w.log, ctx, zerolog.InfoLevel, "connect solana websocket", map[string]any{
-		"ws_url": w.wsURL,
-	})
-	client, err := rpcws.Connect(ctx, w.wsURL)
-	if err != nil {
-		return nil, err
-	}
-	w.ws = client
-	return w.ws, nil
-}
-
-func (w *Waiter) resetClient() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.ws != nil {
-		w.ws.Close()
-		w.ws = nil
-	}
 }

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import api from "@/app/utils/axiosInstance";
 import { RecentTrades } from "./recent-trades";
 import { UserOpenOrders } from "./user-open-orders";
+import { TradeItem } from "@/types/market";
 
 type ReadyStatus = {
   writer: string;
@@ -13,7 +14,21 @@ type ReadyStatus = {
   gateway_write_ready: boolean;
 };
 
-export const UserMarketTabs = ({ marketId, refreshKey }: { marketId: string; refreshKey?: string }) => {
+export const UserMarketTabs = ({
+  marketId,
+  refreshKey,
+  trades,
+  publicSocketState,
+  publicLoading,
+  matchingEnabled,
+}: {
+  marketId: string;
+  refreshKey?: string;
+  trades: TradeItem[];
+  publicSocketState: "connecting" | "live" | "offline";
+  publicLoading: boolean;
+  matchingEnabled: boolean;
+}) => {
   const [ready, setReady] = useState<ReadyStatus | null>(null);
 
   useEffect(() => {
@@ -46,7 +61,7 @@ export const UserMarketTabs = ({ marketId, refreshKey }: { marketId: string; ref
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Pusher Status</h3>
-            <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Public orderbook / trades use websocket pusher; private open orders use websocket tickets plus periodic HTTP resync.</p>
+            <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Public orderbook / trades use websocket pusher hot stream; private open orders use plain HTTP polling.</p>
           </div>
           <span className={`rounded-full px-3 py-1 text-xs font-semibold ${ready?.pusher === "ready" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300" : "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"}`}>
             pusher {ready?.pusher || "unknown"}
@@ -61,16 +76,16 @@ export const UserMarketTabs = ({ marketId, refreshKey }: { marketId: string; ref
       </div>
       <div>
         <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Your Open Orders</h3>
-        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Cancel sends `cmd.order.cancel.v1` to NATS through gateway, then refreshes via HTTP.</p>
+        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Cancel sends `cmd.order.cancel.v1` to NATS through gateway. UI refresh is pure HTTP polling.</p>
         <div className="mt-4">
           <UserOpenOrders marketId={marketId} refreshKey={refreshKey} />
         </div>
       </div>
       <div>
         <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Recent Trades</h3>
-        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Reads from /api/trades/{'{market_id}'} for matcher output verification.</p>
+        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Initialized by market snapshot, then only updated by pusher websocket deltas.</p>
         <div className="mt-4">
-          <RecentTrades marketId={marketId} />
+          <RecentTrades trades={trades} loading={publicLoading} matchingEnabled={matchingEnabled} socketState={publicSocketState} />
         </div>
       </div>
     </section>

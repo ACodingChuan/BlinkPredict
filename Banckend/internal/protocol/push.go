@@ -59,14 +59,71 @@ type UserOrderPush struct {
 }
 
 const (
+	WSTypeMarketSnapshot      = "market.snapshot"
+	WSTypeMarketDelta         = "market.delta"
 	WSTypeMarketDepthDelta    = "market.depth.delta"
 	WSTypeMarketTradeExecuted = "market.trade.executed"
 	WSTypeUserOrderUpdated    = "user.order.updated"
 )
 
+type WSOrderbookLevel struct {
+	Price       string `json:"price"`
+	TotalVolume string `json:"total_volume"`
+}
+
+type WSPricePoint struct {
+	Timestamp string `json:"timestamp"`
+	Price     string `json:"price"`
+	Quantity  string `json:"quantity,omitempty"`
+}
+
+type WSMarketSnapshot struct {
+	Type     string                  `json:"type"`
+	MarketID string                  `json:"market_id"`
+	Seq      string                  `json:"seq"`
+	Ts       string                  `json:"ts"`
+	Payload  WSMarketSnapshotPayload `json:"payload"`
+}
+
+type WSMarketSnapshotPayload struct {
+	MatchingEnabled bool               `json:"matching_enabled"`
+	Orderbook       WSOrderbookPayload `json:"orderbook"`
+	Trades          []WSMarketTrade    `json:"trades"`
+	PriceHistory    []WSPricePoint     `json:"price_history"`
+}
+
+type WSOrderbookPayload struct {
+	Bids         []WSOrderbookLevel `json:"bids"`
+	Asks         []WSOrderbookLevel `json:"asks"`
+	BestBidPrice string             `json:"best_bid_price,omitempty"`
+	BestAskPrice string             `json:"best_ask_price,omitempty"`
+}
+
+type WSMarketDelta struct {
+	Type     string               `json:"type"`
+	MarketID string               `json:"market_id"`
+	Seq      string               `json:"seq"`
+	Ts       string               `json:"ts"`
+	Payload  WSMarketDeltaPayload `json:"payload"`
+}
+
+type WSMarketDeltaPayload struct {
+	DepthLevels []WSDepthLevel  `json:"depth_levels,omitempty"`
+	Trades      []WSMarketTrade `json:"trades,omitempty"`
+	PricePoints []WSPricePoint  `json:"price_points,omitempty"`
+}
+
+type WSMarketTrade struct {
+	TradeID    string `json:"trade_id"`
+	PriceTick  string `json:"price_tick"`
+	FillAmount string `json:"fill_amount"`
+	ExecutedAt string `json:"executed_at"`
+}
+
 type WSMarketDepthDelta struct {
 	Type     string               `json:"type"`
 	MarketID string               `json:"market_id"`
+	Seq      string               `json:"seq,omitempty"`
 	Ts       string               `json:"ts"`
 	Payload  WSMarketDepthPayload `json:"payload"`
 }
@@ -84,6 +141,7 @@ type WSDepthLevel struct {
 type WSMarketTradeExecuted struct {
 	Type     string               `json:"type"`
 	MarketID string               `json:"market_id"`
+	Seq      string               `json:"seq,omitempty"`
 	Ts       string               `json:"ts"`
 	Payload  WSMarketTradePayload `json:"payload"`
 }

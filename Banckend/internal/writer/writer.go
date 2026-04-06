@@ -22,7 +22,8 @@ import (
 
 var logger = logging.New("writer")
 
-const defaultConsumerName = "writer-primary"
+const defaultConsumerName = "writer-market-delta"
+const releasedConsumerName = "writer-released"
 const (
 	recentTradesLimit     = 100
 	priceHistoryHotWindow = 90 * 24 * time.Hour
@@ -32,12 +33,12 @@ const (
 )
 
 type Writer struct {
-	consumerName  string
-	pool          *pgxpool.Pool
-	client        *natsjs.Client
-	rdb           *redis.Client
-	sub           *nats.Subscription
-	settlementSub *nats.Subscription
+	consumerName string
+	pool         *pgxpool.Pool
+	client       *natsjs.Client
+	rdb          *redis.Client
+	sub          *nats.Subscription // EVT: market delta
+	releasedSub  *nats.Subscription // EVT: order released
 }
 
 type pushMessages struct {
@@ -91,13 +92,14 @@ func (w *Writer) Start(ctx context.Context) error {
 	if err := w.ensureSubscription(); err != nil {
 		return err
 	}
-	if err := w.ensureSettlementSubscription(); err != nil {
+	if err := w.ensureReleasedSubscription(); err != nil {
 		return err
 	}
 	if err := w.catchUp(ctx); err != nil {
 		return err
 	}
 	go w.run(ctx)
+	go w.releasedLoop(ctx)
 	return nil
 }
 
@@ -105,7 +107,7 @@ func (w *Writer) ensureSubscription() error {
 	if w.sub != nil {
 		return nil
 	}
-	sub, err := w.client.PullSubscribe(protocol.SubjectMatchBatchV2+".*", w.consumerName)
+	sub, err := w.client.PullSubscribe(protocol.SubjectMarketDelta+".*", w.consumerName)
 	if err != nil {
 		return fmt.Errorf("writer subscribe: %w", err)
 	}
@@ -113,22 +115,21 @@ func (w *Writer) ensureSubscription() error {
 	return nil
 }
 
-func (w *Writer) ensureSettlementSubscription() error {
-	if w.settlementSub != nil {
+// ensureReleasedSubscription creates a durable Pull Consumer for evt.order.released.*
+// writer uses these to update orders.status = canceled/expired without re-parsing full market deltas.
+func (w *Writer) ensureReleasedSubscription() error {
+	if w.releasedSub != nil {
 		return nil
 	}
-	sub, err := w.client.JetStream().QueueSubscribe(
-		protocol.SubjectSettlementConfirm+".*",
-		"writer_settlement_group",
-		w.handleSettlementConfirmedMessage,
-		nats.Durable("writer-settlement-confirmed"),
-		nats.ManualAck(),
-		nats.DeliverNew(),
+	sub, err := w.client.PullSubscribe(
+		protocol.SubjectOrderReleased+".*",
+		releasedConsumerName,
 	)
 	if err != nil {
-		return fmt.Errorf("writer settlement subscribe: %w", err)
+		logger.Warnf("writer: order released pull subscribe failed: %v", err)
+		return nil // non-fatal
 	}
-	w.settlementSub = sub
+	w.releasedSub = sub
 	return nil
 }
 
@@ -155,9 +156,6 @@ func (w *Writer) run(ctx context.Context) {
 		if w.sub != nil {
 			_ = w.sub.Unsubscribe()
 		}
-		if w.settlementSub != nil {
-			_ = w.settlementSub.Unsubscribe()
-		}
 	}()
 
 	for {
@@ -183,6 +181,86 @@ func (w *Writer) run(ctx context.Context) {
 	}
 }
 
+// releasedLoop is a dedicated pull consumer loop for evt.order.released.*
+// It updates orders.status to canceled/expired and flushes Redis read models.
+func (w *Writer) releasedLoop(ctx context.Context) {
+	if w.releasedSub == nil {
+		return
+	}
+	defer func() {
+		_ = w.releasedSub.Unsubscribe()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		msgs, err := w.releasedSub.Fetch(writerRunBatch, nats.MaxWait(1500*time.Millisecond))
+		if err != nil {
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			logger.Warnf("released fetch failed: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		for _, msg := range msgs {
+			w.handleOrderReleasedMessage(ctx, msg)
+		}
+	}
+}
+
+// handleOrderReleasedMessage processes evt.order.released events.
+// Updates orders.status = canceled/expired in Postgres and flushes Redis user orders.
+func (w *Writer) handleOrderReleasedMessage(ctx context.Context, msg *nats.Msg) {
+	var event protocol.OrderReleasedEvent
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		logger.Warnf("writer released decode failed: %v", err)
+		_ = msg.Term()
+		return
+	}
+	if event.OrderID == 0 {
+		_ = msg.Ack()
+		return
+	}
+	statusCode := int16(matching.StatusCanceled)
+	switch event.Status {
+	case "expired":
+		statusCode = int16(matching.StatusExpired)
+	case "rejected":
+		statusCode = int16(matching.StatusRejected)
+	}
+	_, err := w.pool.Exec(ctx, `
+		UPDATE orders
+		SET status     = $1,
+		    updated_at = NOW()
+		WHERE order_id = $2
+		  AND status NOT IN ($3, $4, $5)
+	`,
+		statusCode,
+		int64(event.OrderID),
+		int16(matching.StatusCanceled),
+		int16(matching.StatusExpired),
+		int16(matching.StatusRejected),
+	)
+	if err != nil {
+		logger.Warnf("writer released update order_id=%d failed: %v", event.OrderID, err)
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+	// Flush Redis user orders if available
+	if w.rdb != nil {
+		key := fmt.Sprintf("user:orders:%s", event.WalletAddress)
+		orderIDStr := strconv.FormatUint(event.OrderID, 10)
+		_ = w.rdb.HDel(ctx, key, orderIDStr)
+		// Also remove from order:info
+		_ = w.rdb.Del(ctx, fmt.Sprintf("order:info:%s", orderIDStr))
+	}
+	_ = msg.Ack()
+	logger.Infof("writer: released order_id=%d wallet=%s status=%s", event.OrderID, event.WalletAddress, event.Status)
+}
+
 func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 	startedAt := time.Now()
 	meta, err := msg.Metadata()
@@ -192,7 +270,7 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	var event matching.MatchBatchEventV2
+	var event matching.MatchBatchEvent
 	if err := json.Unmarshal(msg.Data, &event); err != nil {
 		logger.Warnf("decode failed stream_seq=%d deliveries=%d err=%v", meta.Sequence.Stream, meta.NumDelivered, err)
 		_ = msg.Term()
@@ -203,7 +281,7 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		_ = msg.Term()
 		return
 	}
-	batch := legacyBatchFromV2(event)
+	batch := batchPayloadFromMarketDelta(event)
 	logger.Infof("writer processing stream_seq=%d deliveries=%d market=%d source_cmd_seq=%d bytes=%d",
 		meta.Sequence.Stream, meta.NumDelivered, batch.MarketID, batch.SourceCmdSeq, len(msg.Data))
 
@@ -265,12 +343,6 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
-	if err := w.applyPositionDeltas(ctx, tx, &batch); err != nil {
-		logger.Warnf("apply position deltas failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
-		_ = msg.NakWithDelay(time.Second)
-		return
-	}
-
 	if err := w.advanceCursor(ctx, tx, batch.MarketID, evtSeq, sourceCmdSeq); err != nil {
 		logger.Warnf("advance cursor failed stream_seq=%d market=%d deliveries=%d err=%v", meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, err)
 		_ = msg.NakWithDelay(time.Second)
@@ -295,58 +367,6 @@ func (w *Writer) handleMessage(ctx context.Context, msg *nats.Msg) {
 		logger.Infof("writer acked stream_seq=%d market=%d deliveries=%d elapsed=%s trades=%d states=%d depths=%d",
 			meta.Sequence.Stream, batch.MarketID, meta.NumDelivered, elapsed.Round(time.Millisecond), len(batch.TradeEvents), len(batch.StateEvents), len(batch.DepthEvents))
 	}
-}
-
-func (w *Writer) handleSettlementConfirmedMessage(msg *nats.Msg) {
-	var event protocol.SettlementConfirmedEvent
-	if err := json.Unmarshal(msg.Data, &event); err != nil {
-		logger.Warnf("writer settlement decode failed: %v", err)
-		_ = msg.Term()
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	tx, err := w.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		logger.Warnf("writer settlement begin tx failed market=%d err=%v", event.MarketID, err)
-		_ = msg.NakWithDelay(time.Second)
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	marketIDStr := strconv.FormatUint(event.MarketID, 10)
-	for _, wallet := range event.Wallets {
-		wallet = strings.TrimSpace(wallet)
-		if wallet == "" {
-			continue
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE positions
-			SET
-				yes_free_lots = yes_free_lots + yes_pending_lots,
-				yes_pending_lots = 0,
-				no_free_lots = no_free_lots + no_pending_lots,
-				no_pending_lots = 0,
-				updated_at = NOW()
-			WHERE market_id = $1::NUMERIC(20,0) AND wallet_address = $2
-		`, marketIDStr, wallet); err != nil {
-			logger.Warnf("writer settlement apply positions failed market=%d wallet=%s err=%v", event.MarketID, wallet, err)
-			_ = msg.NakWithDelay(time.Second)
-			return
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		logger.Warnf("writer settlement commit failed market=%d err=%v", event.MarketID, err)
-		_ = msg.NakWithDelay(time.Second)
-		return
-	}
-	if w.rdb != nil {
-		if err := w.syncPositionRedis(ctx, &matching.BatchEventPayload{MarketID: event.MarketID}); err != nil {
-			logger.Warnf("writer settlement redis sync failed market=%d err=%v", event.MarketID, err)
-		}
-	}
-	_ = msg.Ack()
 }
 
 func (w *Writer) lockCursorRow(ctx context.Context, tx pgx.Tx, marketID uint64) (int64, error) {
@@ -724,8 +744,8 @@ func (w *Writer) advanceCursor(ctx context.Context, tx pgx.Tx, marketID uint64, 
 	marketIDStr := strconv.FormatUint(marketID, 10)
 	_, err := tx.Exec(ctx, `
 		UPDATE consumer_cursors
-		SET last_evt_seq = $1,
-			last_source_cmd_seq = $2,
+		SET last_evt_seq = GREATEST(last_evt_seq, $1),
+			last_source_cmd_seq = GREATEST(last_source_cmd_seq, $2),
 			updated_at = NOW()
 		WHERE consumer_name = $3 AND market_id = $4::NUMERIC(20,0)
 	`, evtSeq, sourceCmdSeq, w.consumerName, marketIDStr)
@@ -745,9 +765,6 @@ func (w *Writer) rebuildRedisModels(ctx context.Context) error {
 	if err := w.deleteByPattern(ctx, "order:info:*"); err != nil {
 		return err
 	}
-	if err := w.deleteByPattern(ctx, "position:*"); err != nil {
-		return err
-	}
 	if err := w.deleteByPattern(ctx, "trades:latest:*"); err != nil {
 		return err
 	}
@@ -758,9 +775,6 @@ func (w *Writer) rebuildRedisModels(ctx context.Context) error {
 		return err
 	}
 	if err := w.rebuildActiveOrders(ctx); err != nil {
-		return err
-	}
-	if err := w.rebuildPositions(ctx); err != nil {
 		return err
 	}
 	if err := w.rebuildRecentTrades(ctx); err != nil {
@@ -1098,9 +1112,6 @@ func (w *Writer) updateRedisReadModels(ctx context.Context, batch *matching.Batc
 	}
 
 	if _, err := pipe.Exec(ctx); err != nil {
-		return pushMessages{}, err
-	}
-	if err := w.syncPositionRedis(ctx, batch); err != nil {
 		return pushMessages{}, err
 	}
 	return pushes, nil
@@ -1479,7 +1490,7 @@ func sourceOrdersForBatch(batch *matching.BatchEventPayload) []matching.FullOrde
 	return []matching.FullOrderData{*batch.SourceOrder}
 }
 
-func legacyBatchFromV2(event matching.MatchBatchEventV2) matching.BatchEventPayload {
+func batchPayloadFromMarketDelta(event matching.MatchBatchEvent) matching.BatchEventPayload {
 	batch := matching.BatchEventPayload{
 		MarketID:     event.MarketID,
 		SourceCmdSeq: event.SourceCmdSeqMax,
@@ -1490,7 +1501,7 @@ func legacyBatchFromV2(event matching.MatchBatchEventV2) matching.BatchEventPayl
 		SourceOrders: make([]matching.FullOrderData, 0, len(event.Orders)),
 	}
 
-	orderByIndex := make(map[uint16]matching.MatchedOrderV2, len(event.Orders))
+	orderByIndex := make(map[uint16]matching.MatchedOrder, len(event.Orders))
 	createdCmdSeq := event.SourceCmdSeqMin
 	if createdCmdSeq == 0 {
 		createdCmdSeq = event.SourceCmdSeqMax

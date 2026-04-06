@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import api from "@/app/utils/axiosInstance";
-import { MarketDepthSocketMessage, OrderbookSnapshot } from "@/types/market";
+import { useMemo } from "react";
+import { OrderbookSnapshot } from "@/types/market";
 
 interface OrderbookProps {
   outcome: "yes" | "no";
-  marketId: string;
+  snapshot: OrderbookSnapshot;
+  loading: boolean;
+  socketState: "connecting" | "live" | "offline";
 }
 
 type BookRow = {
@@ -15,84 +16,7 @@ type BookRow = {
   quantity: number;
 };
 
-const EMPTY_BOOK: OrderbookSnapshot = {
-  bids: [],
-  asks: [],
-  matching_enabled: false,
-};
-
-export const Orderbook = ({ outcome, marketId }: OrderbookProps) => {
-  const [snapshot, setSnapshot] = useState<OrderbookSnapshot>(EMPTY_BOOK);
-  const [loading, setLoading] = useState(true);
-  const [socketState, setSocketState] = useState<"connecting" | "live" | "offline">("connecting");
-
-  useEffect(() => {
-    let active = true;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const fetchOrderbook = async () => {
-      try {
-        const { data } = await api.get<OrderbookSnapshot>(`/orderbook/${marketId}`);
-        if (!active) return;
-        setSnapshot(data);
-      } catch (error) {
-        console.error("Failed to fetch orderbook", error);
-      } finally {
-        if (active) setLoading(false);
-      }
-    };
-
-    const connectSocket = () => {
-      if (!active) return;
-
-      const wsURL = buildOrderbookWSURL(marketId);
-      setSocketState("connecting");
-      ws = new WebSocket(wsURL);
-
-      ws.onopen = () => {
-        if (!active) return;
-        setSocketState("live");
-      };
-
-      ws.onmessage = (event) => {
-        if (!active) return;
-        try {
-          const payload = JSON.parse(event.data) as Partial<MarketDepthSocketMessage>;
-          if (payload.type !== "market.depth.delta" || payload.market_id !== marketId || !Array.isArray(payload.payload?.levels)) return;
-          setSnapshot((current) => applyDepthLevels(current, payload as MarketDepthSocketMessage));
-          setLoading(false);
-        } catch (error) {
-          console.error("Failed to parse websocket payload", error);
-        }
-      };
-
-      ws.onerror = () => {
-        if (!active) return;
-        setSocketState("offline");
-      };
-
-      ws.onclose = () => {
-        if (!active) return;
-        setSocketState("offline");
-        reconnectTimer = setTimeout(() => {
-          connectSocket();
-        }, 1200);
-      };
-    };
-
-    void fetchOrderbook();
-    connectSocket();
-
-    return () => {
-      active = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        ws.close();
-      }
-    };
-  }, [marketId]);
-
+export const Orderbook = ({ outcome, snapshot, loading, socketState }: OrderbookProps) => {
   const rows = useMemo(() => buildRows(snapshot, outcome), [snapshot, outcome]);
   const maxQty = useMemo(() => {
     if (rows.length === 0) return 1;
@@ -136,7 +60,7 @@ export const Orderbook = ({ outcome, marketId }: OrderbookProps) => {
 
         {loading && rows.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-zinc-300 px-4 py-10 text-center text-sm text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-            Loading orderbook...
+            Waiting for market snapshot...
           </div>
         ) : rows.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-zinc-300 px-4 py-10 text-center text-sm text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
@@ -240,46 +164,11 @@ function toQty(value: string): number {
 }
 
 function formatCents(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "--";
   return `${Math.round(value)}¢`;
 }
 
 function formatQty(value: number): string {
-  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
-function buildOrderbookWSURL(marketId: string): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080/api";
-  const parsed = new URL(apiBase, window.location.origin);
-  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-  return `${wsProtocol}//${parsed.host}/ws/markets/${marketId}`;
-}
-
-function applyDepthLevels(snapshot: OrderbookSnapshot, payload: MarketDepthSocketMessage): OrderbookSnapshot {
-  const bids = new Map(snapshot.bids.map((row) => [row.price, row.total_volume]));
-  const asks = new Map(snapshot.asks.map((row) => [row.price, row.total_volume]));
-
-  for (const level of payload.payload.levels) {
-    const target = level.side === "bid" ? bids : asks;
-    const key = level.price_tick.toString();
-    if (level.total_volume === 0) {
-      target.delete(key);
-    } else {
-      target.set(key, level.total_volume.toString());
-    }
-  }
-
-  const nextBids = Array.from(bids.entries())
-    .map(([price, totalVolume]) => ({ price, total_volume: totalVolume }))
-    .sort((a, b) => Number(b.price) - Number(a.price));
-  const nextAsks = Array.from(asks.entries())
-    .map(([price, totalVolume]) => ({ price, total_volume: totalVolume }))
-    .sort((a, b) => Number(a.price) - Number(b.price));
-
-  return {
-    bids: nextBids,
-    asks: nextAsks,
-    best_bid_price: nextBids[0]?.price,
-    best_ask_price: nextAsks[0]?.price,
-    matching_enabled: true,
-  };
+  if (!Number.isFinite(value)) return "--";
+  return value.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }

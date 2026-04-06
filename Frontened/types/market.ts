@@ -131,9 +131,60 @@ export interface WSDepthLevel {
   total_volume: number;
 }
 
+export interface WSOrderbookLevel {
+  price: string;
+  total_volume: string;
+}
+
+export interface WSPublicTrade {
+  trade_id: string;
+  price_tick: string;
+  fill_amount: string;
+  executed_at: string;
+}
+
+export interface WSPublicPricePoint {
+  timestamp: string;
+  price: string;
+  quantity?: string;
+}
+
+export interface MarketSnapshotSocketMessage {
+  type: "market.snapshot";
+  market_id: string;
+  seq: string;
+  ts: string;
+  payload: {
+    matching_enabled: boolean;
+    orderbook: {
+      bids: WSOrderbookLevel[];
+      asks: WSOrderbookLevel[];
+      best_bid_price?: string;
+      best_ask_price?: string;
+    };
+    trades: WSPublicTrade[];
+    price_history: WSPublicPricePoint[];
+  };
+}
+
+export interface MarketDeltaSocketMessage {
+  type: "market.delta";
+  market_id: string;
+  seq: string;
+  ts: string;
+  payload: {
+    depth_levels?: WSDepthLevel[];
+    trades?: WSPublicTrade[];
+    price_points?: WSPublicPricePoint[];
+  };
+}
+
+export type MarketPublicSocketMessage = MarketSnapshotSocketMessage | MarketDeltaSocketMessage;
+
 export interface MarketDepthSocketMessage {
   type: "market.depth.delta";
   market_id: string;
+  seq?: string;
   ts: string;
   payload: {
     levels: WSDepthLevel[];
@@ -143,6 +194,7 @@ export interface MarketDepthSocketMessage {
 export interface MarketTradeSocketMessage {
   type: "market.trade.executed";
   market_id: string;
+  seq?: string;
   ts: string;
   payload: {
     trade_id: string;

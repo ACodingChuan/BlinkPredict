@@ -3,6 +3,7 @@ package marketconfirm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,6 +19,11 @@ import (
 )
 
 var projectorLogger = logging.New("marketprojector")
+
+const (
+	marketProjectorFetchBatch = 16
+	marketProjectorMaxWait    = 1500 * time.Millisecond
+)
 
 type Projector struct {
 	pool        *pgxpool.Pool
@@ -35,28 +41,50 @@ func (p *Projector) Start(ctx context.Context) error {
 	if p == nil || p.client == nil || p.marketRepo == nil {
 		return nil
 	}
+	if err := p.ensureSubscription(); err != nil {
+		return err
+	}
+	go p.run(ctx)
+	return nil
+}
+
+func (p *Projector) ensureSubscription() error {
 	if p.sub != nil {
 		return nil
 	}
-	sub, err := p.client.JetStream().QueueSubscribe(
-		protocol.SubjectMarketConfirmed,
-		"market_projector_group",
-		p.handleMessage,
-		nats.Durable("market-projector-primary"),
-		nats.ManualAck(),
-		nats.DeliverAll(),
-	)
+	sub, err := p.client.PullSubscribe(protocol.SubjectMarketConfirmed, "market-projector")
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", protocol.SubjectMarketConfirmed, err)
 	}
 	p.sub = sub
-	go func() {
-		<-ctx.Done()
+	return nil
+}
+
+func (p *Projector) run(ctx context.Context) {
+	defer func() {
 		if p.sub != nil {
 			_ = p.sub.Unsubscribe()
 		}
 	}()
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		msgs, err := p.sub.Fetch(marketProjectorFetchBatch, nats.MaxWait(marketProjectorMaxWait))
+		if err != nil {
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			projectorLogger.Warnf("market projector fetch failed: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		for _, msg := range msgs {
+			p.handleMessage(msg)
+		}
+	}
 }
 
 func (p *Projector) handleMessage(msg *nats.Msg) {
@@ -68,18 +96,18 @@ func (p *Projector) handleMessage(msg *nats.Msg) {
 	}
 	now := time.Now().UTC()
 	market := markets.Market{
-		ID:          uuid.NewString(),
-		MarketID:    event.MarketID,
-		MarketPDA:   event.MarketPDA,
-		MetadataCID: event.MetadataCID,
-		MetadataURL: event.MetadataURL,
+		ID:             uuid.NewString(),
+		MarketID:       event.MarketID,
+		MarketPDA:      event.MarketPDA,
+		MetadataCID:    event.MetadataCID,
+		MetadataURL:    event.MetadataURL,
 		CollateralMint: "",
-		Title:       fallbackTitle(event.Title, event.MarketID),
-		Description: event.Description,
-		Category:    event.Category,
-		ImageURL:    event.ImageURL,
-		Status:      markets.MarketStatusOpen,
-		Outcome:     markets.MarketOutcomeUndecided,
+		Title:          fallbackTitle(event.Title, event.MarketID),
+		Description:    event.Description,
+		Category:       event.Category,
+		ImageURL:       event.ImageURL,
+		Status:         markets.MarketStatusOpen,
+		Outcome:        markets.MarketOutcomeUndecided,
 		Resolution: markets.ResolutionConfig{
 			Mode:             markets.ResolutionMode(event.ResolutionMode),
 			Authority:        event.ResolutionAuthority,

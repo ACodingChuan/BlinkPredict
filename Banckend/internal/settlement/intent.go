@@ -105,7 +105,7 @@ func (o OrderIntentV1) SignableMessage() []byte {
 }
 
 func OrderIntentFromHex(raw string) (OrderIntentV1, error) {
-	bytes, err := hex.DecodeString(raw)
+	bytes, err := decodeHex(raw)
 	if err != nil {
 		return OrderIntentV1{}, fmt.Errorf("decode intent hex: %w", err)
 	}

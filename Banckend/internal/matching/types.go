@@ -193,7 +193,7 @@ const (
 	MatchTypeMergeBurn = "merge_burn"
 )
 
-type MatchBatchEventV2 struct {
+type MatchBatchEvent struct {
 	EventID       string `json:"event_id"`
 	SchemaVersion int    `json:"schema_version"`
 
@@ -207,13 +207,13 @@ type MatchBatchEventV2 struct {
 	SourceCommandIDs []string `json:"source_command_ids,omitempty"`
 	TraceIDs         []string `json:"trace_ids,omitempty"`
 
-	Orders       []MatchedOrderV2 `json:"orders"`
-	Fills        []MatchFillV2    `json:"fills"`
-	OrderUpdates []OrderUpdateV2  `json:"order_updates"`
-	DepthUpdates []DepthUpdateV2  `json:"depth_updates"`
+	Orders       []MatchedOrder `json:"orders"`
+	Fills        []MatchFill    `json:"fills"`
+	OrderUpdates []OrderUpdate  `json:"order_updates"`
+	DepthUpdates []DepthUpdate  `json:"depth_updates"`
 }
 
-type ExecutionSnapshotV2 struct {
+type ExecutionSnapshot struct {
 	OrderID             uint64 `json:"order_id"`
 	WalletAddress       string `json:"wallet_address"`
 	OriginalAction      string `json:"original_action"`
@@ -228,20 +228,20 @@ type ExecutionSnapshotV2 struct {
 	Nonce               uint64 `json:"nonce"`
 }
 
-type SettlementPayloadV2 struct {
+type SettlementPayload struct {
 	IntentBytesHex string `json:"intent_bytes_hex"`
 	Signature      string `json:"signature"`
 }
 
-type MatchedOrderV2 struct {
-	OrderIndex uint16              `json:"order_index"`
-	OrderID    uint64              `json:"order_id"`
-	Execution  ExecutionSnapshotV2 `json:"execution"`
-	Settlement SettlementPayloadV2 `json:"settlement"`
-	CreatedAt  int64               `json:"created_at"`
+type MatchedOrder struct {
+	OrderIndex uint16            `json:"order_index"`
+	OrderID    uint64            `json:"order_id"`
+	Execution  ExecutionSnapshot `json:"execution"`
+	Settlement SettlementPayload `json:"settlement"`
+	CreatedAt  int64             `json:"created_at"`
 }
 
-type MatchFillV2 struct {
+type MatchFill struct {
 	FillIndex        uint32 `json:"fill_index"`
 	MakerOrderIndex  uint16 `json:"maker_order_index"`
 	TakerOrderIndex  uint16 `json:"taker_order_index"`
@@ -254,7 +254,7 @@ type MatchFillV2 struct {
 	PlatformFeeUnits uint64 `json:"platform_fee_units"`
 }
 
-type OrderUpdateV2 struct {
+type OrderUpdate struct {
 	OrderIndex           uint16 `json:"order_index"`
 	Status               string `json:"status"`
 	RemainingQtyLots     uint64 `json:"remaining_qty_lots"`
@@ -263,7 +263,7 @@ type OrderUpdateV2 struct {
 	ReasonCode           string `json:"reason_code,omitempty"`
 }
 
-type DepthUpdateV2 struct {
+type DepthUpdate struct {
 	Side        string `json:"side"`
 	PriceTick   uint8  `json:"price_tick"`
 	TotalVolume uint64 `json:"total_volume"`

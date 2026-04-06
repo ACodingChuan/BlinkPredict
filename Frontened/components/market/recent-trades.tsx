@@ -1,79 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import api from "@/app/utils/axiosInstance";
-import { MarketTradeSocketMessage, TradeItem, TradesResponse } from "@/types/market";
+import { TradeItem } from "@/types/market";
 
-export const RecentTrades = ({ marketId }: { marketId: string }) => {
-  const [trades, setTrades] = useState<TradesResponse["trades"]>([]);
-  const [matchingEnabled, setMatchingEnabled] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [socketState, setSocketState] = useState<"connecting" | "live" | "offline">("connecting");
-
-  useEffect(() => {
-    let active = true;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    const load = async () => {
-      try {
-        setLoading(true);
-        const { data } = await api.get<TradesResponse>(`/trades/${marketId}`);
-        if (!active) return;
-        setTrades(data.trades || []);
-        setMatchingEnabled(Boolean(data.matching_enabled));
-      } catch (error) {
-        console.error("load trades failed", error);
-      } finally {
-        if (active) setLoading(false);
-      }
-    };
-
-    const connect = () => {
-      if (!active) return;
-      const wsURL = buildMarketWSURL(marketId);
-      setSocketState("connecting");
-      ws = new WebSocket(wsURL);
-      ws.onopen = () => {
-        if (!active) return;
-        setSocketState("live");
-      };
-      ws.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data) as Partial<MarketTradeSocketMessage>;
-          if (payload.type !== "market.trade.executed" || payload.market_id !== marketId || !payload.payload?.trade_id) return;
-          const trade = toTradeItem(payload as MarketTradeSocketMessage);
-          setTrades((current) => {
-            const next = [trade, ...current.filter((item) => item.id !== trade.id)];
-            return next.slice(0, 100);
-          });
-        } catch (error) {
-          console.error("trade websocket parse failed", error);
-        }
-      };
-      ws.onerror = () => {
-        if (!active) return;
-        setSocketState("offline");
-      };
-      ws.onclose = () => {
-        if (!active) return;
-        setSocketState("offline");
-        reconnectTimer = setTimeout(connect, 1200);
-      };
-    };
-
-    void load();
-    connect();
-    return () => {
-      active = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      ws?.close();
-    };
-  }, [marketId]);
-
+export const RecentTrades = ({
+  trades,
+  loading,
+  matchingEnabled,
+  socketState,
+}: {
+  trades: TradeItem[];
+  loading: boolean;
+  matchingEnabled: boolean;
+  socketState: "connecting" | "live" | "offline";
+}) => {
   if (trades.length === 0) {
     return (
       <div className="rounded-2xl border border-dashed border-zinc-300 px-4 py-8 text-center text-sm text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-        {loading ? "Loading..." : matchingEnabled ? "No trades yet." : "No trades yet (matcher still in rollout)."}
+        {loading ? "Waiting for trade snapshot..." : matchingEnabled ? "No trades yet." : "No trades yet (matcher still in rollout)."}
       </div>
     );
   }
@@ -125,20 +68,4 @@ function formatTime(value?: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
   return parsed.toLocaleString();
-}
-
-function buildMarketWSURL(marketId: string): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080/api";
-  const parsed = new URL(apiBase, window.location.origin);
-  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-  return `${wsProtocol}//${parsed.host}/ws/markets/${marketId}`;
-}
-
-function toTradeItem(payload: MarketTradeSocketMessage): TradeItem {
-  return {
-    id: payload.payload.trade_id,
-    price: payload.payload.price_tick,
-    quantity: payload.payload.fill_amount,
-    executed_at: payload.payload.executed_at,
-  };
 }

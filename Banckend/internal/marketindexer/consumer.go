@@ -2,7 +2,7 @@ package marketindexer
 
 // Deprecated: market creation no longer relies on webhook-driven indexing.
 // Use the marketconfirm flow:
-// frontend tx -> POST /api/markets -> cmd.tx.confirm.market_create.v1 -> evt.market.confirmed.v1.
+// frontend tx -> POST /api/markets -> cmd.tx.confirm.market_create -> evt.market.confirmed.
 
 import (
 	"context"

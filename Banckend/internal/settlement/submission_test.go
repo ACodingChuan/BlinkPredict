@@ -12,6 +12,13 @@ import (
 	solana "github.com/gagliardetto/solana-go"
 )
 
+func assertAccountMetaFlags(t *testing.T, label string, meta *solana.AccountMeta, writable bool, signer bool) {
+	t.Helper()
+	if meta.IsWritable != writable || meta.IsSigner != signer {
+		t.Fatalf("%s flags mismatch: writable=%v signer=%v", label, meta.IsWritable, meta.IsSigner)
+	}
+}
+
 func makeMatchedOrder(
 	programID solana.PublicKey,
 	market solana.PublicKey,
@@ -20,7 +27,7 @@ func makeMatchedOrder(
 	orderID uint64,
 	side Side,
 	outcome Outcome,
-) matching.MatchedOrderV2 {
+) matching.MatchedOrder {
 	intent := OrderIntentV1{
 		Version:     1,
 		ProgramID:   programID,
@@ -34,10 +41,10 @@ func makeMatchedOrder(
 		Nonce:       uint64(orderID),
 		ExpiryTs:    123,
 	}
-	return matching.MatchedOrderV2{
+	return matching.MatchedOrder{
 		OrderIndex: idx,
 		OrderID:    orderID,
-		Execution: matching.ExecutionSnapshotV2{
+		Execution: matching.ExecutionSnapshot{
 			OrderID:           orderID,
 			WalletAddress:     user.String(),
 			OriginalAction:    map[Side]string{SideBuy: "buy", SideSell: "sell"}[side],
@@ -47,7 +54,7 @@ func makeMatchedOrder(
 			ExpireTime:        123,
 			Nonce:             uint64(orderID),
 		},
-		Settlement: matching.SettlementPayloadV2{
+		Settlement: matching.SettlementPayload{
 			IntentBytesHex: hex.EncodeToString(intent.Serialize()),
 			Signature:      base64.StdEncoding.EncodeToString(make([]byte, 64)),
 		},
@@ -60,14 +67,14 @@ func TestBuildSubmissionBatch(t *testing.T) {
 	userA := solana.NewWallet().PublicKey()
 	userB := solana.NewWallet().PublicKey()
 
-	event := matching.MatchBatchEventV2{
+	event := matching.MatchBatchEvent{
 		MarketID:  9,
 		MarketPDA: market.String(),
-		Orders: []matching.MatchedOrderV2{
+		Orders: []matching.MatchedOrder{
 			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
 			makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes),
 		},
-		Fills: []matching.MatchFillV2{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
 	}
 
 	batch, err := BuildSubmissionBatch(event, BuildConfig{ProgramID: programID})
@@ -84,10 +91,10 @@ func TestBuildSubmissionBatchReturnsNoWorkWhenNoFills(t *testing.T) {
 	market := solana.NewWallet().PublicKey()
 	user := solana.NewWallet().PublicKey()
 
-	_, err := BuildSubmissionBatch(matching.MatchBatchEventV2{
+	_, err := BuildSubmissionBatch(matching.MatchBatchEvent{
 		MarketID:  9,
 		MarketPDA: market.String(),
-		Orders:    []matching.MatchedOrderV2{makeMatchedOrder(programID, market, user, 0, 1, SideBuy, OutcomeYes)},
+		Orders:    []matching.MatchedOrder{makeMatchedOrder(programID, market, user, 0, 1, SideBuy, OutcomeYes)},
 	}, BuildConfig{ProgramID: programID})
 	if !errors.Is(err, ErrNoSettlementWork) {
 		t.Fatalf("expected ErrNoSettlementWork, got %v", err)
@@ -100,14 +107,14 @@ func TestBuildSubmissionBatchSortsOrdersByOrderIndex(t *testing.T) {
 	userA := solana.NewWallet().PublicKey()
 	userB := solana.NewWallet().PublicKey()
 
-	event := matching.MatchBatchEventV2{
+	event := matching.MatchBatchEvent{
 		MarketID:  9,
 		MarketPDA: market.String(),
-		Orders: []matching.MatchedOrderV2{
+		Orders: []matching.MatchedOrder{
 			makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes),
 			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
 		},
-		Fills: []matching.MatchFillV2{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
 	}
 
 	batch, err := BuildSubmissionBatch(event, BuildConfig{ProgramID: programID})
@@ -122,20 +129,42 @@ func TestBuildSubmissionBatchSortsOrdersByOrderIndex(t *testing.T) {
 	}
 }
 
+func TestBuildSubmissionBatchAcceptsWhitespaceInIntentHex(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	market := solana.NewWallet().PublicKey()
+	userA := solana.NewWallet().PublicKey()
+	userB := solana.NewWallet().PublicKey()
+
+	orderA := makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes)
+	orderB := makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes)
+	orderA.Settlement.IntentBytesHex = orderA.Settlement.IntentBytesHex[:40] + "\n  " + orderA.Settlement.IntentBytesHex[40:]
+
+	event := matching.MatchBatchEvent{
+		MarketID:  9,
+		MarketPDA: market.String(),
+		Orders:    []matching.MatchedOrder{orderA, orderB},
+		Fills:     []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+	}
+
+	if _, err := BuildSubmissionBatch(event, BuildConfig{ProgramID: programID}); err != nil {
+		t.Fatalf("BuildSubmissionBatch should accept whitespace in intent hex: %v", err)
+	}
+}
+
 func TestBuildSubmissionBatchRejectsMissingOrderIndex(t *testing.T) {
 	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
 	market := solana.NewWallet().PublicKey()
 	userA := solana.NewWallet().PublicKey()
 	userB := solana.NewWallet().PublicKey()
 
-	_, err := BuildSubmissionBatch(matching.MatchBatchEventV2{
+	_, err := BuildSubmissionBatch(matching.MatchBatchEvent{
 		MarketID:  9,
 		MarketPDA: market.String(),
-		Orders: []matching.MatchedOrderV2{
+		Orders: []matching.MatchedOrder{
 			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
 			makeMatchedOrder(programID, market, userB, 2, 2, SideSell, OutcomeYes),
 		},
-		Fills: []matching.MatchFillV2{{MakerOrderIndex: 0, TakerOrderIndex: 2, FillAmount: 10, FillPrice: 60}},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 2, FillAmount: 10, FillPrice: 60}},
 	}, BuildConfig{ProgramID: programID})
 	if err == nil {
 		t.Fatal("expected error for non-contiguous order indexes")
@@ -149,14 +178,14 @@ func TestBuildInstructionsOrdersSettlementAccountsByLayer(t *testing.T) {
 	userA := solana.NewWallet().PublicKey()
 	userB := solana.NewWallet().PublicKey()
 
-	batch, err := BuildSubmissionBatch(matching.MatchBatchEventV2{
+	batch, err := BuildSubmissionBatch(matching.MatchBatchEvent{
 		MarketID:  9,
 		MarketPDA: market.String(),
-		Orders: []matching.MatchedOrderV2{
+		Orders: []matching.MatchedOrder{
 			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
 			makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes),
 		},
-		Fills: []matching.MatchFillV2{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
 	}, BuildConfig{ProgramID: programID})
 	if err != nil {
 		t.Fatalf("BuildSubmissionBatch error: %v", err)
@@ -182,10 +211,23 @@ func TestBuildInstructionsOrdersSettlementAccountsByLayer(t *testing.T) {
 		t.Fatalf("unexpected instruction count: %d", len(instructions))
 	}
 
+	initAccounts := instructions[2].Accounts()
+	assertAccountMetaFlags(t, "init payer", initAccounts[0], true, true)
+	assertAccountMetaFlags(t, "init config", initAccounts[1], false, false)
+	assertAccountMetaFlags(t, "init user", initAccounts[2], false, false)
+	assertAccountMetaFlags(t, "init market", initAccounts[3], false, false)
+	assertAccountMetaFlags(t, "init user_position", initAccounts[4], true, false)
+	assertAccountMetaFlags(t, "init system", initAccounts[5], false, false)
+
 	settleAccounts := instructions[len(instructions)-1].Accounts()
 	if !settleAccounts[0].PublicKey.Equals(relayer.PublicKey()) {
 		t.Fatalf("unexpected relayer account: %s", settleAccounts[0].PublicKey)
 	}
+	assertAccountMetaFlags(t, "settle relayer", settleAccounts[0], true, true)
+	assertAccountMetaFlags(t, "settle config", settleAccounts[1], false, false)
+	assertAccountMetaFlags(t, "settle market", settleAccounts[2], true, false)
+	assertAccountMetaFlags(t, "settle instruction sysvar", settleAccounts[3], false, false)
+	assertAccountMetaFlags(t, "settle system", settleAccounts[4], false, false)
 	expectedLedgerA, _ := internalsolana.DeriveUserLedgerPDA(programID, userA)
 	expectedLedgerB, _ := internalsolana.DeriveUserLedgerPDA(programID, userB)
 	expectedPositionA, _ := internalsolana.DeriveUserPositionPDA(programID, userA, market)
@@ -196,10 +238,16 @@ func TestBuildInstructionsOrdersSettlementAccountsByLayer(t *testing.T) {
 	if !settleAccounts[5].PublicKey.Equals(expectedLedgerA) || !settleAccounts[6].PublicKey.Equals(expectedLedgerB) {
 		t.Fatalf("ledger accounts out of order: %s %s", settleAccounts[5].PublicKey, settleAccounts[6].PublicKey)
 	}
+	assertAccountMetaFlags(t, "settle ledger A", settleAccounts[5], true, false)
+	assertAccountMetaFlags(t, "settle ledger B", settleAccounts[6], true, false)
 	if !settleAccounts[7].PublicKey.Equals(expectedPositionA) || !settleAccounts[8].PublicKey.Equals(expectedPositionB) {
 		t.Fatalf("position accounts out of order: %s %s", settleAccounts[7].PublicKey, settleAccounts[8].PublicKey)
 	}
+	assertAccountMetaFlags(t, "settle position A", settleAccounts[7], true, false)
+	assertAccountMetaFlags(t, "settle position B", settleAccounts[8], true, false)
 	if !settleAccounts[9].PublicKey.Equals(expectedOrderA) || !settleAccounts[10].PublicKey.Equals(expectedOrderB) {
 		t.Fatalf("order state accounts out of order: %s %s", settleAccounts[9].PublicKey, settleAccounts[10].PublicKey)
 	}
+	assertAccountMetaFlags(t, "settle order state A", settleAccounts[9], true, false)
+	assertAccountMetaFlags(t, "settle order state B", settleAccounts[10], true, false)
 }

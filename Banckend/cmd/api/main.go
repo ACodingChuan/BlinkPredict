@@ -19,6 +19,7 @@ import (
 	"blinkpredict/banckend/internal/bootstrap"
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/cache"
+	"blinkpredict/banckend/internal/chainconfirm"
 	"blinkpredict/banckend/internal/config"
 	"blinkpredict/banckend/internal/db"
 	"blinkpredict/banckend/internal/depositconfirm"
@@ -62,14 +63,15 @@ func main() {
 	var redisClient *redis.Client
 	var fundsService *funds.Service
 	var fundsManager *funds.Manager
-	var wsTicketStore *pusher.TicketStore
 	var pusherHub *pusher.Hub
 	var pusherService *pusher.Service
+	var pgWriter *writer.Writer
 	var settlementService *settlement.Service
 	var depositConfirmService *depositconfirm.Service
 	var marketConfirmService *marketconfirm.Service
 	var marketProjector *marketconfirm.Projector
 	var marketManager *matching.MarketManager
+	var wsRouter chainconfirm.WSRouter
 	var err error
 	if cfg.NATSURL != "" {
 		natsClient, err = natsjs.New(natsjs.Config{
@@ -96,12 +98,13 @@ func main() {
 		// 创建市场管理器
 		marketManager = matching.NewMarketManager(natsClient, nil, matching.ManagerConfig{
 			Batch: matching.BatchConfig{
-				MaxFills:  cfg.MatcherBatchMaxFills,
-				MaxOrders: cfg.MatcherBatchMaxOrders,
-				MaxBytes:  cfg.MatcherBatchMaxBytes,
-				MaxAge:    cfg.MatcherBatchMaxAge,
-				IdleFlush: cfg.MatcherBatchIdleFlush,
-				FlushTick: cfg.MatcherBatchFlushTick,
+				MaxFillsHot:  cfg.MatcherBatchMaxFillsHot,
+				MaxFillsCold: cfg.MatcherBatchMaxFillsCold,
+				MaxOrders:    cfg.MatcherBatchMaxOrders,
+				MaxBytes:     cfg.MatcherBatchMaxBytes,
+				MaxAge:       cfg.MatcherBatchMaxAge,
+				IdleFlush:    cfg.MatcherBatchIdleFlush,
+				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
 		})
 	} else {
@@ -122,12 +125,13 @@ func main() {
 	if marketManager != nil {
 		marketManager = matching.NewMarketManager(natsClient, pool, matching.ManagerConfig{
 			Batch: matching.BatchConfig{
-				MaxFills:  cfg.MatcherBatchMaxFills,
-				MaxOrders: cfg.MatcherBatchMaxOrders,
-				MaxBytes:  cfg.MatcherBatchMaxBytes,
-				MaxAge:    cfg.MatcherBatchMaxAge,
-				IdleFlush: cfg.MatcherBatchIdleFlush,
-				FlushTick: cfg.MatcherBatchFlushTick,
+				MaxFillsHot:  cfg.MatcherBatchMaxFillsHot,
+				MaxFillsCold: cfg.MatcherBatchMaxFillsCold,
+				MaxOrders:    cfg.MatcherBatchMaxOrders,
+				MaxBytes:     cfg.MatcherBatchMaxBytes,
+				MaxAge:       cfg.MatcherBatchMaxAge,
+				IdleFlush:    cfg.MatcherBatchIdleFlush,
+				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
 		})
 	}
@@ -151,7 +155,6 @@ func main() {
 		}
 		defer redisClient.Close()
 		logger.Infof("Redis read model enabled")
-		wsTicketStore = pusher.NewTicketStore(redisClient, 45*time.Second)
 		matchingEngine = query.NewRedisEngine(redisClient, pool)
 		if fundsService != nil {
 			fundsService = funds.NewService(natsClient, pool, redisClient, fundsManager)
@@ -162,45 +165,22 @@ func main() {
 		logger.Infof("Market cache initialized")
 	}
 
-	// 初始化 Helius Webhook Handler
 	var webhookHandler *webhooks.HeliusHandler
-	if cfg.HeliusWebhookEnabled && cfg.HeliusWebhookSecret != "" {
-		if cfg.VUSDCMint == "" || cfg.GlobalVault == "" {
-			logger.Warnf("Helius webhook enabled but VUSDC_MINT/GLOBAL_VAULT is missing")
-		} else {
-			depositProjector := webhooks.NewDepositProjector(pool, redisClient, fundsManager, zerologLogger)
-			webhookHandler = webhooks.NewHeliusHandler(
-				depositProjector,
-				zerologLogger,
-				cfg.HeliusWebhookSecret,
-				cfg.VUSDCMint,
-				cfg.GlobalVault,
-				cfg.VUSDCDecimals,
-			)
-			logger.Infof("Helius webhook enabled")
-		}
-	} else {
-		logger.Infof("Helius webhook disabled (set HELIUS_WEBHOOK_ENABLED=true to enable)")
-	}
-
-	// 初始化 Alchemy Webhook Handler
 	var alchemyHandler *webhooks.AlchemyHandler
-	if cfg.AlchemySigningKey != "" {
-		alchemyHandler = webhooks.NewAlchemyHandler(
-			natsClient,
-			zerologLogger,
-			cfg.AlchemySigningKey,
-			cfg.ProgramID,
-		)
-		logger.Infof("Alchemy webhook enabled")
-	} else {
-		logger.Infof("Alchemy webhook disabled (set ALCHEMY_SIGNING_KEY to enable)")
-	}
-	boot := bootstrap.NewGate()
+	logger.Infof("Webhook ingress disabled; deposit and market flows use confirm workers only")
+	boot := bootstrap.NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, cfg.MatcherTickInterval)
 	if natsClient != nil {
-		pusherHub = pusher.NewHub(cfg, wsTicketStore)
+		if cfg.SolanaRPCURL != "" {
+			wsRouter = chainconfirm.NewRouter(cfg.SolanaWSURL, cfg.SolanaRPCURL, 2)
+			if wsRouter == nil {
+				logger.Warnf("shared solana websocket router disabled; using HTTP fallback only")
+			} else {
+				defer wsRouter.Close()
+			}
+		}
+		pusherHub = pusher.NewHub(cfg, nil, matchingEngine)
 		pusherService = pusher.NewService(natsClient, pusherHub)
-		pgWriter := writer.New(pool, natsClient, redisClient, "")
+		pgWriter = writer.New(pool, natsClient, redisClient, "")
 		marketProjector = marketconfirm.NewProjector(natsClient, pool, marketRepo, marketCache)
 		if cfg.SettlementRelayerKeypair != "" && cfg.ProgramID != "" {
 			programID := solana.MustPublicKeyFromBase58(cfg.ProgramID)
@@ -208,100 +188,28 @@ func main() {
 			if err != nil {
 				logger.Fatalf("settlement relayer keypair: %v", err)
 			}
-			settlementService = settlement.NewService(natsClient, pool, cfg.SolanaRPCURL, programID, relayer, "")
-		}
-		if pgWriter != nil {
-			boot.Set("writer", bootstrap.StateCatchingUp)
-			logger.Infof("starting writer catch-up")
-			if err := pgWriter.Start(ctx); err != nil {
-				boot.Set("writer", bootstrap.StateFailed)
-				logger.Fatalf("writer: %v", err)
-			}
-			boot.Set("writer", bootstrap.StateReady)
-		}
-		if fundsService != nil {
-			boot.Set("funds", bootstrap.StateRecovering)
-			logger.Infof("recovering funds snapshots")
-			if err := fundsService.Start(ctx); err != nil {
-				boot.Set("funds", bootstrap.StateFailed)
-				logger.Fatalf("funds: %v", err)
-			}
-			boot.Set("funds", bootstrap.StateReady)
-		}
-		if marketManager != nil {
-			boot.Set("matcher", bootstrap.StateRecovering)
-			logger.Infof("recovering matcher from orders")
-			if err := marketManager.RecoverFromStore(ctx); err != nil {
-				boot.Set("matcher", bootstrap.StateFailed)
-				logger.Fatalf("matcher recover: %v", err)
-			}
-			logger.Infof("running bootstrap tick")
-			if err := marketManager.RunBootstrapTick(ctx); err != nil {
-				boot.Set("matcher", bootstrap.StateFailed)
-				logger.Fatalf("matcher bootstrap tick: %v", err)
-			}
-			go func() {
-				if err := marketManager.StartConsumer(ctx); err != nil {
-					logger.Warnf("matcher consumer stopped: %v", err)
-					boot.Set("matcher", bootstrap.StateFailed)
-				}
-			}()
-			marketManager.StartTickLoop(ctx, cfg.MatcherTickInterval)
-			boot.Set("matcher", bootstrap.StateReady)
-		}
-		if pusherService != nil {
-			boot.Set("pusher", bootstrap.StateStarting)
-			logger.Infof("starting pusher service")
-			if err := pusherService.Start(ctx); err != nil {
-				boot.Set("pusher", bootstrap.StateFailed)
-				logger.Fatalf("pusher: %v", err)
-			}
-			boot.Set("pusher", bootstrap.StateReady)
+			settlementService = settlement.NewService(natsClient, pool, cfg.SolanaRPCURL, programID, relayer, wsRouter, "", cfg.SettlementReconcileInterval)
 		}
 		if cfg.SolanaRPCURL != "" {
-			depositConfirmService = depositconfirm.NewService(natsClient, pool, cfg)
-		}
-		if depositConfirmService != nil {
-			boot.Set("deposit-confirm", bootstrap.StateStarting)
-			logger.Infof("starting deposit confirm service")
-			if err := depositConfirmService.Start(ctx); err != nil {
-				boot.Set("deposit-confirm", bootstrap.StateFailed)
-				logger.Fatalf("deposit confirm: %v", err)
-			}
-			boot.Set("deposit-confirm", bootstrap.StateReady)
+			depositConfirmService = depositconfirm.NewService(natsClient, pool, cfg, wsRouter)
 		}
 		if cfg.SolanaRPCURL != "" {
-			marketConfirmService = marketconfirm.NewService(natsClient, pool, cfg)
+			marketConfirmService = marketconfirm.NewService(natsClient, pool, cfg, wsRouter)
 		}
-		if marketConfirmService != nil {
-			boot.Set("market-confirm", bootstrap.StateStarting)
-			logger.Infof("starting market confirm service")
-			if err := marketConfirmService.Start(ctx); err != nil {
-				boot.Set("market-confirm", bootstrap.StateFailed)
-				logger.Fatalf("market confirm: %v", err)
-			}
-			boot.Set("market-confirm", bootstrap.StateReady)
+		boot = bootstrap.NewCoordinator(
+			pgWriter,
+			fundsService,
+			marketManager,
+			pusherService,
+			depositConfirmService,
+			marketConfirmService,
+			marketProjector,
+			settlementService,
+			cfg.MatcherTickInterval,
+		)
+		if err := boot.Start(ctx); err != nil {
+			logger.Fatalf("bootstrap: %v", err)
 		}
-		if marketProjector != nil {
-			boot.Set("market-projector", bootstrap.StateStarting)
-			logger.Infof("starting market projector")
-			if err := marketProjector.Start(ctx); err != nil {
-				boot.Set("market-projector", bootstrap.StateFailed)
-				logger.Fatalf("market projector: %v", err)
-			}
-			boot.Set("market-projector", bootstrap.StateReady)
-		}
-		if settlementService != nil {
-			boot.Set("settlement", bootstrap.StateStarting)
-			logger.Infof("starting settlement service")
-			if err := settlementService.Start(ctx); err != nil {
-				boot.Set("settlement", bootstrap.StateFailed)
-				logger.Fatalf("settlement: %v", err)
-			}
-			boot.Set("settlement", bootstrap.StateReady)
-		}
-		boot.MarkReady()
-		logger.Infof("bootstrap ready; write traffic enabled")
 	}
 
 	var faucetSvc faucet.Service = faucet.DisabledService{}

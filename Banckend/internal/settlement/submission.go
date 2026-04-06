@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"blinkpredict/banckend/internal/matching"
 	internalsolana "blinkpredict/banckend/internal/solana"
@@ -59,7 +60,7 @@ type Submitter struct {
 
 var ErrNoSettlementWork = errors.New("match batch contains no fills")
 
-func BuildSubmissionBatch(event matching.MatchBatchEventV2, cfg BuildConfig) (SubmissionBatch, error) {
+func BuildSubmissionBatch(event matching.MatchBatchEvent, cfg BuildConfig) (SubmissionBatch, error) {
 	if len(event.Fills) == 0 {
 		return SubmissionBatch{}, ErrNoSettlementWork
 	}
@@ -70,7 +71,7 @@ func BuildSubmissionBatch(event matching.MatchBatchEventV2, cfg BuildConfig) (Su
 	if err != nil {
 		return SubmissionBatch{}, fmt.Errorf("parse market pda: %w", err)
 	}
-	sortedOrders := append([]matching.MatchedOrderV2(nil), event.Orders...)
+	sortedOrders := append([]matching.MatchedOrder(nil), event.Orders...)
 	sort.Slice(sortedOrders, func(i, j int) bool {
 		return sortedOrders[i].OrderIndex < sortedOrders[j].OrderIndex
 	})
@@ -143,7 +144,7 @@ func (s *Submitter) buildSettleMatchBatchInstruction(batch SubmissionBatch, conf
 	accounts := []*solana.AccountMeta{
 		solana.NewAccountMeta(s.Relayer.PublicKey(), true, true),
 		solana.NewAccountMeta(configPDA, false, false),
-		solana.NewAccountMeta(batch.MarketPDA, false, true),
+		solana.NewAccountMeta(batch.MarketPDA, true, false),
 		solana.NewAccountMeta(solana.SysVarInstructionsPubkey, false, false),
 		solana.NewAccountMeta(solana.SystemProgramID, false, false),
 	}
@@ -152,21 +153,21 @@ func (s *Submitter) buildSettleMatchBatchInstruction(batch SubmissionBatch, conf
 		if err != nil {
 			return nil, err
 		}
-		accounts = append(accounts, solana.NewAccountMeta(ledgerPDA, false, true))
+		accounts = append(accounts, solana.NewAccountMeta(ledgerPDA, true, false))
 	}
 	for _, user := range batch.UniqueUsers {
 		positionPDA, err := internalsolana.DeriveUserPositionPDA(s.ProgramID, user, batch.MarketPDA)
 		if err != nil {
 			return nil, err
 		}
-		accounts = append(accounts, solana.NewAccountMeta(positionPDA, false, true))
+		accounts = append(accounts, solana.NewAccountMeta(positionPDA, true, false))
 	}
 	for _, order := range batch.Orders {
 		orderStatePDA, err := internalsolana.DeriveOrderStatePDA(s.ProgramID, order.Intent.User, batch.MarketPDA, order.Intent.Nonce)
 		if err != nil {
 			return nil, err
 		}
-		accounts = append(accounts, solana.NewAccountMeta(orderStatePDA, false, true))
+		accounts = append(accounts, solana.NewAccountMeta(orderStatePDA, true, false))
 	}
 	return solana.NewInstruction(s.ProgramID, accounts, data), nil
 }
@@ -183,6 +184,53 @@ func (s *Submitter) BuildTransaction(ctx context.Context, batch SubmissionBatch,
 	return solana.NewTransaction(instructions, latest.Value.Blockhash, solana.TransactionPayer(s.Relayer.PublicKey()))
 }
 
+func (s *Submitter) BuildSignedTransaction(
+	ctx context.Context,
+	batch SubmissionBatch,
+	initPlan UserPositionInitPlan,
+) (*solana.Transaction, solana.Signature, string, uint64, error) {
+	instructions, err := s.BuildInstructions(batch, initPlan)
+	if err != nil {
+		return nil, solana.Signature{}, "", 0, err
+	}
+	latest, err := s.RPC.GetLatestBlockhash(ctx, rpc.CommitmentConfirmed)
+	if err != nil {
+		return nil, solana.Signature{}, "", 0, fmt.Errorf("get latest blockhash: %w", err)
+	}
+	tx, err := solana.NewTransaction(instructions, latest.Value.Blockhash, solana.TransactionPayer(s.Relayer.PublicKey()))
+	if err != nil {
+		return nil, solana.Signature{}, "", 0, err
+	}
+	sig, rawBase64, err := s.SignTransaction(tx)
+	if err != nil {
+		return nil, solana.Signature{}, "", 0, err
+	}
+	return tx, sig, rawBase64, latest.Value.LastValidBlockHeight, nil
+}
+
+func (s *Submitter) SignTransaction(tx *solana.Transaction) (solana.Signature, string, error) {
+	if tx == nil {
+		return solana.Signature{}, "", fmt.Errorf("transaction is nil")
+	}
+	_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(s.Relayer.PublicKey()) {
+			return &s.Relayer
+		}
+		return nil
+	})
+	if err != nil {
+		return solana.Signature{}, "", fmt.Errorf("sign settlement tx: %w", err)
+	}
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return solana.Signature{}, "", fmt.Errorf("marshal signed transaction: %w", err)
+	}
+	if len(tx.Signatures) == 0 {
+		return solana.Signature{}, "", fmt.Errorf("extract transaction signature: missing signed signatures")
+	}
+	return tx.Signatures[0], base64.StdEncoding.EncodeToString(raw), nil
+}
+
 func (s *Submitter) Submit(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
 	_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
 		if key.Equals(s.Relayer.PublicKey()) {
@@ -196,7 +244,7 @@ func (s *Submitter) Submit(ctx context.Context, tx *solana.Transaction) (solana.
 	return s.RPC.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: false, PreflightCommitment: rpc.CommitmentConfirmed})
 }
 
-func parseMatchedOrder(order matching.MatchedOrderV2) (OrderIntentV1, []byte, []byte, error) {
+func parseMatchedOrder(order matching.MatchedOrder) (OrderIntentV1, []byte, []byte, error) {
 	rawIntent, err := decodeHex(order.Settlement.IntentBytesHex)
 	if err != nil {
 		return OrderIntentV1{}, nil, nil, fmt.Errorf("decode intent hex for order %d: %w", order.OrderID, err)
@@ -215,7 +263,7 @@ func parseMatchedOrder(order matching.MatchedOrderV2) (OrderIntentV1, []byte, []
 	return intent, rawIntent, signature, nil
 }
 
-func validateIntentAgainstExecution(intent OrderIntentV1, marketPDA solana.PublicKey, exec matching.ExecutionSnapshotV2) error {
+func validateIntentAgainstExecution(intent OrderIntentV1, marketPDA solana.PublicKey, exec matching.ExecutionSnapshot) error {
 	if !intent.Market.Equals(marketPDA) {
 		return fmt.Errorf("intent market mismatch for order %d", exec.OrderID)
 	}
@@ -322,7 +370,7 @@ func buildInitUserPositionInstruction(programID, relayer, configPDA solana.Publi
 		solana.NewAccountMeta(configPDA, false, false),
 		solana.NewAccountMeta(entry.UserPublicKey, false, false),
 		solana.NewAccountMeta(entry.MarketPDA, false, false),
-		solana.NewAccountMeta(entry.PositionPDA, false, true),
+		solana.NewAccountMeta(entry.PositionPDA, true, false),
 		solana.NewAccountMeta(solana.SystemProgramID, false, false),
 	}
 	return solana.NewInstruction(programID, accounts, data)
@@ -352,7 +400,8 @@ func anchorDiscriminator(name string) []byte {
 }
 
 func decodeHex(raw string) ([]byte, error) {
-	return hex.DecodeString(raw)
+	cleaned := strings.Join(strings.Fields(raw), "")
+	return hex.DecodeString(cleaned)
 }
 
 func u16le(v uint16) []byte { return []byte{byte(v), byte(v >> 8)} }

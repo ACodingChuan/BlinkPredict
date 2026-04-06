@@ -295,8 +295,18 @@ func (ob *FixedArrayOrderBook) removeAndRecycleMaker(maker *MemoryOrder, level *
 	}
 	level.TotalVolume -= maker.RemainingQty
 	delete(ob.Orders, maker.OrderID)
-	batch.addOrderUpdateForOrder(maker, status, maker.RemainingQty, maker.RemainingSpend, 0, reason)
+	batch.addOrderUpdateForOrder(maker, status, maker.RemainingQty, maker.RemainingSpend, releaseRefundForOrder(maker), reason)
 	ReleaseOrder(maker)
+}
+
+func releaseRefundForOrder(order *MemoryOrder) uint64 {
+	if order == nil || order.OriginalAction != SideBuy {
+		return 0
+	}
+	if order.OrderType == OrderTypeMarket {
+		return order.RemainingSpend
+	}
+	return costForLots(order.RemainingQty, order.OriginalPriceTick)
 }
 
 func (ob *FixedArrayOrderBook) addOrderToBook(order *MemoryOrder, batch *pendingBatch) {

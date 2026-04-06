@@ -1,86 +1,35 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import api from "@/app/utils/axiosInstance";
-import { Market, MarketTradeSocketMessage, PriceHistoryRange, PriceHistoryResponse } from "@/types/market";
+import { useMemo, useState } from "react";
+import { Market, PriceHistoryRange, PricePoint } from "@/types/market";
 
 const RANGES: PriceHistoryRange[] = ["1H", "6H", "1D", "1W", "1M", "ALL"];
 
-export const PriceChart = ({ market, outcome }: { market: Market; outcome: "yes" | "no" }) => {
+export const PriceChart = ({
+  market,
+  outcome,
+  points,
+  socketState,
+  loading,
+}: {
+  market: Market;
+  outcome: "yes" | "no";
+  points: PricePoint[];
+  socketState: "connecting" | "live" | "offline";
+  loading: boolean;
+}) => {
   const isPyth = market.resolution.mode === "pyth";
   const highlight = outcome === "yes" ? "#0f766e" : "#dc2626";
   const [range, setRange] = useState<PriceHistoryRange>("1D");
-  const [history, setHistory] = useState<PriceHistoryResponse>({ range: "1D", points: [] });
-  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        setLoading(true);
-        const { data } = await api.get<PriceHistoryResponse>(`/price-history/${market.market_id}`, {
-          params: { range },
-        });
-        if (!active) return;
-        setHistory(data);
-      } catch (error) {
-        console.error("load price history failed", error);
-        if (active) setHistory({ range, points: [] });
-      } finally {
-        if (active) setLoading(false);
-      }
-    };
-
-    void load();
-    return () => {
-      active = false;
-    };
-  }, [market.market_id, range]);
-
-  useEffect(() => {
-    let active = true;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      if (!active) return;
-      const wsURL = buildMarketWSURL(market.market_id);
-      ws = new WebSocket(wsURL);
-      ws.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data) as Partial<MarketTradeSocketMessage>;
-          if (payload.type !== "market.trade.executed" || payload.market_id !== market.market_id || !payload.payload?.trade_id) return;
-          const point = {
-            timestamp: payload.payload.executed_at || new Date().toISOString(),
-            price: payload.payload.price_tick || "0",
-            quantity: payload.payload.fill_amount || "0",
-          };
-          setHistory((current) => {
-            if (range === "ALL") return current;
-            const points = [...current.points.filter((item) => item.timestamp !== point.timestamp || item.price !== point.price), point];
-            return { range: current.range, points };
-          });
-        } catch (error) {
-          console.error("price chart websocket parse failed", error);
-        }
-      };
-      ws.onerror = () => undefined;
-      ws.onclose = () => {
-        if (!active) return;
-        reconnectTimer = setTimeout(connect, 1200);
-      };
-    };
-
-    connect();
-    return () => {
-      active = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      ws?.close();
-    };
-  }, [market.market_id, range]);
-
-  const points = useMemo(() => {
-    const mapped = history.points
+  const filteredPoints = useMemo(() => {
+    const start = rangeStart(range);
+    return points
+      .filter((point) => {
+        if (range === "ALL") return true;
+        const ts = new Date(point.timestamp).getTime();
+        return Number.isFinite(ts) && ts >= start;
+      })
       .map((point) => {
         const price = Number(point.price);
         const ts = new Date(point.timestamp).getTime();
@@ -93,12 +42,11 @@ export const PriceChart = ({ market, outcome }: { market: Market; outcome: "yes"
         };
       })
       .filter((point): point is { x: number; y: number; quantity: string; timestamp: string } => point !== null);
-    return mapped;
-  }, [history.points, outcome]);
+  }, [outcome, points, range]);
 
-  const chart = useMemo(() => buildChartPath(points), [points]);
-  const latestPoint = points.length > 0 ? points[points.length - 1] : null;
-  const firstPoint = points.length > 0 ? points[0] : null;
+  const chart = useMemo(() => buildChartPath(filteredPoints), [filteredPoints]);
+  const latestPoint = filteredPoints.length > 0 ? filteredPoints[filteredPoints.length - 1] : null;
+  const firstPoint = filteredPoints.length > 0 ? filteredPoints[0] : null;
   const delta = latestPoint && firstPoint ? latestPoint.y - firstPoint.y : 0;
 
   return (
@@ -115,7 +63,10 @@ export const PriceChart = ({ market, outcome }: { market: Market; outcome: "yes"
             {latestPoint ? `${latestPoint.y.toFixed(1)}%` : "--"}
           </div>
           <div className={`${delta <= 0 ? "text-rose-500" : "text-emerald-500"} text-sm font-medium`}>
-            {latestPoint && firstPoint ? `${delta > 0 ? "+" : ""}${delta.toFixed(1)}%` : loading ? "Loading..." : "No data"}
+            {latestPoint && firstPoint ? `${delta > 0 ? "+" : ""}${delta.toFixed(1)}%` : loading ? "Waiting for snapshot..." : "No data"}
+          </div>
+          <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+            market stream {socketState === "live" ? "live" : socketState}
           </div>
         </div>
       </div>
@@ -134,7 +85,7 @@ export const PriceChart = ({ market, outcome }: { market: Market; outcome: "yes"
 
       <div className="flex items-center justify-between gap-4">
         <div className="text-sm text-zinc-500 dark:text-zinc-400">
-          {latestPoint ? `Last update ${formatTime(latestPoint.timestamp)}` : loading ? "Loading chart..." : "No trade history yet"}
+          {latestPoint ? `Last update ${formatTime(latestPoint.timestamp)}` : loading ? "Waiting for price history snapshot..." : "No trade history yet"}
         </div>
         <div className="inline-flex rounded-full border border-zinc-200 p-1 dark:border-zinc-800">
           {RANGES.map((value) => (
@@ -181,9 +132,21 @@ function formatTime(value: string): string {
   return parsed.toLocaleString();
 }
 
-function buildMarketWSURL(marketId: string): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080/api";
-  const parsed = new URL(apiBase, window.location.origin);
-  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-  return `${wsProtocol}//${parsed.host}/ws/markets/${marketId}`;
+function rangeStart(range: PriceHistoryRange): number {
+  const now = Date.now();
+  switch (range) {
+    case "1H":
+      return now - 60 * 60 * 1000;
+    case "6H":
+      return now - 6 * 60 * 60 * 1000;
+    case "1D":
+      return now - 24 * 60 * 60 * 1000;
+    case "1W":
+      return now - 7 * 24 * 60 * 60 * 1000;
+    case "1M":
+      return now - 30 * 24 * 60 * 60 * 1000;
+    case "ALL":
+    default:
+      return 0;
+  }
 }

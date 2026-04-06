@@ -1,32 +1,36 @@
 package matching
 
 import (
+	"hash/fnv"
 	"strconv"
+	"strings"
 	"time"
 )
 
 type BatchConfig struct {
-	MaxFills  int
-	MaxOrders int
-	MaxBytes  int
-	MaxAge    time.Duration
-	IdleFlush time.Duration
-	FlushTick time.Duration
+	MaxFillsHot  int
+	MaxFillsCold int
+	MaxOrders    int
+	MaxBytes     int
+	MaxAge       time.Duration
+	IdleFlush    time.Duration
+	FlushTick    time.Duration
 }
 
 func DefaultBatchConfig() BatchConfig {
 	return BatchConfig{
-		MaxFills:  64,
-		MaxOrders: 96,
-		MaxBytes:  262144,
-		MaxAge:    40 * time.Millisecond,
-		IdleFlush: 15 * time.Millisecond,
-		FlushTick: 10 * time.Millisecond,
+		MaxFillsHot:  64,
+		MaxFillsCold: 16,
+		MaxOrders:    96,
+		MaxBytes:     262144,
+		MaxAge:       40 * time.Millisecond,
+		IdleFlush:    15 * time.Millisecond,
+		FlushTick:    10 * time.Millisecond,
 	}
 }
 
 type pendingBatch struct {
-	event      MatchBatchEventV2
+	event      MatchBatchEvent
 	orderIndex map[uint64]uint16
 	fillIndex  uint32
 	sizeBytes  int
@@ -38,15 +42,15 @@ type pendingBatch struct {
 
 func newPendingBatch(marketID uint64, marketPDA string, now time.Time) *pendingBatch {
 	return &pendingBatch{
-		event: MatchBatchEventV2{
+		event: MatchBatchEvent{
 			SchemaVersion: 1,
 			MarketID:      marketID,
 			MarketPDA:     marketPDA,
 			ProducedAt:    now.Unix(),
-			Orders:        make([]MatchedOrderV2, 0, 16),
-			Fills:         make([]MatchFillV2, 0, 16),
-			OrderUpdates:  make([]OrderUpdateV2, 0, 16),
-			DepthUpdates:  make([]DepthUpdateV2, 0, 16),
+			Orders:        make([]MatchedOrder, 0, 16),
+			Fills:         make([]MatchFill, 0, 16),
+			OrderUpdates:  make([]OrderUpdate, 0, 16),
+			DepthUpdates:  make([]DepthUpdate, 0, 16),
 		},
 		orderIndex: make(map[uint64]uint16),
 		startedAt:  now,
@@ -100,11 +104,11 @@ func (b *pendingBatch) ensureOrder(order *MemoryOrder, createdAt int64) uint16 {
 	}
 	idx := uint16(len(b.event.Orders))
 	b.orderIndex[order.OrderID] = idx
-	b.event.Orders = append(b.event.Orders, MatchedOrderV2{
+	b.event.Orders = append(b.event.Orders, MatchedOrder{
 		OrderIndex: idx,
 		OrderID:    order.OrderID,
 		Execution:  executionSnapshotFromOrder(order),
-		Settlement: SettlementPayloadV2{
+		Settlement: SettlementPayload{
 			IntentBytesHex: order.IntentBytesHex,
 			Signature:      order.Signature,
 		},
@@ -120,11 +124,11 @@ func (b *pendingBatch) ensureOrderFromCommand(cmd *PlaceOrderCommand) uint16 {
 	}
 	idx := uint16(len(b.event.Orders))
 	b.orderIndex[cmd.OrderID] = idx
-	b.event.Orders = append(b.event.Orders, MatchedOrderV2{
+	b.event.Orders = append(b.event.Orders, MatchedOrder{
 		OrderIndex: idx,
 		OrderID:    cmd.OrderID,
 		Execution:  executionSnapshotFromCommand(cmd),
-		Settlement: SettlementPayloadV2{
+		Settlement: SettlementPayload{
 			IntentBytesHex: cmd.IntentBytesHex,
 			Signature:      cmd.Signature,
 		},
@@ -137,7 +141,7 @@ func (b *pendingBatch) ensureOrderFromCommand(cmd *PlaceOrderCommand) uint16 {
 func (b *pendingBatch) addFill(maker, taker *MemoryOrder, price uint8, qty uint64) {
 	makerIdx := b.ensureOrder(maker, 0)
 	takerIdx := b.ensureOrder(taker, 0)
-	b.event.Fills = append(b.event.Fills, MatchFillV2{
+	b.event.Fills = append(b.event.Fills, MatchFill{
 		FillIndex:        b.fillIndex,
 		MakerOrderIndex:  makerIdx,
 		TakerOrderIndex:  takerIdx,
@@ -155,7 +159,7 @@ func (b *pendingBatch) addFill(maker, taker *MemoryOrder, price uint8, qty uint6
 
 func (b *pendingBatch) addOrderUpdateForCommand(cmd *PlaceOrderCommand, status string, remainingQty, remainingSpend, refund uint64, reason string) {
 	idx := b.ensureOrderFromCommand(cmd)
-	b.event.OrderUpdates = append(b.event.OrderUpdates, OrderUpdateV2{
+	b.event.OrderUpdates = append(b.event.OrderUpdates, OrderUpdate{
 		OrderIndex:           idx,
 		Status:               status,
 		RemainingQtyLots:     remainingQty,
@@ -168,7 +172,7 @@ func (b *pendingBatch) addOrderUpdateForCommand(cmd *PlaceOrderCommand, status s
 
 func (b *pendingBatch) addOrderUpdateForOrder(order *MemoryOrder, status string, remainingQty, remainingSpend, refund uint64, reason string) {
 	idx := b.ensureOrder(order, 0)
-	b.event.OrderUpdates = append(b.event.OrderUpdates, OrderUpdateV2{
+	b.event.OrderUpdates = append(b.event.OrderUpdates, OrderUpdate{
 		OrderIndex:           idx,
 		Status:               status,
 		RemainingQtyLots:     remainingQty,
@@ -180,7 +184,7 @@ func (b *pendingBatch) addOrderUpdateForOrder(order *MemoryOrder, status string,
 }
 
 func (b *pendingBatch) addDepthUpdate(side uint8, price uint8, volume uint64) {
-	b.event.DepthUpdates = append(b.event.DepthUpdates, DepthUpdateV2{
+	b.event.DepthUpdates = append(b.event.DepthUpdates, DepthUpdate{
 		Side:        sideLabelForDepth(side),
 		PriceTick:   price,
 		TotalVolume: volume,
@@ -192,11 +196,35 @@ func (b *pendingBatch) hasPayload() bool {
 	return len(b.event.Fills) > 0 || len(b.event.OrderUpdates) > 0 || len(b.event.DepthUpdates) > 0
 }
 
-func (b *pendingBatch) shouldFlush(now time.Time, cfg BatchConfig, forceIdle bool) bool {
+func (b *pendingBatch) requiresColdLimit(registry *UserPositionRegistry) bool {
+	if b == nil || registry == nil || len(b.event.Fills) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(b.event.Orders))
+	for _, order := range b.event.Orders {
+		wallet := strings.TrimSpace(order.Execution.WalletAddress)
+		if wallet == "" {
+			continue
+		}
+		if _, ok := seen[wallet]; ok {
+			continue
+		}
+		seen[wallet] = struct{}{}
+		if !registry.Has(b.event.MarketID, wallet) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *pendingBatch) shouldFlush(now time.Time, cfg BatchConfig, maxFills int, forceIdle bool) bool {
 	if b == nil || !b.hasPayload() {
 		return false
 	}
-	if cfg.MaxFills > 0 && len(b.event.Fills) >= cfg.MaxFills {
+	if maxFills <= 0 {
+		maxFills = cfg.MaxFillsHot
+	}
+	if maxFills > 0 && len(b.event.Fills) >= maxFills {
 		return true
 	}
 	if cfg.MaxOrders > 0 && len(b.event.Orders) >= cfg.MaxOrders {
@@ -214,15 +242,15 @@ func (b *pendingBatch) shouldFlush(now time.Time, cfg BatchConfig, forceIdle boo
 	return false
 }
 
-func (b *pendingBatch) freeze(now time.Time) MatchBatchEventV2 {
+func (b *pendingBatch) freeze(now time.Time) MatchBatchEvent {
 	event := b.event
-	event.EventID = generateBatchEventID(event.MarketID, event.SourceCmdSeqMax, now)
+	event.EventID = generateBatchEventID(event, b.seqs, now)
 	event.ProducedAt = now.Unix()
 	return event
 }
 
-func executionSnapshotFromCommand(cmd *PlaceOrderCommand) ExecutionSnapshotV2 {
-	return ExecutionSnapshotV2{
+func executionSnapshotFromCommand(cmd *PlaceOrderCommand) ExecutionSnapshot {
+	return ExecutionSnapshot{
 		OrderID:             cmd.OrderID,
 		WalletAddress:       cmd.WalletAddress,
 		OriginalAction:      sideString(cmd.OriginalAction),
@@ -238,8 +266,8 @@ func executionSnapshotFromCommand(cmd *PlaceOrderCommand) ExecutionSnapshotV2 {
 	}
 }
 
-func executionSnapshotFromOrder(order *MemoryOrder) ExecutionSnapshotV2 {
-	return ExecutionSnapshotV2{
+func executionSnapshotFromOrder(order *MemoryOrder) ExecutionSnapshot {
+	return ExecutionSnapshot{
 		OrderID:             order.OrderID,
 		WalletAddress:       order.WalletAddress,
 		OriginalAction:      sideString(order.OriginalAction),
@@ -255,8 +283,66 @@ func executionSnapshotFromOrder(order *MemoryOrder) ExecutionSnapshotV2 {
 	}
 }
 
-func generateBatchEventID(marketID uint64, seq uint64, now time.Time) string {
-	return "match-batch-" + strconv.FormatUint(marketID, 10) + "-" + strconv.FormatUint(seq, 10) + "-" + strconv.FormatInt(now.UnixMilli(), 10)
+func generateBatchEventID(event MatchBatchEvent, seqs map[uint64]struct{}, now time.Time) string {
+	marketID := event.MarketID
+	seqMin := event.SourceCmdSeqMin
+	seqMax := event.SourceCmdSeqMax
+	if len(seqs) == 0 || seqMax == 0 {
+		digest := fnv.New64a()
+		for _, order := range event.Orders {
+			_, _ = digest.Write([]byte(strconv.FormatUint(order.OrderID, 10)))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(order.Execution.NormalizedSide))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(uint64(order.Execution.NormalizedPriceTick), 10)))
+			_, _ = digest.Write([]byte{';'})
+		}
+		for _, update := range event.OrderUpdates {
+			_, _ = digest.Write([]byte(strconv.FormatUint(uint64(update.OrderIndex), 10)))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(update.Status))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(update.RemainingQtyLots, 10)))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(update.RemainingSpendAmount, 10)))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(update.RefundAmount, 10)))
+			_, _ = digest.Write([]byte{';'})
+		}
+		for _, depth := range event.DepthUpdates {
+			_, _ = digest.Write([]byte(depth.Side))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(uint64(depth.PriceTick), 10)))
+			_, _ = digest.Write([]byte{':'})
+			_, _ = digest.Write([]byte(strconv.FormatUint(depth.TotalVolume, 10)))
+			_, _ = digest.Write([]byte{';'})
+		}
+		if len(event.Orders) == 0 && len(event.OrderUpdates) == 0 && len(event.DepthUpdates) == 0 {
+			return "match-batch-" + strconv.FormatUint(marketID, 10) + "-tick-" + strconv.FormatInt(now.UnixMilli(), 10)
+		}
+		return "match-batch-" + strconv.FormatUint(marketID, 10) + "-tick-" + strconv.FormatUint(digest.Sum64(), 16)
+	}
+	digest := fnv.New64a()
+	ordered := make([]uint64, 0, len(seqs))
+	for seq := range seqs {
+		ordered = append(ordered, seq)
+	}
+	for i := 0; i < len(ordered); i++ {
+		for j := i + 1; j < len(ordered); j++ {
+			if ordered[j] < ordered[i] {
+				ordered[i], ordered[j] = ordered[j], ordered[i]
+			}
+		}
+	}
+	for _, seq := range ordered {
+		_, _ = digest.Write([]byte(strconv.FormatUint(seq, 10)))
+		_, _ = digest.Write([]byte{':'})
+	}
+	return "match-batch-" +
+		strconv.FormatUint(marketID, 10) +
+		"-" + strconv.FormatUint(seqMin, 10) +
+		"-" + strconv.FormatUint(seqMax, 10) +
+		"-" + strconv.FormatUint(digest.Sum64(), 16)
 }
 
 func appendUniqueString(values []string, value string) []string {

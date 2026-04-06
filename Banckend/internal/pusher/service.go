@@ -3,9 +3,8 @@ package pusher
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"strconv"
-	"time"
 
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/logging"
@@ -17,24 +16,18 @@ import (
 
 var logger = logging.New("pusher")
 
-const (
-	defaultConsumerName = "pusher-primary"
-	pusherCatchUpBatch  = 64
-	pusherRunBatch      = 32
-)
+const hotConsumerSubject = protocol.SubjectMarketDeltaHot + ".*"
 
 type Service struct {
-	client       *natsjs.Client
-	hub          *Hub
-	consumerName string
-	sub          *nats.Subscription
+	client *natsjs.Client
+	hub    *Hub
+	sub    *nats.Subscription
 }
 
 func NewService(client *natsjs.Client, hub *Hub) *Service {
 	return &Service{
-		client:       client,
-		hub:          hub,
-		consumerName: defaultConsumerName,
+		client: client,
+		hub:    hub,
 	}
 }
 
@@ -45,10 +38,12 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.ensureSubscription(); err != nil {
 		return err
 	}
-	if err := s.catchUp(ctx); err != nil {
-		return err
-	}
-	go s.run(ctx)
+	go func() {
+		<-ctx.Done()
+		if s.sub != nil {
+			_ = s.sub.Unsubscribe()
+		}
+	}()
 	return nil
 }
 
@@ -56,156 +51,53 @@ func (s *Service) ensureSubscription() error {
 	if s.sub != nil {
 		return nil
 	}
-	sub, err := s.client.PullSubscribe(protocol.SubjectMatchBatchV2+".*", s.consumerName)
+	conn := s.client.Conn()
+	if conn == nil {
+		return fmt.Errorf("nats core connection is not configured")
+	}
+	sub, err := conn.Subscribe(hotConsumerSubject, s.handleMessage)
 	if err != nil {
-		return err
+		return fmt.Errorf("subscribe hot market stream: %w", err)
 	}
 	s.sub = sub
+	logger.Infof("pusher subscribed subject=%s", hotConsumerSubject)
 	return nil
 }
 
-func (s *Service) catchUp(ctx context.Context) error {
-	_ = ctx
-	for {
-		msgs, err := s.sub.Fetch(pusherCatchUpBatch, nats.MaxWait(500*time.Millisecond))
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
-			}
-			return err
-		}
-		if len(msgs) == 0 {
-			return nil
-		}
-		for _, msg := range msgs {
-			s.handleMessage(msg)
-		}
-	}
-}
-
-func (s *Service) run(ctx context.Context) {
-	defer func() {
-		if s.sub != nil {
-			_ = s.sub.Unsubscribe()
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		msgs, err := s.sub.Fetch(pusherRunBatch, nats.MaxWait(1500*time.Millisecond))
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-				continue
-			}
-			logger.Warnf("fetch failed: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
-		for _, msg := range msgs {
-			s.handleMessage(msg)
-		}
-	}
-}
-
 func (s *Service) handleMessage(msg *nats.Msg) {
-	var event matching.MatchBatchEventV2
+	var event matching.MatchBatchEvent
 	if err := json.Unmarshal(msg.Data, &event); err != nil {
-		logger.Warnf("decode match batch failed: %v", err)
-		_ = msg.Term()
+		logger.Warnf("decode hot market delta failed subject=%s err=%v", msg.Subject, err)
 		return
 	}
 	if event.SchemaVersion != 0 && event.SchemaVersion != 1 {
-		logger.Warnf("unsupported schema version: %d", event.SchemaVersion)
-		_ = msg.Term()
+		logger.Warnf("unsupported hot market delta schema subject=%s version=%d", msg.Subject, event.SchemaVersion)
 		return
 	}
-
-	orderByIndex := make(map[uint16]matching.MatchedOrderV2, len(event.Orders))
-	for _, order := range event.Orders {
-		orderByIndex[order.OrderIndex] = order
+	if err := s.hub.PublishMarketDelta(context.Background(), event); err != nil {
+		logger.Warnf("publish hot market delta failed market=%d subject=%s err=%v", event.MarketID, msg.Subject, err)
+		return
 	}
-
-	ts := time.Unix(event.ProducedAt, 0).UTC().Format(time.RFC3339)
-	if len(event.DepthUpdates) > 0 {
-		levels := compressDepthUpdates(event.DepthUpdates)
-		msgBody := protocol.WSMarketDepthDelta{
-			Type:     protocol.WSTypeMarketDepthDelta,
-			MarketID: strconv.FormatUint(event.MarketID, 10),
-			Ts:       ts,
-			Payload:  protocol.WSMarketDepthPayload{Levels: levels},
-		}
-		if err := s.hub.PublishMarketMessage(event.MarketID, msgBody); err != nil {
-			logger.Warnf("publish depth delta failed market=%d err=%v", event.MarketID, err)
-		}
-	}
-
-	for _, fill := range event.Fills {
-		maker, makerOK := orderByIndex[fill.MakerOrderIndex]
-		taker, takerOK := orderByIndex[fill.TakerOrderIndex]
-		if !makerOK || !takerOK {
-			continue
-		}
-		msgBody := protocol.WSMarketTradeExecuted{
-			Type:     protocol.WSTypeMarketTradeExecuted,
-			MarketID: strconv.FormatUint(event.MarketID, 10),
-			Ts:       ts,
-			Payload: protocol.WSMarketTradePayload{
-				TradeID:            tradeIDForFill(event.EventID, fill),
-				MakerOrderID:       strconv.FormatUint(maker.OrderID, 10),
-				TakerOrderID:       strconv.FormatUint(taker.OrderID, 10),
-				MakerWalletAddress: maker.Execution.WalletAddress,
-				TakerWalletAddress: taker.Execution.WalletAddress,
-				PriceTick:          strconv.FormatUint(fill.FillPrice, 10),
-				FillAmount:         strconv.FormatUint(fill.FillAmount, 10),
-				MatchType:          fill.MatchType,
-				ExecutedAt:         ts,
-			},
-		}
-		if err := s.hub.PublishMarketMessage(event.MarketID, msgBody); err != nil {
-			logger.Warnf("publish trade delta failed market=%d err=%v", event.MarketID, err)
-		}
-	}
-
-	for _, update := range event.OrderUpdates {
-		order, ok := orderByIndex[update.OrderIndex]
-		if !ok || order.Execution.WalletAddress == "" {
-			continue
-		}
-		msgBody := protocol.WSUserOrderUpdated{
-			Type:     protocol.WSTypeUserOrderUpdated,
-			MarketID: strconv.FormatUint(event.MarketID, 10),
-			Ts:       ts,
-			Payload: protocol.WSUserOrderPayload{
-				OrderID:              strconv.FormatUint(order.OrderID, 10),
-				Status:               update.Status,
-				RemainingQtyLots:     strconv.FormatUint(update.RemainingQtyLots, 10),
-				RemainingSpendAmount: strconv.FormatUint(update.RemainingSpendAmount, 10),
-				RefundAmount:         strconv.FormatUint(update.RefundAmount, 10),
-				UpdatedAt:            ts,
-				OriginalAction:       order.Execution.OriginalAction,
-				OriginalOutcome:      order.Execution.OriginalOutcome,
-				OriginalPriceTick:    strconv.FormatUint(uint64(order.Execution.OriginalPriceTick), 10),
-			},
-		}
-		if err := s.hub.PublishUserMessage(order.Execution.WalletAddress, msgBody); err != nil {
-			logger.Warnf("publish user order delta failed wallet=%s err=%v", order.Execution.WalletAddress, err)
-		}
-	}
-
-	_ = msg.Ack()
+	logger.Infof(
+		"hot market delta published market=%d event=%s source_seq=%d seq_range=%d-%d depths=%d fills=%d order_updates=%d conns=%d",
+		event.MarketID,
+		event.EventID,
+		event.SourceCmdSeqMax,
+		event.SourceCmdSeqMin,
+		event.SourceCmdSeqMax,
+		len(event.DepthUpdates),
+		len(event.Fills),
+		len(event.OrderUpdates),
+		s.hub.marketConnectionCount(event.MarketID),
+	)
 }
 
-func compressDepthUpdates(updates []matching.DepthUpdateV2) []protocol.WSDepthLevel {
+func compressDepthUpdates(updates []matching.DepthUpdate) []protocol.WSDepthLevel {
 	type key struct {
 		side      string
 		priceTick uint8
 	}
-	latest := make(map[key]matching.DepthUpdateV2, len(updates))
+	latest := make(map[key]matching.DepthUpdate, len(updates))
 	order := make([]key, 0, len(updates))
 	for _, update := range updates {
 		k := key{side: update.Side, priceTick: update.PriceTick}
@@ -227,7 +119,7 @@ func compressDepthUpdates(updates []matching.DepthUpdateV2) []protocol.WSDepthLe
 	return levels
 }
 
-func tradeIDForFill(eventID string, fill matching.MatchFillV2) string {
+func tradeIDForFill(eventID string, fill matching.MatchFill) string {
 	if eventID == "" {
 		return "fill-" + strconv.FormatUint(uint64(fill.FillIndex), 10)
 	}

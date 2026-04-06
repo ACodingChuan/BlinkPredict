@@ -110,11 +110,12 @@ func (c *Client) EnsureStreams(_ context.Context) error {
 
 func (c *Client) ensureStream(name string, subjects []string, retention nats.RetentionPolicy) error {
 	config := &nats.StreamConfig{
-		Name:      name,
-		Subjects:  subjects,
-		Storage:   nats.FileStorage,
-		Retention: retention,
-		MaxAge:    7 * 24 * time.Hour,
+		Name:       name,
+		Subjects:   subjects,
+		Storage:    nats.FileStorage,
+		Retention:  retention,
+		MaxAge:     7 * 24 * time.Hour,
+		Duplicates: 24 * time.Hour,
 	}
 	info, err := c.js.StreamInfo(name)
 	if err == nil {
@@ -125,6 +126,7 @@ func (c *Client) ensureStream(name string, subjects []string, retention nats.Ret
 		current.Subjects = subjects
 		current.Storage = nats.FileStorage
 		current.MaxAge = 7 * 24 * time.Hour
+		current.Duplicates = 24 * time.Hour
 		if _, err := c.js.UpdateStream(&current); err != nil {
 			return fmt.Errorf("update stream %s: %w", name, err)
 		}

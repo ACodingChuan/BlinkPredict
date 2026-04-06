@@ -13,11 +13,11 @@
 --   matcher recovery, settlement registry.
 --
 -- Notes:
---   1. NATS durable consumers are still the primary replay/checkpoint mechanism for
---      funds / matcher / settlement. Postgres currently persists only writer cursor state.
---   2. `wallet_accounts` is the wallet-level trading projection used by funds recovery.
---   3. `positions` is the market-level position projection. Pending lots stay pending until
+--   1. `wallet_accounts` is the wallet-level trading projection used by funds recovery.
+--   2. `positions` is the market-level position projection. Pending lots stay pending until
 --      settlement confirmed; they must not be exposed as free lots beforehand.
+--   3. `funds_recovery_state` stores the funds module checkpoint/inflight metadata so
+--      cold start can recover from Postgres baseline + JetStream tail replay.
 
 BEGIN;
 
@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS wallet_accounts (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS funds_recovery_state (
+    recovery_id SMALLINT PRIMARY KEY,
+    last_flushed_evt_seq BIGINT NOT NULL DEFAULT 0,
+    inflight_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    pending_terminals_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    pending_reserves_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    processed_submits_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    processed_deposits_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS deposit_requests (
     id UUID PRIMARY KEY,
     wallet_address VARCHAR(44) NOT NULL,
@@ -152,18 +163,42 @@ CREATE INDEX IF NOT EXISTS idx_market_submissions_status_created
 CREATE INDEX IF NOT EXISTS idx_market_submissions_market_created
     ON market_submissions (market_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS webhook_receipts (
-    event_id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    signature TEXT,
-    slot BIGINT NOT NULL DEFAULT 0,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    payload_json JSONB NOT NULL DEFAULT '{}'::JSONB
+CREATE TABLE IF NOT EXISTS settlement_submissions (
+    match_event_id TEXT PRIMARY KEY,
+    market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
+    market_pda TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'submitted', 'confirmed', 'failed')),
+    market_lane_status TEXT NOT NULL DEFAULT 'active' CHECK (market_lane_status IN ('active', 'paused')),
+    match_event_json JSONB NOT NULL,
+    wallets_json JSONB NOT NULL,
+    tx_signature TEXT NOT NULL DEFAULT '',
+    raw_tx_base64 TEXT NOT NULL DEFAULT '',
+    last_valid_block_height BIGINT NOT NULL DEFAULT 0,
+    retry_count INT NOT NULL DEFAULT 0,
+    confirmation_slot BIGINT NOT NULL DEFAULT 0,
+    reason_code TEXT NOT NULL DEFAULT '',
+    submitted_event_published BOOLEAN NOT NULL DEFAULT FALSE,
+    terminal_event_published BOOLEAN NOT NULL DEFAULT FALSE,
+    version BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_webhook_receipts_provider_event_received
-    ON webhook_receipts (provider, event_type, received_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS settlement_submissions_tx_signature_uidx
+    ON settlement_submissions (tx_signature)
+    WHERE tx_signature <> '';
+
+CREATE INDEX IF NOT EXISTS settlement_submissions_hot_queue_idx
+    ON settlement_submissions (market_id, created_at)
+    WHERE status = 'queued' AND market_lane_status = 'active';
+
+CREATE INDEX IF NOT EXISTS settlement_submissions_hot_submitted_idx
+    ON settlement_submissions (updated_at)
+    WHERE status = 'submitted';
+
+CREATE INDEX IF NOT EXISTS settlement_submissions_terminal_publish_idx
+    ON settlement_submissions (updated_at)
+    WHERE status IN ('confirmed', 'failed') AND terminal_event_published = FALSE;
 
 CREATE TABLE IF NOT EXISTS orders (
     order_id BIGINT PRIMARY KEY,
@@ -225,12 +260,13 @@ CREATE INDEX IF NOT EXISTS idx_trades_taker_wallet
 CREATE TABLE IF NOT EXISTS positions (
     market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
     wallet_address VARCHAR(44) NOT NULL,
+    market_pda TEXT NOT NULL DEFAULT '',
     yes_free_lots BIGINT NOT NULL DEFAULT 0 CHECK (yes_free_lots >= 0),
     yes_locked_lots BIGINT NOT NULL DEFAULT 0 CHECK (yes_locked_lots >= 0),
-    yes_pending_lots BIGINT NOT NULL DEFAULT 0 CHECK (yes_pending_lots >= 0),
+    yes_pending_lots BIGINT NOT NULL DEFAULT 0,
     no_free_lots BIGINT NOT NULL DEFAULT 0 CHECK (no_free_lots >= 0),
     no_locked_lots BIGINT NOT NULL DEFAULT 0 CHECK (no_locked_lots >= 0),
-    no_pending_lots BIGINT NOT NULL DEFAULT 0 CHECK (no_pending_lots >= 0),
+    no_pending_lots BIGINT NOT NULL DEFAULT 0,
     collateral_locked_units BIGINT NOT NULL DEFAULT 0 CHECK (collateral_locked_units >= 0),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (market_id, wallet_address)
@@ -238,6 +274,10 @@ CREATE TABLE IF NOT EXISTS positions (
 
 CREATE INDEX IF NOT EXISTS idx_positions_wallet
     ON positions (wallet_address);
+
+CREATE UNIQUE INDEX IF NOT EXISTS positions_wallet_pda_uidx
+    ON positions (wallet_address, market_pda)
+    WHERE market_pda <> '';
 
 CREATE TABLE IF NOT EXISTS user_position_accounts (
     market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),

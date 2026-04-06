@@ -27,7 +27,9 @@
 
 - `matcher`
   - 继续从 `orders` 表中的活跃订单恢复 orderbook
-  - 启动后执行 bootstrap tick，清理过期订单并重新进入可撮合状态
+  - 启动恢复时，先把 `orders` 表中“已经到期但仍是 open / partially_filled”的订单直接收口为 `expired`
+  - 然后只把剩余未过期活跃订单恢复进内存 orderbook
+  - `bootstrap tick` 仍保留，但不再承担“冷启动修正历史过期单”的职责
 - `funds / shared wallet`
   - 从 `wallet_accounts` 恢复 `free / locked / pending usdc`
   - 从 `positions` 恢复 `free / locked / pending yes/no lots`
@@ -52,6 +54,73 @@
 - **可手测恢复**
 - **可重启后继续挂单/撮合**
 - **资金与仓位读模型不再明显漂移**
+
+### 本轮关于订单过期的明确边界
+
+本轮只修两件事：
+
+1. **冷启动 / 重建恢复**
+- 如果订单在系统停机期间已经超过 `expire_time`，则在 matcher 恢复前直接执行数据库收口：
+  - `orders.status -> expired`
+  - 不再恢复进内存 orderbook
+- 这一类修正属于“恢复期静态收口”，可以直接改数据库，再决定是否恢复进内存
+
+2. **运行中定期过期**
+- 本轮**不改实现**
+- 继续沿用当前运行期 tick / matcher 驱动的过期发现方式
+
+原因是：
+
+- 恢复期没有并发撮合中的订单流，直接改数据库与恢复内存是安全的
+- 运行期如果直接扫库并改 `orders.status`，会绕过 funds / matcher / writer 的事件顺序，导致：
+  - locked 资金释放时序不一致
+  - Redis / websocket / depth / open orders 投影无法同步收口
+  - 多节点后更难保证只处理一次
+
+因此，运行期过期必须走事件化闭环，而不是“扫库后直接 UPDATE orders”
+
+### 运行期定期过期方案（本轮只记方案，不落代码）
+
+运行期的正确方案定义如下：
+
+1. `matcher` 仍然是“订单是否到期”的第一发现者
+- 因为只有 matcher 持有 market 级 orderbook 内存
+- 它最清楚哪张单还在 book 上，哪张单已经被部分成交
+
+2. 到期触发后，不直接写数据库
+- matcher 产出标准化 `expired` 结果事件
+- 事件中至少包含：
+  - `order_id`
+  - `market_id`
+  - `wallet_address`
+  - `status=expired`
+  - `remaining_qty / remaining_spend_amount`
+  - `reason=expired`
+
+3. 下游按既有职责收口
+- `funds`
+  - 释放该订单对应的 locked 余额 / locked lots
+- `writer`
+  - 更新 `orders.status=expired`
+  - 更新 `updated_at`
+  - 刷新 Redis `order:info` / `user:orders` / `l2 depth`
+- `pusher`
+  - 推送订单状态变化与盘口变化
+
+4. 多节点时代的要求
+- 运行期过期事件必须是“单 writer / 单 consumer 语义”
+- 不能由 query、gateway、定时任务各自扫库判定
+- 未来拆服务后，仍应坚持：
+  - `matcher` 发现
+  - `funds / writer / pusher` 各自消费
+  - 不允许旁路直改投影表
+
+5. 与冷启动恢复的职责分界
+- 冷启动恢复：
+  - 允许先做数据库静态收口，再恢复内存
+- 运行期：
+  - 必须走事件流
+  - 不能直接改数据库冒充过期完成
 
 而不是：
 

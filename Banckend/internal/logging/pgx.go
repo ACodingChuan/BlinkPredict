@@ -11,6 +11,22 @@ import (
 type pgxTraceContextKey string
 
 const pgxQueryStartKey pgxTraceContextKey = "pgx_query_start"
+const pgxSkipQueryLogKey pgxTraceContextKey = "pgx_skip_query_log"
+
+func WithoutPGXQueryLogging(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, pgxSkipQueryLogKey, true)
+}
+
+func shouldSkipPGXQueryLogging(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	skip, _ := ctx.Value(pgxSkipQueryLogKey).(bool)
+	return skip
+}
 
 func NewPGXTracer(component string) *PGXTracer {
 	return &PGXTracer{logger: Component(component)}
@@ -49,6 +65,9 @@ func (t *PGXTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.T
 	if t == nil || t.logger == nil {
 		return ctx
 	}
+	if shouldSkipPGXQueryLogging(ctx) {
+		return ctx
+	}
 	EventWithContext(ctx, t.logger.Info()).
 		Str("kind", "sql_query_start").
 		Str("sql", data.SQL).
@@ -59,6 +78,9 @@ func (t *PGXTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.T
 
 func (t *PGXTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
 	if t == nil || t.logger == nil {
+		return
+	}
+	if shouldSkipPGXQueryLogging(ctx) {
 		return
 	}
 	event := EventWithContext(ctx, t.logger.Info()).
@@ -83,6 +105,9 @@ func (t *PGXTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.Trac
 	if t == nil || t.logger == nil {
 		return ctx
 	}
+	if shouldSkipPGXQueryLogging(ctx) {
+		return ctx
+	}
 	EventWithContext(ctx, t.logger.Info()).
 		Str("kind", "sql_batch_start").
 		Msg("postgres batch start")
@@ -91,6 +116,9 @@ func (t *PGXTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.Trac
 
 func (t *PGXTracer) TraceBatchQuery(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchQueryData) {
 	if t == nil || t.logger == nil {
+		return
+	}
+	if shouldSkipPGXQueryLogging(ctx) {
 		return
 	}
 	event := EventWithContext(ctx, t.logger.Info()).
@@ -111,6 +139,9 @@ func (t *PGXTracer) TraceBatchQuery(ctx context.Context, _ *pgx.Conn, data pgx.T
 
 func (t *PGXTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
 	if t == nil || t.logger == nil {
+		return
+	}
+	if shouldSkipPGXQueryLogging(ctx) {
 		return
 	}
 	event := EventWithContext(ctx, t.logger.Info()).Str("kind", "sql_batch_end")
