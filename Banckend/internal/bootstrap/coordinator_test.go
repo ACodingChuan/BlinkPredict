@@ -38,3 +38,18 @@ func TestCoordinatorDefaultsToInitAndNotReady(t *testing.T) {
 		t.Fatalf("expected write ready false, got %v", status["gateway_write_ready"])
 	}
 }
+
+func TestGateDefaultsIncludeConfirmModules(t *testing.T) {
+	g := NewGate()
+	status := g.Status()
+
+	if status["deposit-confirm"] != StateInit {
+		t.Fatalf("expected deposit-confirm init, got %v", status["deposit-confirm"])
+	}
+	if status["market-confirm"] != StateInit {
+		t.Fatalf("expected market-confirm init, got %v", status["market-confirm"])
+	}
+	if status["market-projector"] != StateInit {
+		t.Fatalf("expected market-projector init, got %v", status["market-projector"])
+	}
+}

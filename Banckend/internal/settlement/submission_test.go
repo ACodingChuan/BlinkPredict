@@ -3,6 +3,7 @@ package settlement
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -29,7 +30,6 @@ func makeMatchedOrder(
 	outcome Outcome,
 ) matching.MatchedOrder {
 	intent := OrderIntentV1{
-		Version:     1,
 		ProgramID:   programID,
 		Market:      market,
 		User:        user,
@@ -191,33 +191,13 @@ func TestBuildInstructionsOrdersSettlementAccountsByLayer(t *testing.T) {
 		t.Fatalf("BuildSubmissionBatch error: %v", err)
 	}
 
-	positionA, err := internalsolana.DeriveUserPositionPDA(programID, userA, market)
-	if err != nil {
-		t.Fatalf("derive position A: %v", err)
-	}
-	instructions, err := (&Submitter{ProgramID: programID, Relayer: relayer.PrivateKey}).BuildInstructions(batch, UserPositionInitPlan{
-		NeedInit: []UserPositionPlanEntry{{
-			MarketID:      9,
-			Wallet:        userA.String(),
-			MarketPDA:     market,
-			PositionPDA:   positionA,
-			UserPublicKey: userA,
-		}},
-	})
+	instructions, err := (&Submitter{ProgramID: programID, Relayer: relayer.PrivateKey}).BuildInstructions(batch)
 	if err != nil {
 		t.Fatalf("BuildInstructions error: %v", err)
 	}
-	if len(instructions) != 4 {
+	if len(instructions) != 3 {
 		t.Fatalf("unexpected instruction count: %d", len(instructions))
 	}
-
-	initAccounts := instructions[2].Accounts()
-	assertAccountMetaFlags(t, "init payer", initAccounts[0], true, true)
-	assertAccountMetaFlags(t, "init config", initAccounts[1], false, false)
-	assertAccountMetaFlags(t, "init user", initAccounts[2], false, false)
-	assertAccountMetaFlags(t, "init market", initAccounts[3], false, false)
-	assertAccountMetaFlags(t, "init user_position", initAccounts[4], true, false)
-	assertAccountMetaFlags(t, "init system", initAccounts[5], false, false)
 
 	settleAccounts := instructions[len(instructions)-1].Accounts()
 	if !settleAccounts[0].PublicKey.Equals(relayer.PublicKey()) {
@@ -250,4 +230,195 @@ func TestBuildInstructionsOrdersSettlementAccountsByLayer(t *testing.T) {
 	}
 	assertAccountMetaFlags(t, "settle order state A", settleAccounts[9], true, false)
 	assertAccountMetaFlags(t, "settle order state B", settleAccounts[10], true, false)
+}
+
+func TestBuildSubmissionBatchRejectsInvalidSignatureLength(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	market := solana.NewWallet().PublicKey()
+	userA := solana.NewWallet().PublicKey()
+	userB := solana.NewWallet().PublicKey()
+
+	orderA := makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes)
+	orderB := makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes)
+	orderA.Settlement.Signature = base64.StdEncoding.EncodeToString(make([]byte, 63))
+
+	_, err := BuildSubmissionBatch(matching.MatchBatchEvent{
+		MarketID:  9,
+		MarketPDA: market.String(),
+		Orders:    []matching.MatchedOrder{orderA, orderB},
+		Fills:     []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+	}, BuildConfig{ProgramID: programID})
+	if err == nil {
+		t.Fatalf("expected BuildSubmissionBatch to reject non-64-byte signature")
+	}
+}
+
+func TestBuildSubmissionBatchRejectsSubOneUsdcNotional(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	market := solana.NewWallet().PublicKey()
+	userA := solana.NewWallet().PublicKey()
+	userB := solana.NewWallet().PublicKey()
+
+	orderA := makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes)
+	orderB := makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes)
+
+	intentA := OrderIntentV1{
+		ProgramID:   programID,
+		Market:      market,
+		User:        userA,
+		Nonce:       1,
+		Side:        SideBuy,
+		Outcome:     OutcomeYes,
+		OrderType:   OrderTypeLimit,
+		LimitPrice:  99,
+		TotalAmount: 100,
+		ExpiryTs:    123,
+	}
+	orderA.Settlement.IntentBytesHex = hex.EncodeToString(intentA.Serialize())
+	orderA.Execution.OriginalPriceTick = 99
+
+	_, err := BuildSubmissionBatch(matching.MatchBatchEvent{
+		MarketID:  9,
+		MarketPDA: market.String(),
+		Orders:    []matching.MatchedOrder{orderA, orderB},
+		Fills:     []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+	}, BuildConfig{ProgramID: programID})
+	if err == nil {
+		t.Fatalf("expected BuildSubmissionBatch to reject minimum notional below 100 units")
+	}
+}
+
+func TestPreparedPayloadRoundTrip(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	market := solana.NewWallet().PublicKey()
+	userA := solana.NewWallet().PublicKey()
+	userB := solana.NewWallet().PublicKey()
+
+	batch, err := BuildSubmissionBatch(matching.MatchBatchEvent{
+		MarketID:  9,
+		MarketPDA: market.String(),
+		Orders: []matching.MatchedOrder{
+			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
+			makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes),
+		},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+	}, BuildConfig{ProgramID: programID})
+	if err != nil {
+		t.Fatalf("BuildSubmissionBatch error: %v", err)
+	}
+	batch.Orders[1].Warm = true
+
+	payload, err := encodePreparedPayload(batch)
+	if err != nil {
+		t.Fatalf("encodePreparedPayload error: %v", err)
+	}
+	decoded, err := decodePreparedPayload(payload, BuildConfig{ProgramID: programID})
+	if err != nil {
+		t.Fatalf("decodePreparedPayload error: %v", err)
+	}
+
+	if decoded.MarketID != batch.MarketID || !decoded.MarketPDA.Equals(batch.MarketPDA) {
+		t.Fatalf("market mismatch after roundtrip")
+	}
+	if len(decoded.Orders) != len(batch.Orders) || len(decoded.Fills) != len(batch.Fills) || len(decoded.UniqueUsers) != len(batch.UniqueUsers) {
+		t.Fatalf("roundtrip size mismatch")
+	}
+	for i := range batch.Orders {
+		if decoded.Orders[i].OrderIndex != batch.Orders[i].OrderIndex {
+			t.Fatalf("order index mismatch at %d", i)
+		}
+		if decoded.Orders[i].Warm != batch.Orders[i].Warm {
+			t.Fatalf("order warm flag mismatch at %d", i)
+		}
+		if decoded.Orders[i].Intent != batch.Orders[i].Intent {
+			t.Fatalf("intent mismatch at %d", i)
+		}
+		if hex.EncodeToString(decoded.Orders[i].RawIntent) != hex.EncodeToString(batch.Orders[i].RawIntent) {
+			t.Fatalf("raw intent mismatch at %d", i)
+		}
+		if base64.StdEncoding.EncodeToString(decoded.Orders[i].Signature) != base64.StdEncoding.EncodeToString(batch.Orders[i].Signature) {
+			t.Fatalf("signature mismatch at %d", i)
+		}
+	}
+}
+
+func TestDecodePreparedPayloadRejectsNonContiguousOrderIndex(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	payload := mustPreparedPayloadFromSingleFillBatch(t, programID)
+	payload.Orders[1].OrderIndex = 3
+	raw := mustMarshalPreparedPayload(t, payload)
+
+	if _, err := decodePreparedPayload(raw, BuildConfig{ProgramID: programID}); err == nil {
+		t.Fatalf("expected decodePreparedPayload to reject non-contiguous order indexes")
+	}
+}
+
+func TestDecodePreparedPayloadRejectsOutOfRangeFillIndex(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	payload := mustPreparedPayloadFromSingleFillBatch(t, programID)
+	payload.Fills[0].TakerIdx = 9
+	raw := mustMarshalPreparedPayload(t, payload)
+
+	if _, err := decodePreparedPayload(raw, BuildConfig{ProgramID: programID}); err == nil {
+		t.Fatalf("expected decodePreparedPayload to reject out-of-range fill index")
+	}
+}
+
+func TestDecodePreparedPayloadRejectsSelfMatchFill(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	payload := mustPreparedPayloadFromSingleFillBatch(t, programID)
+	payload.Fills[0].TakerIdx = payload.Fills[0].MakerIdx
+	raw := mustMarshalPreparedPayload(t, payload)
+
+	if _, err := decodePreparedPayload(raw, BuildConfig{ProgramID: programID}); err == nil {
+		t.Fatalf("expected decodePreparedPayload to reject maker=taker fill")
+	}
+}
+
+func TestDecodePreparedPayloadRejectsUnusedUniqueUsers(t *testing.T) {
+	programID := solana.MustPublicKeyFromBase58("Buz3tgLcPxPDXGcQk38hzBvuUdb1yvvZjExC1g4tfibA")
+	payload := mustPreparedPayloadFromSingleFillBatch(t, programID)
+	payload.UniqueUsers = append(payload.UniqueUsers, solana.NewWallet().PublicKey().String())
+	raw := mustMarshalPreparedPayload(t, payload)
+
+	if _, err := decodePreparedPayload(raw, BuildConfig{ProgramID: programID}); err == nil {
+		t.Fatalf("expected decodePreparedPayload to reject unused unique users")
+	}
+}
+
+func mustPreparedPayloadFromSingleFillBatch(t *testing.T, programID solana.PublicKey) preparedSubmissionPayload {
+	t.Helper()
+	market := solana.NewWallet().PublicKey()
+	userA := solana.NewWallet().PublicKey()
+	userB := solana.NewWallet().PublicKey()
+	batch, err := BuildSubmissionBatch(matching.MatchBatchEvent{
+		MarketID:  9,
+		MarketPDA: market.String(),
+		Orders: []matching.MatchedOrder{
+			makeMatchedOrder(programID, market, userA, 0, 1, SideBuy, OutcomeYes),
+			makeMatchedOrder(programID, market, userB, 1, 2, SideSell, OutcomeYes),
+		},
+		Fills: []matching.MatchFill{{MakerOrderIndex: 0, TakerOrderIndex: 1, FillAmount: 10, FillPrice: 60}},
+	}, BuildConfig{ProgramID: programID})
+	if err != nil {
+		t.Fatalf("BuildSubmissionBatch error: %v", err)
+	}
+	raw, err := encodePreparedPayload(batch)
+	if err != nil {
+		t.Fatalf("encodePreparedPayload error: %v", err)
+	}
+	var payload preparedSubmissionPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal prepared payload: %v", err)
+	}
+	return payload
+}
+
+func mustMarshalPreparedPayload(t *testing.T, payload preparedSubmissionPayload) []byte {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal prepared payload: %v", err)
+	}
+	return raw
 }

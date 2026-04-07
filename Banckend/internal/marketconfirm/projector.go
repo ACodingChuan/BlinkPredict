@@ -31,6 +31,7 @@ type Projector struct {
 	marketRepo  markets.Repository
 	marketCache *cache.MarketCache
 	sub         *nats.Subscription
+	rootCtx     context.Context
 }
 
 func NewProjector(client *natsjs.Client, pool *pgxpool.Pool, marketRepo markets.Repository, marketCache *cache.MarketCache) *Projector {
@@ -41,6 +42,7 @@ func (p *Projector) Start(ctx context.Context) error {
 	if p == nil || p.client == nil || p.marketRepo == nil {
 		return nil
 	}
+	p.rootCtx = ctx
 	if err := p.ensureSubscription(); err != nil {
 		return err
 	}
@@ -122,25 +124,32 @@ func (p *Projector) handleMessage(msg *nats.Msg) {
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	projectorLogger.Infof("market projector saving signature=%s market_id=%d market_pda=%s", event.Signature, event.MarketID, event.MarketPDA)
-	if err := p.marketRepo.Save(context.Background(), market); err != nil {
+	opCtx := p.serviceContext()
+	projectorLogger.Debugf("market projector saving signature=%s market_id=%d market_pda=%s", event.Signature, event.MarketID, event.MarketPDA)
+	if err := p.marketRepo.Save(opCtx, market); err != nil {
+		if p.isStoppingError(err) {
+			return
+		}
 		projectorLogger.Warnf("market projector save failed signature=%s market_id=%d err=%v", event.Signature, event.MarketID, err)
 		_ = msg.Nak()
 		return
 	}
 	if p.pool != nil {
-		if _, err := p.pool.Exec(context.Background(), `
+		if _, err := p.pool.Exec(opCtx, `
 			UPDATE market_submissions
 			SET status = 'confirmed', market_id = $2, market_pda = $3, creator_wallet = $4, metadata_cid = $5, slot = $6, failure_reason = '', confirmed_at = COALESCE(confirmed_at, NOW()), updated_at = NOW()
 			WHERE signature = $1
 		`, event.Signature, fmt.Sprintf("%d", event.MarketID), event.MarketPDA, event.Creator, event.MetadataCID, int64(event.Slot)); err != nil {
+			if p.isStoppingError(err) {
+				return
+			}
 			projectorLogger.Warnf("market projector update submission failed signature=%s err=%v", event.Signature, err)
 			_ = msg.Nak()
 			return
 		}
 	}
 	if p.marketCache != nil {
-		if err := p.marketCache.SetMarket(context.Background(), cache.MarketData{
+		if err := p.marketCache.SetMarket(opCtx, cache.MarketData{
 			ID:                   market.ID,
 			MarketID:             market.MarketID,
 			MarketPDA:            market.MarketPDA,
@@ -167,11 +176,28 @@ func (p *Projector) handleMessage(msg *nats.Msg) {
 			CreatedAt:            market.CreatedAt.Unix(),
 			UpdatedAt:            market.UpdatedAt.Unix(),
 		}); err != nil {
+			if p.isStoppingError(err) {
+				return
+			}
 			projectorLogger.Warnf("market projector redis cache failed signature=%s market_id=%d err=%v", event.Signature, event.MarketID, err)
 		}
 	}
-	projectorLogger.Infof("market projector saved signature=%s market_id=%d", event.Signature, event.MarketID)
+	projectorLogger.Debugf("market projector saved signature=%s market_id=%d", event.Signature, event.MarketID)
 	_ = msg.Ack()
+}
+
+func (p *Projector) serviceContext() context.Context {
+	if p != nil && p.rootCtx != nil {
+		return p.rootCtx
+	}
+	return context.Background()
+}
+
+func (p *Projector) isStoppingError(err error) bool {
+	if err == nil || p == nil || p.rootCtx == nil || p.rootCtx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 func fallbackTitle(title string, marketID uint64) string {

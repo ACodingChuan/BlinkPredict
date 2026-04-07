@@ -54,9 +54,9 @@ func (r *RedisQueryEngine) GetOrderbook(ctx context.Context, marketID uint64) Or
 			continue
 		}
 		switch parts[0] {
-		case "bid":
+		case "bid", "buy":
 			bids = append(bids, row{price: price, vol: vol})
-		case "ask":
+		case "ask", "sell":
 			asks = append(asks, row{price: price, vol: vol})
 		}
 	}

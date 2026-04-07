@@ -2,30 +2,31 @@ package settlement
 
 import (
 	"bytes"
-	"encoding/hex"
+	"encoding/base64"
 	"testing"
 
 	solana "github.com/gagliardetto/solana-go"
 )
 
-func TestOrderIntentSerializeRoundTrip(t *testing.T) {
+func TestOrderIntentRoundTrip(t *testing.T) {
 	intent := OrderIntentV1{
-		Version:     1,
 		ProgramID:   solana.NewWallet().PublicKey(),
 		Market:      solana.NewWallet().PublicKey(),
 		User:        solana.NewWallet().PublicKey(),
+		Nonce:       5678,
 		Side:        SideBuy,
 		Outcome:     OutcomeNo,
 		OrderType:   OrderTypeLimit,
 		LimitPrice:  60,
 		TotalAmount: 1234,
-		Nonce:       5678,
 		ExpiryTs:    999,
 	}
+
 	encoded := intent.Serialize()
 	if len(encoded) != OrderIntentSize {
 		t.Fatalf("unexpected encoded size: %d", len(encoded))
 	}
+
 	decoded, err := ParseOrderIntentV1(encoded)
 	if err != nil {
 		t.Fatalf("ParseOrderIntentV1 error: %v", err)
@@ -35,9 +36,8 @@ func TestOrderIntentSerializeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestOrderIntentSerializeMatchesContractFieldLayout(t *testing.T) {
+func TestOrderIntentBinaryLayout(t *testing.T) {
 	intent := OrderIntentV1{
-		Version:     1,
 		ProgramID:   solana.MustPublicKeyFromBase58("11111111111111111111111111111112"),
 		Market:      solana.MustPublicKeyFromBase58("11111111111111111111111111111113"),
 		User:        solana.MustPublicKeyFromBase58("11111111111111111111111111111114"),
@@ -45,62 +45,40 @@ func TestOrderIntentSerializeMatchesContractFieldLayout(t *testing.T) {
 		Side:        SideSell,
 		Outcome:     OutcomeNo,
 		OrderType:   OrderTypeMarket,
-		LimitPrice:  0x1817161514131211,
+		LimitPrice:  0x42,
 		TotalAmount: 0x2827262524232221,
-		ExpiryTs:    0x3837363534333231,
+		ExpiryTs:    0x38373635,
 	}
 
 	encoded := intent.Serialize()
-	if len(encoded) != OrderIntentSize {
-		t.Fatalf("unexpected encoded size: %d", len(encoded))
+	if !bytes.Equal(encoded[0:32], intent.ProgramID.Bytes()) {
+		t.Fatal("program id offset mismatch")
 	}
-
-	if encoded[0] != intent.Version {
-		t.Fatalf("version offset mismatch: got %d want %d", encoded[0], intent.Version)
+	if !bytes.Equal(encoded[32:64], intent.Market.Bytes()) {
+		t.Fatal("market offset mismatch")
 	}
-	if !bytes.Equal(encoded[1:33], intent.ProgramID.Bytes()) {
-		t.Fatalf("program id offset mismatch")
+	if !bytes.Equal(encoded[64:96], intent.User.Bytes()) {
+		t.Fatal("user offset mismatch")
 	}
-	if !bytes.Equal(encoded[33:65], intent.Market.Bytes()) {
-		t.Fatalf("market offset mismatch")
-	}
-	if !bytes.Equal(encoded[65:97], intent.User.Bytes()) {
-		t.Fatalf("user offset mismatch")
-	}
-	if got := leu64(encoded[97:105]); got != intent.Nonce {
+	if got := leu64(encoded[96:104]); got != intent.Nonce {
 		t.Fatalf("nonce offset mismatch: got %d want %d", got, intent.Nonce)
 	}
-	if got := Side(encoded[105]); got != intent.Side {
-		t.Fatalf("side offset mismatch: got %d want %d", got, intent.Side)
+	if got := encoded[104]; got != intent.Flags() {
+		t.Fatalf("flags offset mismatch: got %d want %d", got, intent.Flags())
 	}
-	if got := Outcome(encoded[106]); got != intent.Outcome {
-		t.Fatalf("outcome offset mismatch: got %d want %d", got, intent.Outcome)
+	if got := encoded[105]; got != intent.LimitPrice {
+		t.Fatalf("limit_price offset mismatch: got %d want %d", got, intent.LimitPrice)
 	}
-	if got := OrderType(encoded[107]); got != intent.OrderType {
-		t.Fatalf("order type offset mismatch: got %d want %d", got, intent.OrderType)
+	if got := leu64(encoded[106:114]); got != intent.TotalAmount {
+		t.Fatalf("total_amount offset mismatch: got %d want %d", got, intent.TotalAmount)
 	}
-	if got := leu64(encoded[108:116]); got != intent.LimitPrice {
-		t.Fatalf("limit price offset mismatch: got %d want %d", got, intent.LimitPrice)
-	}
-	if got := leu64(encoded[116:124]); got != intent.TotalAmount {
-		t.Fatalf("total amount offset mismatch: got %d want %d", got, intent.TotalAmount)
-	}
-	if got := int64(leu64(encoded[124:132])); got != intent.ExpiryTs {
-		t.Fatalf("expiry offset mismatch: got %d want %d", got, intent.ExpiryTs)
-	}
-
-	decoded, err := ParseOrderIntentV1(encoded)
-	if err != nil {
-		t.Fatalf("ParseOrderIntentV1 error: %v", err)
-	}
-	if decoded != intent {
-		t.Fatalf("decoded mismatch after explicit layout check: %#v != %#v", decoded, intent)
+	if got := leu32(encoded[114:118]); got != intent.ExpiryTs {
+		t.Fatalf("expiry_ts offset mismatch: got %d want %d", got, intent.ExpiryTs)
 	}
 }
 
-func TestOrderIntentMessageIsLowerHexKeccak(t *testing.T) {
+func TestOrderIntentSignableMessageUsesBP1Base64URLHash(t *testing.T) {
 	intent := OrderIntentV1{
-		Version:     1,
 		ProgramID:   solana.PublicKey{},
 		Market:      solana.PublicKey{},
 		User:        solana.PublicKey{},
@@ -112,11 +90,40 @@ func TestOrderIntentMessageIsLowerHexKeccak(t *testing.T) {
 		TotalAmount: 100,
 		ExpiryTs:    2,
 	}
+
 	msg := intent.SignableMessage()
-	if _, err := hex.DecodeString(string(msg)); err != nil {
-		t.Fatalf("signable message is not lower hex: %v", err)
+	if !bytes.HasPrefix(msg, []byte("bp1:")) {
+		t.Fatalf("unexpected signable message prefix: %q", msg)
 	}
-	if len(msg) != 64 {
+	if len(msg) != 47 {
 		t.Fatalf("unexpected signable message length: %d", len(msg))
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(string(msg[4:]))
+	if err != nil {
+		t.Fatalf("signable message is not raw base64url: %v", err)
+	}
+	if !bytes.Equal(decoded, intent.Hash()) {
+		t.Fatalf("signable message hash mismatch")
+	}
+}
+
+func TestParseOrderIntentRejectsUnknownFlagBits(t *testing.T) {
+	intent := OrderIntentV1{
+		ProgramID:   solana.NewWallet().PublicKey(),
+		Market:      solana.NewWallet().PublicKey(),
+		User:        solana.NewWallet().PublicKey(),
+		Nonce:       1,
+		Side:        SideBuy,
+		Outcome:     OutcomeYes,
+		OrderType:   OrderTypeLimit,
+		LimitPrice:  50,
+		TotalAmount: 10,
+		ExpiryTs:    1000,
+	}
+	raw := intent.Serialize()
+	raw[104] = 1 << 7
+
+	if _, err := ParseOrderIntentV1(raw); err == nil {
+		t.Fatalf("expected ParseOrderIntentV1 to reject unknown flags")
 	}
 }

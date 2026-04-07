@@ -22,13 +22,27 @@ type SubmissionOrder struct {
 	Signature  []byte
 	RawIntent  []byte
 	OrderIndex uint16
+	Warm       bool
 }
 
 type FillIndexPair struct {
-	MakerIdx   uint16
-	TakerIdx   uint16
-	FillAmount uint64
-	FillPrice  uint64
+	MakerIdx   uint8
+	TakerIdx   uint8
+	FillAmount uint32
+	FillPrice  uint8
+}
+
+type OrderSlot struct {
+	UserIdx        uint8
+	ColdWitnessIdx uint8
+}
+
+type ColdOrderWitness struct {
+	Nonce       uint64
+	TotalAmount uint64
+	ExpiryTs    uint32
+	LimitPrice  uint8
+	Flags       uint8
 }
 
 type SubmissionBatch struct {
@@ -53,9 +67,10 @@ type TransactionSender interface {
 }
 
 type Submitter struct {
-	ProgramID solana.PublicKey
-	Relayer   solana.PrivateKey
-	RPC       TransactionSender
+	ProgramID     solana.PublicKey
+	Relayer       solana.PrivateKey
+	RPC           TransactionSender
+	AddressTables map[solana.PublicKey]solana.PublicKeySlice
 }
 
 var ErrNoSettlementWork = errors.New("match batch contains no fills")
@@ -70,6 +85,9 @@ func BuildSubmissionBatch(event matching.MatchBatchEvent, cfg BuildConfig) (Subm
 	marketPDA, err := solana.PublicKeyFromBase58(event.MarketPDA)
 	if err != nil {
 		return SubmissionBatch{}, fmt.Errorf("parse market pda: %w", err)
+	}
+	if len(event.Orders) > 255 {
+		return SubmissionBatch{}, fmt.Errorf("match batch has too many orders: %d", len(event.Orders))
 	}
 	sortedOrders := append([]matching.MatchedOrder(nil), event.Orders...)
 	sort.Slice(sortedOrders, func(i, j int) bool {
@@ -97,10 +115,16 @@ func BuildSubmissionBatch(event matching.MatchBatchEvent, cfg BuildConfig) (Subm
 			uniqueUsers = append(uniqueUsers, intent.User)
 		}
 	}
+	if len(uniqueUsers) > 255 {
+		return SubmissionBatch{}, fmt.Errorf("match batch has too many unique users: %d", len(uniqueUsers))
+	}
 	fills := make([]FillIndexPair, 0, len(event.Fills))
 	for _, fill := range event.Fills {
 		if fill.FillAmount == 0 {
 			return SubmissionBatch{}, fmt.Errorf("fill %d has zero fill_amount", fill.FillIndex)
+		}
+		if fill.FillAmount > uint64(^uint32(0)) {
+			return SubmissionBatch{}, fmt.Errorf("fill %d exceeds u32 amount limit", fill.FillIndex)
 		}
 		if fill.FillPrice == 0 || fill.FillPrice >= 100 {
 			return SubmissionBatch{}, fmt.Errorf("fill %d has invalid fill_price %d", fill.FillIndex, fill.FillPrice)
@@ -111,22 +135,30 @@ func BuildSubmissionBatch(event matching.MatchBatchEvent, cfg BuildConfig) (Subm
 		if fill.MakerOrderIndex == fill.TakerOrderIndex {
 			return SubmissionBatch{}, fmt.Errorf("fill %d cannot reference the same maker and taker order", fill.FillIndex)
 		}
-		fills = append(fills, FillIndexPair{MakerIdx: fill.MakerOrderIndex, TakerIdx: fill.TakerOrderIndex, FillAmount: fill.FillAmount, FillPrice: fill.FillPrice})
+		fills = append(fills, FillIndexPair{
+			MakerIdx:   uint8(fill.MakerOrderIndex),
+			TakerIdx:   uint8(fill.TakerOrderIndex),
+			FillAmount: uint32(fill.FillAmount),
+			FillPrice:  uint8(fill.FillPrice),
+		})
 	}
 	return SubmissionBatch{MarketID: event.MarketID, MarketPDA: marketPDA, Orders: orders, Fills: fills, UniqueUsers: uniqueUsers}, nil
 }
 
-func (s *Submitter) BuildInstructions(batch SubmissionBatch, initPlan UserPositionInitPlan) ([]solana.Instruction, error) {
+func (s *Submitter) BuildInstructions(batch SubmissionBatch) ([]solana.Instruction, error) {
 	configPDA, err := internalsolana.DeriveConfigPDA(s.ProgramID)
 	if err != nil {
 		return nil, err
 	}
-	instructions := make([]solana.Instruction, 0, len(batch.Orders)+len(initPlan.NeedInit)+1)
+	instructions := make([]solana.Instruction, 0, len(batch.Orders)+1)
 	for _, order := range batch.Orders {
+		if order.Warm {
+			continue
+		}
+		if len(order.Signature) != 64 {
+			return nil, fmt.Errorf("invalid signature length for order %d: got %d want 64", order.OrderIndex, len(order.Signature))
+		}
 		instructions = append(instructions, buildEd25519Instruction(order.Intent.User, order.Intent.SignableMessage(), order.Signature))
-	}
-	for _, entry := range initPlan.NeedInit {
-		instructions = append(instructions, buildInitUserPositionInstruction(s.ProgramID, s.Relayer.PublicKey(), configPDA, entry))
 	}
 	settleIx, err := s.buildSettleMatchBatchInstruction(batch, configPDA)
 	if err != nil {
@@ -172,32 +204,31 @@ func (s *Submitter) buildSettleMatchBatchInstruction(batch SubmissionBatch, conf
 	return solana.NewInstruction(s.ProgramID, accounts, data), nil
 }
 
-func (s *Submitter) BuildTransaction(ctx context.Context, batch SubmissionBatch, initPlan UserPositionInitPlan) (*solana.Transaction, error) {
-	instructions, err := s.BuildInstructions(batch, initPlan)
+func (s *Submitter) BuildTransaction(ctx context.Context, batch SubmissionBatch) (*solana.Transaction, error) {
+	instructions, err := s.BuildInstructions(batch)
 	if err != nil {
 		return nil, err
 	}
-	latest, err := s.RPC.GetLatestBlockhash(ctx, rpc.CommitmentConfirmed)
+	latest, err := s.RPC.GetLatestBlockhash(ctx, rpc.CommitmentProcessed)
 	if err != nil {
 		return nil, fmt.Errorf("get latest blockhash: %w", err)
 	}
-	return solana.NewTransaction(instructions, latest.Value.Blockhash, solana.TransactionPayer(s.Relayer.PublicKey()))
+	return s.newTransactionWithBlockhash(instructions, latest.Value.Blockhash)
 }
 
 func (s *Submitter) BuildSignedTransaction(
 	ctx context.Context,
 	batch SubmissionBatch,
-	initPlan UserPositionInitPlan,
 ) (*solana.Transaction, solana.Signature, string, uint64, error) {
-	instructions, err := s.BuildInstructions(batch, initPlan)
+	instructions, err := s.BuildInstructions(batch)
 	if err != nil {
 		return nil, solana.Signature{}, "", 0, err
 	}
-	latest, err := s.RPC.GetLatestBlockhash(ctx, rpc.CommitmentConfirmed)
+	latest, err := s.RPC.GetLatestBlockhash(ctx, rpc.CommitmentProcessed)
 	if err != nil {
 		return nil, solana.Signature{}, "", 0, fmt.Errorf("get latest blockhash: %w", err)
 	}
-	tx, err := solana.NewTransaction(instructions, latest.Value.Blockhash, solana.TransactionPayer(s.Relayer.PublicKey()))
+	tx, err := s.newTransactionWithBlockhash(instructions, latest.Value.Blockhash)
 	if err != nil {
 		return nil, solana.Signature{}, "", 0, err
 	}
@@ -206,6 +237,22 @@ func (s *Submitter) BuildSignedTransaction(
 		return nil, solana.Signature{}, "", 0, err
 	}
 	return tx, sig, rawBase64, latest.Value.LastValidBlockHeight, nil
+}
+
+func (s *Submitter) BuildTransactionWithBlockhash(batch SubmissionBatch, blockhash solana.Hash) (*solana.Transaction, error) {
+	instructions, err := s.BuildInstructions(batch)
+	if err != nil {
+		return nil, err
+	}
+	return s.newTransactionWithBlockhash(instructions, blockhash)
+}
+
+func (s *Submitter) newTransactionWithBlockhash(instructions []solana.Instruction, blockhash solana.Hash) (*solana.Transaction, error) {
+	opts := []solana.TransactionOption{solana.TransactionPayer(s.Relayer.PublicKey())}
+	if len(s.AddressTables) > 0 {
+		opts = append(opts, solana.TransactionAddressTables(internalsolana.CopyAddressTables(s.AddressTables)))
+	}
+	return solana.NewTransaction(instructions, blockhash, opts...)
 }
 
 func (s *Submitter) SignTransaction(tx *solana.Transaction) (solana.Signature, string, error) {
@@ -231,6 +278,17 @@ func (s *Submitter) SignTransaction(tx *solana.Transaction) (solana.Signature, s
 	return tx.Signatures[0], base64.StdEncoding.EncodeToString(raw), nil
 }
 
+func (s *Submitter) TransactionWireBytes(tx *solana.Transaction) (int, error) {
+	if tx == nil {
+		return 0, fmt.Errorf("transaction is nil")
+	}
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return 0, fmt.Errorf("marshal transaction bytes: %w", err)
+	}
+	return len(raw), nil
+}
+
 func (s *Submitter) Submit(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
 	_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
 		if key.Equals(s.Relayer.PublicKey()) {
@@ -241,7 +299,7 @@ func (s *Submitter) Submit(ctx context.Context, tx *solana.Transaction) (solana.
 	if err != nil {
 		return solana.Signature{}, fmt.Errorf("sign settlement tx: %w", err)
 	}
-	return s.RPC.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: false, PreflightCommitment: rpc.CommitmentConfirmed})
+	return s.RPC.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: true, PreflightCommitment: rpc.CommitmentProcessed})
 }
 
 func parseMatchedOrder(order matching.MatchedOrder) (OrderIntentV1, []byte, []byte, error) {
@@ -253,12 +311,9 @@ func parseMatchedOrder(order matching.MatchedOrder) (OrderIntentV1, []byte, []by
 	if err != nil {
 		return OrderIntentV1{}, nil, nil, fmt.Errorf("parse intent for order %d: %w", order.OrderID, err)
 	}
-	signature, err := base64.StdEncoding.DecodeString(order.Settlement.Signature)
+	signature, err := decodeSignature(order.Settlement.Signature)
 	if err != nil {
-		signature, err = base64.RawStdEncoding.DecodeString(order.Settlement.Signature)
-		if err != nil {
-			return OrderIntentV1{}, nil, nil, fmt.Errorf("decode signature for order %d: %w", order.OrderID, err)
-		}
+		return OrderIntentV1{}, nil, nil, fmt.Errorf("decode signature for order %d: %w", order.OrderID, err)
 	}
 	return intent, rawIntent, signature, nil
 }
@@ -277,14 +332,27 @@ func validateIntentAgainstExecution(intent OrderIntentV1, marketPDA solana.Publi
 	if intent.Nonce != exec.Nonce {
 		return fmt.Errorf("intent nonce mismatch for order %d", exec.OrderID)
 	}
-	if intent.ExpiryTs != exec.ExpireTime {
+	if exec.ExpireTime < 0 || exec.ExpireTime > int64(^uint32(0)) {
+		return fmt.Errorf("execution expiry out of range for order %d", exec.OrderID)
+	}
+	if intent.ExpiryTs != uint32(exec.ExpireTime) {
 		return fmt.Errorf("intent expiry mismatch for order %d", exec.OrderID)
 	}
-	if intent.LimitPrice != uint64(exec.OriginalPriceTick) {
+	if intent.LimitPrice == 0 || intent.LimitPrice >= 100 {
+		return fmt.Errorf("intent limit price out of range for order %d", exec.OrderID)
+	}
+	if intent.LimitPrice != uint8(exec.OriginalPriceTick) {
 		return fmt.Errorf("intent limit price mismatch for order %d", exec.OrderID)
 	}
 	if intent.TotalAmount == 0 {
 		return fmt.Errorf("intent total amount is zero for order %d", exec.OrderID)
+	}
+	minNotional, err := minimumOrderNotional(intent)
+	if err != nil {
+		return fmt.Errorf("intent minimum notional overflow for order %d: %w", exec.OrderID, err)
+	}
+	if minNotional < 100 {
+		return fmt.Errorf("intent minimum notional below 100 units for order %d", exec.OrderID)
 	}
 	if err := compareSide(intent.Side, exec.OriginalAction); err != nil {
 		return fmt.Errorf("order %d: %w", exec.OrderID, err)
@@ -349,31 +417,56 @@ func compareOrderType(orderType OrderType, raw string) error {
 func encodeSettleMatchBatchArgs(batch SubmissionBatch) ([]byte, error) {
 	args := make([]byte, 0, 1024)
 	args = append(args, anchorDiscriminator("global:settle_match_batch")...)
+	if len(batch.UniqueUsers) > 255 {
+		return nil, fmt.Errorf("too many unique users: %d", len(batch.UniqueUsers))
+	}
+	userIndexByKey := make(map[string]uint8, len(batch.UniqueUsers))
+	for idx, user := range batch.UniqueUsers {
+		userIndexByKey[user.String()] = uint8(idx)
+	}
+	orderSlots := make([]OrderSlot, 0, len(batch.Orders))
+	coldWitnesses := make([]ColdOrderWitness, 0, len(batch.Orders))
+	args = append(args, byte(len(batch.UniqueUsers)))
 	args = append(args, u32le(uint32(len(batch.Orders)))...)
 	for _, order := range batch.Orders {
-		args = append(args, order.Intent.Serialize()...)
+		userIdx, ok := userIndexByKey[order.Intent.User.String()]
+		if !ok {
+			return nil, fmt.Errorf("missing user index for order %d", order.OrderIndex)
+		}
+		slot := OrderSlot{UserIdx: userIdx, ColdWitnessIdx: 0xff}
+		if !order.Warm {
+			if len(coldWitnesses) >= 255 {
+				return nil, fmt.Errorf("too many cold witnesses")
+			}
+			slot.ColdWitnessIdx = uint8(len(coldWitnesses))
+			coldWitnesses = append(coldWitnesses, ColdOrderWitness{
+				Nonce:       order.Intent.Nonce,
+				TotalAmount: order.Intent.TotalAmount,
+				ExpiryTs:    order.Intent.ExpiryTs,
+				LimitPrice:  order.Intent.LimitPrice,
+				Flags:       order.Intent.Flags(),
+			})
+		}
+		orderSlots = append(orderSlots, slot)
+	}
+	for _, slot := range orderSlots {
+		args = append(args, slot.UserIdx, slot.ColdWitnessIdx)
+	}
+	args = append(args, u32le(uint32(len(coldWitnesses)))...)
+	for _, witness := range coldWitnesses {
+		args = append(args, u64le(witness.Nonce)...)
+		args = append(args, u64le(witness.TotalAmount)...)
+		args = append(args, u32le(witness.ExpiryTs)...)
+		args = append(args, witness.LimitPrice)
+		args = append(args, witness.Flags)
 	}
 	args = append(args, u32le(uint32(len(batch.Fills)))...)
 	for _, fill := range batch.Fills {
-		args = append(args, u16le(fill.MakerIdx)...)
-		args = append(args, u16le(fill.TakerIdx)...)
-		args = append(args, u64le(fill.FillAmount)...)
-		args = append(args, u64le(fill.FillPrice)...)
+		args = append(args, fill.MakerIdx, fill.TakerIdx)
+		args = append(args, u32le(fill.FillAmount)...)
+		args = append(args, fill.FillPrice)
 	}
 	return args, nil
-}
-
-func buildInitUserPositionInstruction(programID, relayer, configPDA solana.PublicKey, entry UserPositionPlanEntry) solana.Instruction {
-	data := anchorDiscriminator("global:init_user_position")
-	accounts := []*solana.AccountMeta{
-		solana.NewAccountMeta(relayer, true, true),
-		solana.NewAccountMeta(configPDA, false, false),
-		solana.NewAccountMeta(entry.UserPublicKey, false, false),
-		solana.NewAccountMeta(entry.MarketPDA, false, false),
-		solana.NewAccountMeta(entry.PositionPDA, true, false),
-		solana.NewAccountMeta(solana.SystemProgramID, false, false),
-	}
-	return solana.NewInstruction(programID, accounts, data)
 }
 
 func buildEd25519Instruction(pubkey solana.PublicKey, message []byte, signature []byte) solana.Instruction {
@@ -405,7 +498,6 @@ func decodeHex(raw string) ([]byte, error) {
 }
 
 func u16le(v uint16) []byte { return []byte{byte(v), byte(v >> 8)} }
-func u32le(v uint32) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)} }
 
 func containsPubkey(list []solana.PublicKey, key solana.PublicKey) bool {
 	for _, item := range list {
@@ -418,4 +510,37 @@ func containsPubkey(list []solana.PublicKey, key solana.PublicKey) bool {
 
 func SortUsersForAccounts(users []solana.PublicKey) {
 	sort.Slice(users, func(i, j int) bool { return users[i].String() < users[j].String() })
+}
+
+func minimumOrderNotional(intent OrderIntentV1) (uint64, error) {
+	if intent.OrderType == OrderTypeMarket && intent.Side == SideBuy {
+		return intent.TotalAmount, nil
+	}
+	return ceilMulDiv(intent.TotalAmount, uint64(intent.LimitPrice), 100)
+}
+
+func ceilMulDiv(lhs, rhs, denominator uint64) (uint64, error) {
+	if denominator == 0 {
+		return 0, fmt.Errorf("denominator must be greater than zero")
+	}
+	product, overflow := mulUint64(lhs, rhs)
+	if overflow {
+		return 0, fmt.Errorf("multiply overflow")
+	}
+	quotient := product / denominator
+	if product%denominator != 0 {
+		if quotient == ^uint64(0) {
+			return 0, fmt.Errorf("round up overflow")
+		}
+		quotient++
+	}
+	return quotient, nil
+}
+
+func mulUint64(lhs, rhs uint64) (uint64, bool) {
+	if lhs == 0 || rhs == 0 {
+		return 0, false
+	}
+	product := lhs * rhs
+	return product, product/lhs != rhs
 }

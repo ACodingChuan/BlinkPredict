@@ -125,7 +125,7 @@ function buildRows(snapshot: OrderbookSnapshot, outcome: "yes" | "no"): BookRow[
     .filter((row) => row.price > 0 && row.quantity > 0);
 
   if (outcome === "yes") {
-    const asks = yesAsks.sort((a, b) => b.price - a.price);
+    const asks = yesAsks.sort((a, b) => a.price - b.price);
     const bids = yesBids.sort((a, b) => b.price - a.price);
     return [...asks, ...bids];
   }
@@ -146,7 +146,7 @@ function buildRows(snapshot: OrderbookSnapshot, outcome: "yes" | "no"): BookRow[
       quantity: row.quantity,
     }))
     .filter((row) => row.price > 0 && row.price < 100)
-    .sort((a, b) => b.price - a.price);
+    .sort((a, b) => a.price - b.price);
 
   return [...noAsks, ...noBids];
 }

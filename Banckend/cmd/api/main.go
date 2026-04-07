@@ -35,6 +35,7 @@ import (
 	"blinkpredict/banckend/internal/pusher"
 	"blinkpredict/banckend/internal/query"
 	"blinkpredict/banckend/internal/settlement"
+	internalsolana "blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
 	"blinkpredict/banckend/internal/writer"
@@ -56,6 +57,34 @@ func main() {
 	logging.Configure(cfg.LogLevel)
 	if _, err := auth.NewSessionManager(cfg); err != nil {
 		logger.Fatalf("auth session manager: %v", err)
+	}
+	ctx := context.Background()
+	var programID solana.PublicKey
+	if cfg.ProgramID != "" {
+		var parseErr error
+		programID, parseErr = solana.PublicKeyFromBase58(cfg.ProgramID)
+		if parseErr != nil {
+			logger.Fatalf("program id: %v", parseErr)
+		}
+	}
+	var settlementAddressTables map[solana.PublicKey]solana.PublicKeySlice
+	if cfg.SolanaRPCURL != "" && len(cfg.SettlementStaticALTIDs) > 0 {
+		altRPC := logging.NewSolanaRPCClient("alt-loader-rpc", cfg.SolanaRPCURL)
+		loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		tables, err := internalsolana.LoadAddressTables(loadCtx, altRPC, cfg.SettlementStaticALTIDs)
+		cancel()
+		if err != nil {
+			logger.Warnf("settlement static ALT load failed: %v", err)
+		} else {
+			settlementAddressTables = tables
+			totalAddresses := 0
+			for _, addresses := range tables {
+				totalAddresses += len(addresses)
+			}
+			if len(tables) > 0 {
+				logger.Infof("Loaded settlement static ALT tables: tables=%d addresses=%d", len(tables), totalAddresses)
+			}
+		}
 	}
 
 	var commandPublisher protocol.CommandPublisher = protocol.DisabledCommandPublisher{}
@@ -106,6 +135,10 @@ func main() {
 				IdleFlush:    cfg.MatcherBatchIdleFlush,
 				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
+			CheckpointInterval:  cfg.MatcherCheckpointInterval,
+			ProgramID:           programID,
+			SettlementTxMaxBytes: cfg.SettlementTxMaxBytes,
+			AddressTables:       settlementAddressTables,
 		})
 	} else {
 		logger.Warnf("NATS disabled (set NATS_URL to enable command bus)")
@@ -114,7 +147,6 @@ func main() {
 	if cfg.DatabaseURL == "" {
 		logger.Fatalf("database is required for markets metadata (set DB_* or DATABASE_URL)")
 	}
-	ctx := context.Background()
 	pool, err := db.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatalf("database: %v", err)
@@ -133,6 +165,10 @@ func main() {
 				IdleFlush:    cfg.MatcherBatchIdleFlush,
 				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
+			CheckpointInterval:  cfg.MatcherCheckpointInterval,
+			ProgramID:           programID,
+			SettlementTxMaxBytes: cfg.SettlementTxMaxBytes,
+			AddressTables:       settlementAddressTables,
 		})
 	}
 
@@ -183,12 +219,38 @@ func main() {
 		pgWriter = writer.New(pool, natsClient, redisClient, "")
 		marketProjector = marketconfirm.NewProjector(natsClient, pool, marketRepo, marketCache)
 		if cfg.SettlementRelayerKeypair != "" && cfg.ProgramID != "" {
-			programID := solana.MustPublicKeyFromBase58(cfg.ProgramID)
 			relayer, err := faucet.LoadKeypair(cfg.SettlementRelayerKeypair)
 			if err != nil {
 				logger.Fatalf("settlement relayer keypair: %v", err)
 			}
-			settlementService = settlement.NewService(natsClient, pool, cfg.SolanaRPCURL, programID, relayer, wsRouter, "", cfg.SettlementReconcileInterval)
+			sendSkipPreflight := cfg.SettlementSendSkipPreflight
+			settlementService = settlement.NewService(
+				natsClient,
+				pool,
+				cfg.SolanaRPCURL,
+				programID,
+				relayer,
+				wsRouter,
+				"",
+				cfg.SettlementReconcileInterval,
+				settlement.ServiceOptions{
+					PrepareWorkerTick:     cfg.SettlementPrepareWorkerTick,
+					SchedulerFallbackScan: cfg.SettlementSchedulerScan,
+					SubmittedStatusPoll:   cfg.SettlementSubmittedPoll,
+					SubmittedRebroadcast:  cfg.SettlementRebroadcast,
+					SubmittedBlockPoll:    cfg.SettlementSubmittedHeight,
+					TerminalPollInterval:  cfg.SettlementTerminalPoll,
+					TerminalPollBatchSize: cfg.SettlementTerminalBatchSize,
+					BlockhashPollInterval: cfg.SettlementBlockhashPoll,
+					BlockhashMaxCacheAge:  cfg.SettlementBlockhashMaxAge,
+					SendSkipPreflight:     &sendSkipPreflight,
+					MaxTxBytes:            cfg.SettlementTxMaxBytes,
+					AddressTables:         settlementAddressTables,
+				},
+			)
+			if settlementService != nil && marketManager != nil {
+				settlementService.SetProcessedSettlementObserver(marketManager)
+			}
 		}
 		if cfg.SolanaRPCURL != "" {
 			depositConfirmService = depositconfirm.NewService(natsClient, pool, cfg, wsRouter)

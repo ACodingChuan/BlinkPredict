@@ -97,3 +97,22 @@ func TestRedisQueryEngineFallsBackWhenRedisMissing(t *testing.T) {
 		t.Fatalf("expected empty price history from fallback")
 	}
 }
+
+func TestRedisQueryEngineReadsLegacyBuySellDepthFields(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	mr.HSet("l2:depth:2001", "buy:45", "111")
+	mr.HSet("l2:depth:2001", "sell:46", "222")
+
+	engine := NewRedisQueryEngine(rdb, nil, NewDisabledEngine())
+	book := engine.GetOrderbook(context.Background(), 2001)
+
+	if len(book.Bids) != 1 || len(book.Asks) != 1 {
+		t.Fatalf("unexpected orderbook depth: %+v", book)
+	}
+	if book.BestBidPrice != "45" || book.BestAskPrice != "46" {
+		t.Fatalf("unexpected best prices: %+v", book)
+	}
+}

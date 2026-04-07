@@ -167,18 +167,23 @@ CREATE TABLE IF NOT EXISTS settlement_submissions (
     match_event_id TEXT PRIMARY KEY,
     market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
     market_pda TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('queued', 'submitted', 'confirmed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'prepared', 'submitted', 'processed', 'confirmed', 'failed')),
     market_lane_status TEXT NOT NULL DEFAULT 'active' CHECK (market_lane_status IN ('active', 'paused')),
     match_event_json JSONB NOT NULL,
+    prepared_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     wallets_json JSONB NOT NULL,
     tx_signature TEXT NOT NULL DEFAULT '',
     raw_tx_base64 TEXT NOT NULL DEFAULT '',
     last_valid_block_height BIGINT NOT NULL DEFAULT 0,
     retry_count INT NOT NULL DEFAULT 0,
+    processed_slot BIGINT NOT NULL DEFAULT 0,
     confirmation_slot BIGINT NOT NULL DEFAULT 0,
     reason_code TEXT NOT NULL DEFAULT '',
     submitted_event_published BOOLEAN NOT NULL DEFAULT FALSE,
     terminal_event_published BOOLEAN NOT NULL DEFAULT FALSE,
+    prepared_at TIMESTAMPTZ,
+    processed_at TIMESTAMPTZ,
+    confirmed_at TIMESTAMPTZ,
     version BIGINT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -192,9 +197,17 @@ CREATE INDEX IF NOT EXISTS settlement_submissions_hot_queue_idx
     ON settlement_submissions (market_id, created_at)
     WHERE status = 'queued' AND market_lane_status = 'active';
 
+CREATE INDEX IF NOT EXISTS settlement_submissions_hot_prepared_idx
+    ON settlement_submissions (market_id, created_at)
+    WHERE status = 'prepared' AND market_lane_status = 'active';
+
 CREATE INDEX IF NOT EXISTS settlement_submissions_hot_submitted_idx
     ON settlement_submissions (updated_at)
     WHERE status = 'submitted';
+
+CREATE INDEX IF NOT EXISTS settlement_submissions_hot_processed_idx
+    ON settlement_submissions (updated_at)
+    WHERE status = 'processed';
 
 CREATE INDEX IF NOT EXISTS settlement_submissions_terminal_publish_idx
     ON settlement_submissions (updated_at)
@@ -293,5 +306,21 @@ CREATE TABLE IF NOT EXISTS user_position_accounts (
 
 CREATE INDEX IF NOT EXISTS idx_user_position_accounts_wallet
     ON user_position_accounts (wallet_address);
+
+CREATE TABLE IF NOT EXISTS order_state_accounts (
+    market_id NUMERIC(20,0) NOT NULL REFERENCES markets(market_id),
+    wallet_address VARCHAR(44) NOT NULL,
+    nonce BIGINT NOT NULL CHECK (nonce >= 0),
+    order_state_pda VARCHAR(44) NOT NULL,
+    created_by_relayer VARCHAR(44),
+    created_tx_sig TEXT,
+    first_observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (market_id, wallet_address, nonce),
+    UNIQUE (order_state_pda)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_state_accounts_wallet
+    ON order_state_accounts (wallet_address);
 
 COMMIT;

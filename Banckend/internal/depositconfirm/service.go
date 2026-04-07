@@ -26,8 +26,10 @@ var logger = logging.New("depositconfirm")
 const defaultConsumerName = "deposit-confirm"
 
 const (
-	depositFetchBatch = 16
-	depositMaxWait    = 1500 * time.Millisecond
+	depositFetchBatch         = 16
+	depositMaxWait            = 1500 * time.Millisecond
+	depositRecoveryRetryBase  = time.Second
+	depositRecoveryRetryLimit = 20 * time.Second
 )
 
 type Service struct {
@@ -38,8 +40,11 @@ type Service struct {
 	cfg          config.Config
 	consumerName string
 	sub          *nats.Subscription
+	rootCtx      context.Context
 	watchMu      sync.Mutex
 	watchActive  map[string]struct{}
+	retryBase    time.Duration
+	retryLimit   time.Duration
 }
 
 func NewService(client *natsjs.Client, pool *pgxpool.Pool, cfg config.Config, routers ...chainconfirm.WSRouter) *Service {
@@ -56,6 +61,8 @@ func NewService(client *natsjs.Client, pool *pgxpool.Pool, cfg config.Config, ro
 		cfg:          cfg,
 		consumerName: defaultConsumerName,
 		watchActive:  make(map[string]struct{}),
+		retryBase:    depositRecoveryRetryBase,
+		retryLimit:   depositRecoveryRetryLimit,
 	}
 }
 
@@ -63,6 +70,7 @@ func (s *Service) Start(ctx context.Context) error {
 	if s == nil || s.client == nil || s.repo == nil {
 		return nil
 	}
+	s.rootCtx = ctx
 	if err := s.ensureSubscription(); err != nil {
 		return err
 	}
@@ -130,8 +138,11 @@ func (s *Service) handleMessage(msg *nats.Msg) {
 		_ = msg.Term()
 		return
 	}
-	submission, err := s.repo.Load(context.Background(), cmd.Signature)
+	submission, err := s.repo.Load(s.serviceContext(), cmd.Signature)
 	if err != nil {
+		if s.isStoppingError(err) {
+			return
+		}
 		logger.Warnf("deposit confirm load failed signature=%s err=%v", cmd.Signature, err)
 		_ = msg.NakWithDelay(time.Second)
 		return
@@ -159,10 +170,11 @@ func (s *Service) startSubmissionTask(submission Submission, msg *nats.Msg) {
 	}
 	go func() {
 		defer s.clearActive(signature)
-		retry, terminal := s.processSubmission(submission)
 		if msg == nil {
+			s.runRecoveryTask(signature, submission, s.processSubmission)
 			return
 		}
+		retry, terminal := s.processSubmission(submission)
 		switch {
 		case retry:
 			_ = msg.NakWithDelay(time.Second)
@@ -174,24 +186,128 @@ func (s *Service) startSubmissionTask(submission Submission, msg *nats.Msg) {
 	}()
 }
 
+type submissionProcessor func(Submission) (retry bool, terminal bool)
+
+func (s *Service) runRecoveryTask(signature string, submission Submission, process submissionProcessor) {
+	if process == nil {
+		return
+	}
+	delay := s.retryBaseDelay()
+	for {
+		retry, terminal := process(submission)
+		if !retry || terminal {
+			return
+		}
+		if !s.sleepRetry(delay) {
+			return
+		}
+		if refreshed, ok := s.reloadSubmission(signature); ok {
+			submission = refreshed
+		}
+		delay = nextRetryDelay(delay, s.retryLimitDelay())
+	}
+}
+
+func (s *Service) reloadSubmission(signature string) (Submission, bool) {
+	if s == nil || s.repo == nil {
+		return Submission{}, false
+	}
+	updated, err := s.repo.Load(s.serviceContext(), signature)
+	if err != nil {
+		if s.isStoppingError(err) {
+			return Submission{}, false
+		}
+		logger.Warnf("deposit confirm reload failed signature=%s err=%v", signature, err)
+		return Submission{}, false
+	}
+	return updated, true
+}
+
+func (s *Service) retryBaseDelay() time.Duration {
+	if s != nil && s.retryBase > 0 {
+		return s.retryBase
+	}
+	return depositRecoveryRetryBase
+}
+
+func (s *Service) retryLimitDelay() time.Duration {
+	if s != nil && s.retryLimit > 0 {
+		return s.retryLimit
+	}
+	return depositRecoveryRetryLimit
+}
+
+func (s *Service) sleepRetry(delay time.Duration) bool {
+	ctx := context.Background()
+	if s != nil && s.rootCtx != nil {
+		ctx = s.rootCtx
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func nextRetryDelay(current time.Duration, max time.Duration) time.Duration {
+	if current <= 0 {
+		return max
+	}
+	if max <= 0 {
+		return current
+	}
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
+func (s *Service) serviceContext() context.Context {
+	if s != nil && s.rootCtx != nil {
+		return s.rootCtx
+	}
+	return context.Background()
+}
+
+func (s *Service) isStoppingError(err error) bool {
+	if err == nil || s == nil || s.rootCtx == nil || s.rootCtx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled)
+}
+
 func (s *Service) processSubmission(submission Submission) (retry bool, terminal bool) {
 	if submission.Status == "confirmed" || submission.Status == "failed" || submission.Status == "expired" {
 		return false, true
 	}
-	if err := s.repo.MarkWatching(context.Background(), submission.Signature); err != nil {
+	opCtx := s.serviceContext()
+	if err := s.repo.MarkWatching(opCtx, submission.Signature); err != nil {
+		if s.isStoppingError(err) {
+			return true, false
+		}
 		logger.Warnf("deposit confirm mark watching failed signature=%s err=%v", submission.Signature, err)
 		return true, false
 	}
-	ctx, cancel := chainconfirm.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := chainconfirm.WithTimeout(opCtx, 90*time.Second)
 	defer cancel()
 
 	signature, err := solana.SignatureFromBase58(strings.TrimSpace(submission.Signature))
 	if err != nil {
-		if err := s.publishFailed(context.Background(), submission.Signature, submission.WalletAddress, "invalid_signature"); err != nil {
+		if err := s.publishFailed(opCtx, submission.Signature, submission.WalletAddress, "invalid_signature"); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("publish deposit invalid-signature failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
-		if err := s.repo.MarkFailed(context.Background(), submission.Signature, "invalid_signature"); err != nil {
+		if err := s.repo.MarkFailed(opCtx, submission.Signature, "invalid_signature"); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("deposit mark failed invalid-signature failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
@@ -199,28 +315,47 @@ func (s *Service) processSubmission(submission Submission) (retry bool, terminal
 	}
 	result, err := s.confirmer.WaitForConfirmed(ctx, signature)
 	if err != nil {
+		if s.isStoppingError(err) {
+			return true, false
+		}
 		reason := "confirm_timeout"
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.DeadlineExceeded) {
 			reason = "confirm_failed"
 		}
-		if err := s.publishFailed(context.Background(), submission.Signature, submission.WalletAddress, reason); err != nil {
+		if err := s.publishFailed(opCtx, submission.Signature, submission.WalletAddress, reason); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("publish deposit failed event failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
-		if err := s.repo.MarkExpired(context.Background(), submission.Signature, reason); err != nil {
+		if err := s.repo.MarkExpired(opCtx, submission.Signature, reason); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("deposit mark expired failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
 		return false, true
 	}
-	verified, err := VerifyDepositTransaction(context.Background(), s.rpc, s.cfg, submission)
+	verified, err := VerifyDepositTransaction(opCtx, s.rpc, s.cfg, submission)
 	if err != nil {
+		if s.isStoppingError(err) || isRetryableVerifyError(err) {
+			logger.Warnf("deposit verify deferred signature=%s err=%v", submission.Signature, err)
+			return true, false
+		}
 		logger.Warnf("deposit verify failed signature=%s err=%v", submission.Signature, err)
-		if err := s.publishFailed(context.Background(), submission.Signature, submission.WalletAddress, "transaction_not_deposit"); err != nil {
+		if err := s.publishFailed(opCtx, submission.Signature, submission.WalletAddress, "transaction_not_deposit"); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("publish deposit verify-failed event failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
-		if err := s.repo.MarkFailed(context.Background(), submission.Signature, "transaction_not_deposit"); err != nil {
+		if err := s.repo.MarkFailed(opCtx, submission.Signature, "transaction_not_deposit"); err != nil {
+			if s.isStoppingError(err) {
+				return true, false
+			}
 			logger.Warnf("deposit mark failed verify-failed failed signature=%s err=%v", submission.Signature, err)
 			return true, false
 		}
@@ -229,16 +364,22 @@ func (s *Service) processSubmission(submission Submission) (retry bool, terminal
 	if result.Slot > 0 {
 		verified.Slot = result.Slot
 	}
-	if err := s.client.PublishJSON(context.Background(), protocol.SubjectDepositConfirmed, verified.Signature, protocol.DepositConfirmedEvent{
+	if err := s.client.PublishJSON(opCtx, protocol.SubjectDepositConfirmed, verified.Signature, protocol.DepositConfirmedEvent{
 		Signature:     verified.Signature,
 		WalletAddress: verified.WalletAddress,
 		AmountUnits:   verified.AmountUnits,
 		Slot:          verified.Slot,
 	}); err != nil {
+		if s.isStoppingError(err) {
+			return true, false
+		}
 		logger.Warnf("publish deposit confirmed failed signature=%s err=%v", verified.Signature, err)
 		return true, false
 	}
-	if err := s.repo.MarkConfirmed(context.Background(), verified.Signature, verified.Slot); err != nil {
+	if err := s.repo.MarkConfirmed(opCtx, verified.Signature, verified.Slot); err != nil {
+		if s.isStoppingError(err) {
+			return true, false
+		}
 		logger.Warnf("deposit mark confirmed failed signature=%s err=%v", verified.Signature, err)
 		return true, false
 	}

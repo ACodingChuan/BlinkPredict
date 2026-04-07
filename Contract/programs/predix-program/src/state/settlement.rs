@@ -1,18 +1,35 @@
 use anchor_lang::prelude::*;
 
-use crate::state::{OrderIntentV1, SettleBranch};
+use crate::state::SettleBranch;
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct OrderSlot {
+    pub user_idx: u8,
+    pub cold_witness_idx: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct ColdOrderWitness {
+    pub nonce: u64,
+    pub total_amount: u64,
+    pub expiry_ts: u32,
+    pub limit_price: u8,
+    pub flags: u8,
+}
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct FillIndexPair {
-    pub maker_idx: u16,
-    pub taker_idx: u16,
-    pub fill_amount: u64,
-    pub fill_price: u64,
+    pub maker_idx: u8,
+    pub taker_idx: u8,
+    pub fill_amount: u32,
+    pub fill_price: u8,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct SettleMatchBatchArgs {
-    pub orders: Vec<OrderIntentV1>,
+    pub user_count: u8,
+    pub orders: Vec<OrderSlot>,
+    pub cold_witnesses: Vec<ColdOrderWitness>,
     pub fills: Vec<FillIndexPair>,
 }
 

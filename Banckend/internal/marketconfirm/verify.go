@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
 	"blinkpredict/banckend/internal/config"
-	internalsolana "blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/protocol"
+	internalsolana "blinkpredict/banckend/internal/solana"
 
 	solana "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -19,9 +20,39 @@ type VerifiedMarket struct {
 	protocol.MarketConfirmedEvent
 }
 
+type retryableVerifyError struct {
+	err error
+}
+
+func (e *retryableVerifyError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *retryableVerifyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func markVerifyRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &retryableVerifyError{err: err}
+}
+
+func isRetryableVerifyError(err error) bool {
+	var tagged *retryableVerifyError
+	return errors.As(err, &tagged)
+}
+
 func VerifyMarketCreateTransaction(ctx context.Context, rpcClient *rpc.Client, cfg config.Config, expected Submission) (VerifiedMarket, error) {
 	if rpcClient == nil {
-		return VerifiedMarket{}, fmt.Errorf("rpc client is not configured")
+		return VerifiedMarket{}, markVerifyRetryable(fmt.Errorf("rpc client is not configured"))
 	}
 	signature, err := solana.SignatureFromBase58(strings.TrimSpace(expected.Signature))
 	if err != nil {
@@ -29,7 +60,7 @@ func VerifyMarketCreateTransaction(ctx context.Context, rpcClient *rpc.Client, c
 	}
 	programID, err := solana.PublicKeyFromBase58(strings.TrimSpace(cfg.ProgramID))
 	if err != nil {
-		return VerifiedMarket{}, fmt.Errorf("invalid program id config: %w", err)
+		return VerifiedMarket{}, markVerifyRetryable(fmt.Errorf("invalid program id config: %w", err))
 	}
 	maxVersion := uint64(0)
 	out, err := rpcClient.GetParsedTransaction(ctx, signature, &rpc.GetParsedTransactionOpts{
@@ -37,7 +68,7 @@ func VerifyMarketCreateTransaction(ctx context.Context, rpcClient *rpc.Client, c
 		MaxSupportedTransactionVersion: &maxVersion,
 	})
 	if err != nil {
-		return VerifiedMarket{}, fmt.Errorf("get parsed transaction: %w", err)
+		return VerifiedMarket{}, markVerifyRetryable(fmt.Errorf("get parsed transaction: %w", err))
 	}
 	if out == nil || out.Meta == nil || out.Meta.Err != nil || out.Transaction == nil {
 		return VerifiedMarket{}, fmt.Errorf("transaction failed or missing meta")
@@ -71,6 +102,9 @@ func VerifyMarketCreateTransaction(ctx context.Context, rpcClient *rpc.Client, c
 			return VerifiedMarket{}, fmt.Errorf("market pda mismatch")
 		}
 		metadataCID := decodeFixedString(ix.Data[16 : 16+96])
+		if strings.TrimSpace(metadataCID) == "" {
+			return VerifiedMarket{}, fmt.Errorf("metadata cid is empty")
+		}
 		closeTS := int64(binary.LittleEndian.Uint64(ix.Data[112:120]))
 		resolveAfterTS := int64(binary.LittleEndian.Uint64(ix.Data[120:128]))
 		claimDeadlineTS := int64(binary.LittleEndian.Uint64(ix.Data[128:136]))
@@ -87,7 +121,7 @@ func VerifyMarketCreateTransaction(ctx context.Context, rpcClient *rpc.Client, c
 		}
 		metadataDoc, metadataURL, err := fetchMetadata(ctx, metadataCID)
 		if err != nil {
-			return VerifiedMarket{}, fmt.Errorf("fetch metadata: %w", err)
+			return VerifiedMarket{}, markVerifyRetryable(fmt.Errorf("fetch metadata: %w", err))
 		}
 		verified := VerifiedMarket{MarketConfirmedEvent: protocol.MarketConfirmedEvent{
 			Signature:           expected.Signature,

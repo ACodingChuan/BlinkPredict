@@ -9,7 +9,6 @@ import { useUSDCStore } from "@/store/usdcStore";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
 import {
   buildOrderIntent,
-  buildOrderSignatureMessage,
   encodeAmountToUnits,
   encodePriceToTick,
   type BuildOrderIntentParams,
@@ -175,8 +174,7 @@ export const useTrading = () => {
         expiryTs,
       };
 
-      const { intent, messageHash } = buildOrderIntent(buildParams);
-      const signableMessage = buildOrderSignatureMessage(messageHash);
+      const { intent, signableMessage } = buildOrderIntent(buildParams);
       const signature = await signOrderMessage(signableMessage);
       if (!signature) {
         return false;

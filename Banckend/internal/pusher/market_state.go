@@ -185,7 +185,7 @@ func (s *marketState) applyMatchEvent(event matching.MatchBatchEvent) protocol.W
 		if level.PriceTick > maxPriceTick {
 			continue
 		}
-		if level.Side == "ask" {
+		if normalizeDepthSide(level.Side) == "ask" {
 			s.asks[level.PriceTick] = level.TotalVolume
 			continue
 		}

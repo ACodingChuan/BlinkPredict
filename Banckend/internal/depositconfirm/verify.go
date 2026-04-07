@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -20,9 +21,39 @@ type VerifiedDeposit struct {
 	Slot          uint64
 }
 
+type retryableVerifyError struct {
+	err error
+}
+
+func (e *retryableVerifyError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *retryableVerifyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func markVerifyRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &retryableVerifyError{err: err}
+}
+
+func isRetryableVerifyError(err error) bool {
+	var tagged *retryableVerifyError
+	return errors.As(err, &tagged)
+}
+
 func VerifyDepositTransaction(ctx context.Context, rpcClient *rpc.Client, cfg config.Config, expected Submission) (VerifiedDeposit, error) {
 	if rpcClient == nil {
-		return VerifiedDeposit{}, fmt.Errorf("rpc client is not configured")
+		return VerifiedDeposit{}, markVerifyRetryable(fmt.Errorf("rpc client is not configured"))
 	}
 	signature, err := solana.SignatureFromBase58(expected.Signature)
 	if err != nil {
@@ -30,15 +61,15 @@ func VerifyDepositTransaction(ctx context.Context, rpcClient *rpc.Client, cfg co
 	}
 	programID, err := solana.PublicKeyFromBase58(strings.TrimSpace(cfg.ProgramID))
 	if err != nil {
-		return VerifiedDeposit{}, fmt.Errorf("invalid program id config: %w", err)
+		return VerifiedDeposit{}, markVerifyRetryable(fmt.Errorf("invalid program id config: %w", err))
 	}
 	globalVault, err := solana.PublicKeyFromBase58(strings.TrimSpace(cfg.GlobalVault))
 	if err != nil {
-		return VerifiedDeposit{}, fmt.Errorf("invalid global vault config: %w", err)
+		return VerifiedDeposit{}, markVerifyRetryable(fmt.Errorf("invalid global vault config: %w", err))
 	}
 	mint, err := solana.PublicKeyFromBase58(strings.TrimSpace(cfg.VUSDCMint))
 	if err != nil {
-		return VerifiedDeposit{}, fmt.Errorf("invalid vusdc mint config: %w", err)
+		return VerifiedDeposit{}, markVerifyRetryable(fmt.Errorf("invalid vusdc mint config: %w", err))
 	}
 	wallet, err := solana.PublicKeyFromBase58(strings.TrimSpace(expected.WalletAddress))
 	if err != nil {
@@ -50,7 +81,7 @@ func VerifyDepositTransaction(ctx context.Context, rpcClient *rpc.Client, cfg co
 		MaxSupportedTransactionVersion: &maxVersion,
 	})
 	if err != nil {
-		return VerifiedDeposit{}, fmt.Errorf("get parsed transaction: %w", err)
+		return VerifiedDeposit{}, markVerifyRetryable(fmt.Errorf("get parsed transaction: %w", err))
 	}
 	if out.Meta == nil || out.Meta.Err != nil {
 		return VerifiedDeposit{}, fmt.Errorf("transaction failed or missing meta")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/logging"
@@ -100,10 +101,12 @@ func compressDepthUpdates(updates []matching.DepthUpdate) []protocol.WSDepthLeve
 	latest := make(map[key]matching.DepthUpdate, len(updates))
 	order := make([]key, 0, len(updates))
 	for _, update := range updates {
-		k := key{side: update.Side, priceTick: update.PriceTick}
+		normalizedSide := normalizeDepthSide(update.Side)
+		k := key{side: normalizedSide, priceTick: update.PriceTick}
 		if _, ok := latest[k]; !ok {
 			order = append(order, k)
 		}
+		update.Side = normalizedSide
 		latest[k] = update
 	}
 
@@ -111,12 +114,19 @@ func compressDepthUpdates(updates []matching.DepthUpdate) []protocol.WSDepthLeve
 	for _, k := range order {
 		update := latest[k]
 		levels = append(levels, protocol.WSDepthLevel{
-			Side:        update.Side,
+			Side:        normalizeDepthSide(update.Side),
 			PriceTick:   update.PriceTick,
 			TotalVolume: update.TotalVolume,
 		})
 	}
 	return levels
+}
+
+func normalizeDepthSide(side string) string {
+	if strings.EqualFold(strings.TrimSpace(side), "ask") || strings.EqualFold(strings.TrimSpace(side), "sell") {
+		return "ask"
+	}
+	return "bid"
 }
 
 func tradeIDForFill(eventID string, fill matching.MatchFill) string {

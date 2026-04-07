@@ -35,8 +35,13 @@ type SignatureResult struct {
 }
 
 type WSRouter interface {
-	SubscribeSignature(signature string, subscriberID string, kind string, ch chan<- SignatureResult) (func(), error)
+	SubscribeSignature(signature string, subscriberID string, kind string, commitment string, ch chan<- SignatureResult) (func(), error)
 	Close()
+}
+
+type subscriptionKey struct {
+	Signature  string
+	Commitment string
 }
 
 type Router struct {
@@ -46,14 +51,16 @@ type Router struct {
 	reqID    atomic.Uint64
 	closed   atomic.Bool
 	mu       sync.Mutex
-	watches  map[string]*signatureWatch
+	watches  map[subscriptionKey]*signatureWatch
 	shards   []*routerShard
 	dialer   *websocket.Dialer
 	stopOnce sync.Once
 }
 
 type signatureWatch struct {
+	Key           subscriptionKey
 	Signature     string
+	Commitment    string
 	ShardIndex    int
 	WSSubID       uint64
 	PendingReqID  uint64
@@ -80,8 +87,8 @@ type routerShard struct {
 	stateMu         sync.RWMutex
 	conn            *websocket.Conn
 	connected       bool
-	pendingRequests map[uint64]string
-	sigByWSSubID    map[uint64]string
+	pendingRequests map[uint64]subscriptionKey
+	sigByWSSubID    map[uint64]subscriptionKey
 
 	writeMu sync.Mutex
 }
@@ -124,7 +131,7 @@ func NewRouter(wsURL string, rpcURL string, shardCount int) *Router {
 		log:     "wsrouter",
 		wsURL:   wsURL,
 		ttl:     defaultTerminalCacheTTL,
-		watches: make(map[string]*signatureWatch),
+		watches: make(map[subscriptionKey]*signatureWatch),
 		shards:  make([]*routerShard, 0, shardCount),
 		dialer: &websocket.Dialer{
 			Proxy:             http.ProxyFromEnvironment,
@@ -138,8 +145,8 @@ func NewRouter(wsURL string, rpcURL string, shardCount int) *Router {
 			index:           i,
 			url:             wsURL,
 			wakeCh:          make(chan struct{}, 1),
-			pendingRequests: make(map[uint64]string),
-			sigByWSSubID:    make(map[uint64]string),
+			pendingRequests: make(map[uint64]subscriptionKey),
+			sigByWSSubID:    make(map[uint64]subscriptionKey),
 		}
 		r.shards = append(r.shards, shard)
 		go shard.run()
@@ -148,36 +155,40 @@ func NewRouter(wsURL string, rpcURL string, shardCount int) *Router {
 	return r
 }
 
-func (r *Router) SubscribeSignature(signature string, subscriberID string, kind string, ch chan<- SignatureResult) (func(), error) {
+func (r *Router) SubscribeSignature(signature string, subscriberID string, kind string, commitment string, ch chan<- SignatureResult) (func(), error) {
 	if r == nil {
 		return func() {}, fmt.Errorf("ws router is not configured")
 	}
 	signature = strings.TrimSpace(signature)
 	subscriberID = strings.TrimSpace(subscriberID)
 	kind = strings.TrimSpace(kind)
+	commitment = normalizeCommitment(commitment)
 	if signature == "" {
 		return func() {}, fmt.Errorf("signature is required")
 	}
 	if subscriberID == "" {
 		subscriberID = fmt.Sprintf("%s:%d", kind, time.Now().UnixNano())
 	}
+	key := subscriptionKey{Signature: signature, Commitment: commitment}
 	var (
 		shardIndex   int
 		needUpstream bool
 		cached       *SignatureResult
 	)
 	r.mu.Lock()
-	watch, ok := r.watches[signature]
+	watch, ok := r.watches[key]
 	if !ok {
-		shardIndex = shardIndexForSignature(signature, len(r.shards))
+		shardIndex = shardIndexForSignature(signature+":"+commitment, len(r.shards))
 		watch = &signatureWatch{
+			Key:         key,
 			Signature:   signature,
+			Commitment:  commitment,
 			ShardIndex:  shardIndex,
 			Subscribers: make(map[string]signatureSubscriber),
 			CreatedAt:   time.Now().UTC(),
 			UpdatedAt:   time.Now().UTC(),
 		}
-		r.watches[signature] = watch
+		r.watches[key] = watch
 		needUpstream = true
 	} else {
 		shardIndex = watch.ShardIndex
@@ -196,38 +207,39 @@ func (r *Router) SubscribeSignature(signature string, subscriberID string, kind 
 		default:
 			logging.LogWS(r.log, context.Background(), zerolog.WarnLevel, "ws router cached dispatch dropped", map[string]any{
 				"signature":     signature,
+				"commitment":    commitment,
 				"subscriber_id": subscriberID,
 				"kind":          kind,
 			})
 		}
-		return func() { r.unsubscribe(signature, subscriberID) }, nil
+		return func() { r.unsubscribe(key, subscriberID) }, nil
 	}
 	if needUpstream {
 		r.shards[shardIndex].signal()
-		if err := r.shards[shardIndex].sendSubscribe(signature); err != nil {
+		if err := r.shards[shardIndex].sendSubscribe(key); err != nil {
 			logging.LogWS(r.log, context.Background(), zerolog.WarnLevel, "ws router subscribe deferred to reconnect", map[string]any{
-				"signature": signature,
-				"shard":     shardIndex,
-				"error":     err.Error(),
+				"signature":  signature,
+				"commitment": commitment,
+				"shard":      shardIndex,
+				"error":      err.Error(),
 			})
 		}
 	}
-	return func() { r.unsubscribe(signature, subscriberID) }, nil
+	return func() { r.unsubscribe(key, subscriberID) }, nil
 }
 
-func (r *Router) unsubscribe(signature string, subscriberID string) {
+func (r *Router) unsubscribe(key subscriptionKey, subscriberID string) {
 	if r == nil || r.closed.Load() {
 		return
 	}
-	signature = strings.TrimSpace(signature)
 	subscriberID = strings.TrimSpace(subscriberID)
-	if signature == "" || subscriberID == "" {
+	if key.Signature == "" || subscriberID == "" {
 		return
 	}
 	var shard *routerShard
 	var wsSubID uint64
 	r.mu.Lock()
-	watch, ok := r.watches[signature]
+	watch, ok := r.watches[key]
 	if !ok {
 		r.mu.Unlock()
 		return
@@ -240,7 +252,7 @@ func (r *Router) unsubscribe(signature string, subscriberID string) {
 		watch.WSSubID = 0
 		watch.PendingReqID = 0
 		if watch.TerminalCache == nil || time.Now().UTC().After(watch.TerminalUntil) {
-			delete(r.watches, signature)
+			delete(r.watches, key)
 		}
 	}
 	r.mu.Unlock()
@@ -275,23 +287,23 @@ func (r *Router) cleanupLoop() {
 		<-ticker.C
 		now := time.Now().UTC()
 		r.mu.Lock()
-		for signature, watch := range r.watches {
+		for key, watch := range r.watches {
 			if len(watch.Subscribers) > 0 {
 				continue
 			}
 			if watch.TerminalCache != nil && now.Before(watch.TerminalUntil) {
 				continue
 			}
-			delete(r.watches, signature)
+			delete(r.watches, key)
 		}
 		r.mu.Unlock()
 	}
 }
 
-func (r *Router) cacheAndDispatch(signature string, result SignatureResult) {
+func (r *Router) cacheAndDispatch(key subscriptionKey, result SignatureResult) {
 	var subscribers []signatureSubscriber
 	r.mu.Lock()
-	watch, ok := r.watches[signature]
+	watch, ok := r.watches[key]
 	if ok {
 		result.ObservedAt = time.Now().UTC()
 		cached := result
@@ -311,7 +323,8 @@ func (r *Router) cacheAndDispatch(signature string, result SignatureResult) {
 		case sub.Ch <- result:
 		default:
 			logging.LogWS(r.log, context.Background(), zerolog.WarnLevel, "ws router dispatch dropped", map[string]any{
-				"signature":     signature,
+				"signature":     key.Signature,
+				"commitment":    key.Commitment,
 				"subscriber_id": sub.ID,
 				"kind":          sub.Kind,
 			})
@@ -323,12 +336,12 @@ func (r *Router) onSubscribeAck(reqID uint64, wsSubID uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, shard := range r.shards {
-		signature, ok := shard.pendingByRequest(reqID)
+		key, ok := shard.pendingByRequest(reqID)
 		if !ok {
 			continue
 		}
-		shard.bindSubscription(reqID, wsSubID, signature)
-		if watch, exists := r.watches[signature]; exists {
+		shard.bindSubscription(reqID, wsSubID, key)
+		if watch, exists := r.watches[key]; exists {
 			watch.WSSubID = wsSubID
 			watch.PendingReqID = 0
 			watch.UpdatedAt = time.Now().UTC()
@@ -338,25 +351,38 @@ func (r *Router) onSubscribeAck(reqID uint64, wsSubID uint64) {
 }
 
 func (r *Router) onNotification(subID uint64, notify wsSignatureNotify) {
-	var signature string
+	var key subscriptionKey
+	found := false
 	for _, shard := range r.shards {
-		if sig, ok := shard.signatureBySubID(subID); ok {
-			signature = sig
+		if k, ok := shard.subscriptionBySubID(subID); ok {
+			key = k
+			found = true
 			break
 		}
 	}
-	if signature == "" {
+	if !found {
 		return
 	}
+
+	r.mu.Lock()
+	watch, ok := r.watches[key]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	signature := watch.Signature
+	commitment := watch.Commitment
+	r.mu.Unlock()
+
 	res := SignatureResult{
 		Signature:          signature,
 		Slot:               notify.Context.Slot,
-		ConfirmationStatus: "confirmed",
+		ConfirmationStatus: commitment,
 	}
 	if notify.Value.Err != nil {
 		res.ErrText = fmt.Sprint(notify.Value.Err)
 	}
-	r.cacheAndDispatch(signature, res)
+	r.cacheAndDispatch(key, res)
 }
 
 func (r *Router) resetShard(index int) {
@@ -371,18 +397,18 @@ func (r *Router) resetShard(index int) {
 	}
 }
 
-func (r *Router) shardSignatures(index int) []string {
+func (r *Router) shardSubscriptions(index int) []subscriptionKey {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]string, 0)
-	for _, watch := range r.watches {
+	out := make([]subscriptionKey, 0)
+	for key, watch := range r.watches {
 		if watch.ShardIndex != index {
 			continue
 		}
 		if len(watch.Subscribers) == 0 {
 			continue
 		}
-		out = append(out, watch.Signature)
+		out = append(out, key)
 	}
 	return out
 }
@@ -401,11 +427,11 @@ func (r *Router) shardHasActiveSubscribers(index int) bool {
 	return false
 }
 
-func (r *Router) nextRequestID(signature string, shardIndex int) uint64 {
+func (r *Router) nextRequestID(key subscriptionKey, shardIndex int) uint64 {
 	reqID := r.reqID.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if watch, ok := r.watches[signature]; ok {
+	if watch, ok := r.watches[key]; ok {
 		watch.PendingReqID = reqID
 		watch.ShardIndex = shardIndex
 		watch.UpdatedAt = time.Now().UTC()
@@ -466,10 +492,7 @@ func (s *routerShard) waitUntilNeeded() bool {
 			return true
 		}
 		s.close()
-		select {
-		case <-s.wakeCh:
-		case <-time.After(time.Second):
-		}
+		<-s.wakeCh
 	}
 	return false
 }
@@ -492,8 +515,8 @@ func (s *routerShard) connect() error {
 	s.stateMu.Lock()
 	s.conn = conn
 	s.connected = true
-	s.pendingRequests = make(map[uint64]string)
-	s.sigByWSSubID = make(map[uint64]string)
+	s.pendingRequests = make(map[uint64]subscriptionKey)
+	s.sigByWSSubID = make(map[uint64]subscriptionKey)
 	s.stateMu.Unlock()
 	return nil
 }
@@ -573,26 +596,27 @@ func (s *routerShard) pingLoop(stop <-chan struct{}) {
 }
 
 func (s *routerShard) resubscribeAll() {
-	for _, signature := range s.router.shardSignatures(s.index) {
-		if err := s.sendSubscribe(signature); err != nil {
+	for _, key := range s.router.shardSubscriptions(s.index) {
+		if err := s.sendSubscribe(key); err != nil {
 			logging.LogWS(s.router.log, context.Background(), zerolog.WarnLevel, "ws router resubscribe failed", map[string]any{
-				"shard":     s.index,
-				"signature": signature,
-				"error":     err.Error(),
+				"shard":      s.index,
+				"signature":  key.Signature,
+				"commitment": key.Commitment,
+				"error":      err.Error(),
 			})
 		}
 	}
 }
 
-func (s *routerShard) sendSubscribe(signature string) error {
-	reqID := s.router.nextRequestID(signature, s.index)
+func (s *routerShard) sendSubscribe(key subscriptionKey) error {
+	reqID := s.router.nextRequestID(key, s.index)
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      reqID,
 		"method":  "signatureSubscribe",
 		"params": []any{
-			signature,
-			map[string]any{"commitment": "confirmed"},
+			key.Signature,
+			map[string]any{"commitment": key.Commitment},
 		},
 	}
 	data, err := json.Marshal(payload)
@@ -600,7 +624,7 @@ func (s *routerShard) sendSubscribe(signature string) error {
 		return err
 	}
 	s.stateMu.Lock()
-	s.pendingRequests[reqID] = signature
+	s.pendingRequests[reqID] = key
 	s.stateMu.Unlock()
 	return s.writeJSON(data)
 }
@@ -655,27 +679,40 @@ func (s *routerShard) close() {
 	}
 	s.conn = nil
 	s.connected = false
-	s.pendingRequests = make(map[uint64]string)
-	s.sigByWSSubID = make(map[uint64]string)
+	s.pendingRequests = make(map[uint64]subscriptionKey)
+	s.sigByWSSubID = make(map[uint64]subscriptionKey)
 }
 
-func (s *routerShard) pendingByRequest(reqID uint64) (string, bool) {
+func (s *routerShard) pendingByRequest(reqID uint64) (subscriptionKey, bool) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	signature, ok := s.pendingRequests[reqID]
-	return signature, ok
+	key, ok := s.pendingRequests[reqID]
+	return key, ok
 }
 
-func (s *routerShard) bindSubscription(reqID uint64, wsSubID uint64, signature string) {
+func (s *routerShard) bindSubscription(reqID uint64, wsSubID uint64, key subscriptionKey) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	delete(s.pendingRequests, reqID)
-	s.sigByWSSubID[wsSubID] = signature
+	s.sigByWSSubID[wsSubID] = key
 }
 
-func (s *routerShard) signatureBySubID(subID uint64) (string, bool) {
+func (s *routerShard) subscriptionBySubID(subID uint64) (subscriptionKey, bool) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	signature, ok := s.sigByWSSubID[subID]
-	return signature, ok
+	key, ok := s.sigByWSSubID[subID]
+	return key, ok
+}
+
+func normalizeCommitment(commitment string) string {
+	switch strings.ToLower(strings.TrimSpace(commitment)) {
+	case "processed":
+		return "processed"
+	case "confirmed":
+		return "confirmed"
+	case "finalized":
+		return "finalized"
+	default:
+		return "confirmed"
+	}
 }

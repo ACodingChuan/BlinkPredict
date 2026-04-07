@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -738,8 +740,8 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "system bootstrap in progress")
 		return
 	}
-	var req orders.PlaceOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := decodePlaceOrderRequest(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -890,12 +892,37 @@ func (s *Server) resolveMarketForOrder(ctx context.Context, req orders.PlaceOrde
 }
 
 func (s *Server) normalizePlaceOrderRequest(req orders.PlaceOrderRequest, market markets.Market, authenticatedWallet string) (orders.PlaceOrderRequest, []byte, error) {
-	if strings.TrimSpace(req.User) != strings.TrimSpace(authenticatedWallet) {
+	authenticatedWallet = strings.TrimSpace(authenticatedWallet)
+	if authenticatedWallet == "" {
+		return req, nil, errors.New("authenticated wallet is required")
+	}
+	reqUser := strings.TrimSpace(req.User)
+	if reqUser == "" {
+		reqUser = authenticatedWallet
+	}
+	if reqUser != authenticatedWallet {
 		return req, nil, errOrderWalletMismatch
 	}
 	if req.Signature == "" {
 		return req, nil, errors.New("signature is required")
 	}
+	programIDText := strings.TrimSpace(s.cfg.ProgramID)
+	if programIDText == "" {
+		return req, nil, errors.New("program_id is not configured")
+	}
+	if providedProgram := strings.TrimSpace(req.ProgramID); providedProgram != "" && !strings.EqualFold(providedProgram, programIDText) {
+		return req, nil, errors.New("program_id does not match server configuration")
+	}
+	marketPDA := strings.TrimSpace(market.MarketPDA)
+	if marketPDA == "" {
+		return req, nil, errors.New("market is not configured")
+	}
+	if providedMarket := strings.TrimSpace(req.Market); providedMarket != "" && !strings.EqualFold(providedMarket, marketPDA) {
+		return req, nil, errors.New("market does not match resolved market_id")
+	}
+	req.ProgramID = programIDText
+	req.Market = marketPDA
+	req.User = authenticatedWallet
 	if req.Version == 0 {
 		req.Version = 1
 	}
@@ -930,15 +957,15 @@ func (s *Server) normalizePlaceOrderRequest(req orders.PlaceOrderRequest, market
 	}
 	req.ExpireTime = req.ExpiryTs
 
-	programID, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.ProgramID))
+	programID, err := gsolana.PublicKeyFromBase58(req.ProgramID)
 	if err != nil {
 		return req, nil, errors.New("program_id is not a valid solana address")
 	}
-	marketPubkey, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.Market))
+	marketPubkey, err := gsolana.PublicKeyFromBase58(req.Market)
 	if err != nil {
 		return req, nil, errors.New("market is not a valid solana address")
 	}
-	userPubkey, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(req.User))
+	userPubkey, err := gsolana.PublicKeyFromBase58(req.User)
 	if err != nil {
 		return req, nil, errors.New("user is not a valid solana address")
 	}
@@ -947,6 +974,69 @@ func (s *Server) normalizePlaceOrderRequest(req orders.PlaceOrderRequest, market
 		return req, nil, err
 	}
 	return req, intentBytes, nil
+}
+
+func decodePlaceOrderRequest(body io.Reader) (orders.PlaceOrderRequest, error) {
+	var req orders.PlaceOrderRequest
+	payload, err := io.ReadAll(io.LimitReader(body, 1<<20))
+	if err != nil {
+		return req, err
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return req, err
+	}
+	if req.MarketID != 0 {
+		return req, nil
+	}
+	marketID, ok, err := extractPlaceOrderMarketID(payload)
+	if err != nil {
+		return req, err
+	}
+	if ok {
+		req.MarketID = marketID
+	}
+	return req, nil
+}
+
+func extractPlaceOrderMarketID(payload []byte) (uint64, bool, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return 0, false, err
+	}
+	value, exists := raw["market_id"]
+	if !exists {
+		return 0, false, nil
+	}
+	trimmed := bytes.TrimSpace(value)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, false, nil
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return 0, false, err
+		}
+		id, err := parseMarketID(strings.TrimSpace(text))
+		if err != nil {
+			return 0, false, err
+		}
+		return id, true, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	var number json.Number
+	if err := decoder.Decode(&number); err != nil {
+		return 0, false, err
+	}
+	text := strings.TrimSpace(number.String())
+	if text == "" || strings.Contains(text, ".") {
+		return 0, false, fmt.Errorf("invalid market_id: %s", text)
+	}
+	id, err := parseMarketID(text)
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
 
 func normalizeToYesBook(side string, outcome string, limitPrice uint64) (string, uint64, error) {
@@ -987,16 +1077,16 @@ func (s *Server) precheckPlaceOrder(ctx context.Context, req orders.PlaceOrderRe
 	}
 
 	originalAction := strings.ToLower(strings.TrimSpace(req.OriginalAction))
-	position, err := s.getOrInitPositionSnapshot(ctx, market, walletAddress)
+	position, err := s.getPositionSnapshot(ctx, market.MarketID, walletAddress)
 	if err != nil {
-		if s.logger != nil {
+		if s.logger != nil && !strings.Contains(err.Error(), "not found") {
 			s.logger.Warn().Err(err).Str("wallet", walletAddress).Msg("gateway position precheck skipped")
 		}
 		position = positionSnapshot{}
 	}
-	account, accountErr := s.getOrInitWalletAccountSnapshot(ctx, walletAddress)
+	account, accountErr := s.getWalletAccountSnapshot(ctx, walletAddress)
 	if accountErr != nil {
-		if s.logger != nil {
+		if s.logger != nil && !strings.Contains(accountErr.Error(), "not found") {
 			s.logger.Warn().Err(accountErr).Str("wallet", walletAddress).Msg("gateway wallet account precheck skipped")
 		}
 		account = walletAccountSnapshot{}
@@ -1899,20 +1989,6 @@ type OrderIntentBorsh struct {
 	Nonce             uint64
 }
 
-type RawOrderIntentV1 struct {
-	Version     uint8
-	ProgramID   [32]byte
-	Market      [32]byte
-	User        [32]byte
-	Nonce       uint64
-	Side        uint8
-	Outcome     uint8
-	OrderType   uint8
-	LimitPrice  uint64
-	TotalAmount uint64
-	ExpiryTs    int64
-}
-
 // serializeOrderIntentBorsh 序列化订单意图为 110 字节数组
 func serializeOrderIntentBorsh(intent *OrderIntentBorsh) ([]byte, error) {
 	if intent == nil {
@@ -1972,51 +2048,29 @@ func uint16ToLEBytes(v uint16) []byte {
 	return []byte{byte(v), byte(v >> 8)}
 }
 
-func serializeRawOrderIntentV1(intent *RawOrderIntentV1) ([]byte, error) {
-	if intent == nil {
-		return nil, errors.New("intent is nil")
-	}
-	buf := make([]byte, 0, 132)
-	buf = append(buf, intent.Version)
-	buf = append(buf, intent.ProgramID[:]...)
-	buf = append(buf, intent.Market[:]...)
-	buf = append(buf, intent.User[:]...)
-	buf = append(buf, uint64ToLEBytes(intent.Nonce)...)
-	buf = append(buf, intent.Side)
-	buf = append(buf, intent.Outcome)
-	buf = append(buf, intent.OrderType)
-	buf = append(buf, uint64ToLEBytes(intent.LimitPrice)...)
-	buf = append(buf, uint64ToLEBytes(intent.TotalAmount)...)
-	buf = append(buf, uint64ToLEBytes(uint64(intent.ExpiryTs))...)
-	if len(buf) != 132 {
-		return nil, fmt.Errorf("serialized size mismatch: expected 132, got %d", len(buf))
-	}
-	return buf, nil
-}
-
-func buildOrderSignatureMessage(messageHash []byte) []byte {
-	hexHash := hex.EncodeToString(messageHash)
-	return []byte(hexHash)
-}
-
 func buildRawOrderIntentBytes(
 	req orders.PlaceOrderRequest,
 	programID gsolana.PublicKey,
 	marketPubkey gsolana.PublicKey,
 	userPubkey gsolana.PublicKey,
 ) ([]byte, error) {
+	if req.LimitPrice == 0 || req.LimitPrice > 99 {
+		return nil, fmt.Errorf("limit_price must be between 1 and 99")
+	}
+	if req.ExpiryTs < 0 || req.ExpiryTs > math.MaxUint32 {
+		return nil, fmt.Errorf("expiry_ts out of range")
+	}
 	intent := settlement.OrderIntentV1{
-		Version:     req.Version,
 		ProgramID:   programID,
 		Market:      marketPubkey,
 		User:        userPubkey,
 		Side:        settlement.Side(mapSideToUint8(req.OriginalAction)),
 		Outcome:     settlement.Outcome(mapOutcomeToUint8(req.OriginalOutcome)),
 		OrderType:   settlement.OrderType(mapOrderTypeToUint8(req.OrderType)),
-		LimitPrice:  req.LimitPrice,
+		LimitPrice:  uint8(req.LimitPrice),
 		TotalAmount: req.TotalAmount,
 		Nonce:       req.Nonce,
-		ExpiryTs:    req.ExpiryTs,
+		ExpiryTs:    uint32(req.ExpiryTs),
 	}
 	return intent.Serialize(), nil
 }

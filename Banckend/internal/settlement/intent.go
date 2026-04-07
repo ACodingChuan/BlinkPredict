@@ -1,7 +1,7 @@
 package settlement
 
 import (
-	"encoding/hex"
+	"encoding/base64"
 	"fmt"
 
 	solana "github.com/gagliardetto/solana-go"
@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	OrderIntentVersion = 1
-	OrderIntentSize    = 132
+	OrderIntentDomain = "predix-order"
+	OrderIntentSize   = 118
+	orderFlagsMask    = (1 << 0) | (1 << 1) | (1 << 2)
 )
 
 type Side uint8
@@ -35,7 +36,6 @@ const (
 )
 
 type OrderIntentV1 struct {
-	Version     uint8
 	ProgramID   solana.PublicKey
 	Market      solana.PublicKey
 	User        solana.PublicKey
@@ -43,24 +43,21 @@ type OrderIntentV1 struct {
 	Side        Side
 	Outcome     Outcome
 	OrderType   OrderType
-	LimitPrice  uint64
+	LimitPrice  uint8
 	TotalAmount uint64
-	ExpiryTs    int64
+	ExpiryTs    uint32
 }
 
 func (o OrderIntentV1) Serialize() []byte {
 	buf := make([]byte, 0, OrderIntentSize)
-	buf = append(buf, o.Version)
 	buf = append(buf, o.ProgramID.Bytes()...)
 	buf = append(buf, o.Market.Bytes()...)
 	buf = append(buf, o.User.Bytes()...)
 	buf = append(buf, u64le(o.Nonce)...)
-	buf = append(buf, byte(o.Side))
-	buf = append(buf, byte(o.Outcome))
-	buf = append(buf, byte(o.OrderType))
-	buf = append(buf, u64le(o.LimitPrice)...)
+	buf = append(buf, o.Flags())
+	buf = append(buf, o.LimitPrice)
 	buf = append(buf, u64le(o.TotalAmount)...)
-	buf = append(buf, u64le(uint64(o.ExpiryTs))...)
+	buf = append(buf, u32le(o.ExpiryTs)...)
 	return buf
 }
 
@@ -70,8 +67,6 @@ func ParseOrderIntentV1(data []byte) (OrderIntentV1, error) {
 	}
 	var intent OrderIntentV1
 	offset := 0
-	intent.Version = data[offset]
-	offset++
 	intent.ProgramID = solana.PublicKeyFromBytes(data[offset : offset+32])
 	offset += 32
 	intent.Market = solana.PublicKeyFromBytes(data[offset : offset+32])
@@ -80,28 +75,31 @@ func ParseOrderIntentV1(data []byte) (OrderIntentV1, error) {
 	offset += 32
 	intent.Nonce = leu64(data[offset : offset+8])
 	offset += 8
-	intent.Side = Side(data[offset])
+	flags := data[offset]
+	if flags&^orderFlagsMask != 0 {
+		return OrderIntentV1{}, fmt.Errorf("invalid intent flags: %d", flags)
+	}
 	offset++
-	intent.Outcome = Outcome(data[offset])
+	intent.Side = sideFromFlags(flags)
+	intent.Outcome = outcomeFromFlags(flags)
+	intent.OrderType = orderTypeFromFlags(flags)
+	intent.LimitPrice = data[offset]
 	offset++
-	intent.OrderType = OrderType(data[offset])
-	offset++
-	intent.LimitPrice = leu64(data[offset : offset+8])
-	offset += 8
 	intent.TotalAmount = leu64(data[offset : offset+8])
 	offset += 8
-	intent.ExpiryTs = int64(leu64(data[offset : offset+8]))
+	intent.ExpiryTs = leu32(data[offset : offset+4])
 	return intent, nil
 }
 
 func (o OrderIntentV1) Hash() []byte {
 	h := sha3.NewLegacyKeccak256()
+	_, _ = h.Write([]byte(OrderIntentDomain))
 	_, _ = h.Write(o.Serialize())
 	return h.Sum(nil)
 }
 
 func (o OrderIntentV1) SignableMessage() []byte {
-	return []byte(hex.EncodeToString(o.Hash()))
+	return []byte("bp1:" + base64.RawURLEncoding.EncodeToString(o.Hash()))
 }
 
 func OrderIntentFromHex(raw string) (OrderIntentV1, error) {
@@ -116,6 +114,10 @@ func u64le(v uint64) []byte {
 	return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24), byte(v >> 32), byte(v >> 40), byte(v >> 48), byte(v >> 56)}
 }
 
+func u32le(v uint32) []byte {
+	return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}
+}
+
 func leu64(b []byte) uint64 {
 	return uint64(b[0]) |
 		uint64(b[1])<<8 |
@@ -125,4 +127,46 @@ func leu64(b []byte) uint64 {
 		uint64(b[5])<<40 |
 		uint64(b[6])<<48 |
 		uint64(b[7])<<56
+}
+
+func leu32(b []byte) uint32 {
+	return uint32(b[0]) |
+		uint32(b[1])<<8 |
+		uint32(b[2])<<16 |
+		uint32(b[3])<<24
+}
+
+func (o OrderIntentV1) Flags() uint8 {
+	var flags uint8
+	if o.Side == SideSell {
+		flags |= 1 << 0
+	}
+	if o.Outcome == OutcomeNo {
+		flags |= 1 << 1
+	}
+	if o.OrderType == OrderTypeMarket {
+		flags |= 1 << 2
+	}
+	return flags
+}
+
+func sideFromFlags(flags uint8) Side {
+	if flags&(1<<0) != 0 {
+		return SideSell
+	}
+	return SideBuy
+}
+
+func outcomeFromFlags(flags uint8) Outcome {
+	if flags&(1<<1) != 0 {
+		return OutcomeNo
+	}
+	return OutcomeYes
+}
+
+func orderTypeFromFlags(flags uint8) OrderType {
+	if flags&(1<<2) != 0 {
+		return OrderTypeMarket
+	}
+	return OrderTypeLimit
 }

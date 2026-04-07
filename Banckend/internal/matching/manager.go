@@ -6,13 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"blinkpredict/banckend/internal/bus/natsjs"
 	"blinkpredict/banckend/internal/logging"
 	"blinkpredict/banckend/internal/protocol"
+	internalsolana "blinkpredict/banckend/internal/solana"
 
+	"github.com/gagliardetto/solana-go"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
@@ -22,22 +26,32 @@ var logger = logging.New("matcher")
 const (
 	matcherReservedConsumer            = "matcher-reserved"
 	matcherSettlementConfirmedConsumer = "matcher-settlement-confirmed"
+	defaultMatcherCheckpointInterval   = 100 * time.Millisecond
 )
 
 type ManagerConfig struct {
-	Batch BatchConfig
+	Batch                BatchConfig
+	CheckpointInterval   time.Duration
+	ProgramID            solana.PublicKey
+	SettlementTxMaxBytes int
+	AddressTables        map[solana.PublicKey]solana.PublicKeySlice
 }
 
 // MarketManager 负责监听路由和管理所有市场Actor
 type MarketManager struct {
-	client           *natsjs.Client
-	pool             *pgxpool.Pool
-	batchConfig      BatchConfig
-	positionRegistry *UserPositionRegistry
-	positionRepo     *UserPositionAccountRepo
-	mu               sync.RWMutex
-	actors           map[uint64]*MarketActor
-	checkpoints      map[uint64]uint64
+	client               *natsjs.Client
+	pool                 *pgxpool.Pool
+	batchConfig          BatchConfig
+	checkpointInterval   time.Duration
+	positionRegistry     *UserPositionRegistry
+	positionRepo         *UserPositionAccountRepo
+	orderRegistry        *OrderStateRegistry
+	orderRepo            *OrderStateAccountRepo
+	txEstimator          *internalsolana.SettlementTxEstimator
+	maxSettlementTxBytes int
+	mu                   sync.RWMutex
+	actors               map[uint64]*MarketActor
+	checkpoints          map[uint64]uint64
 }
 
 // NewMarketManager 创建市场管理器
@@ -46,14 +60,27 @@ func NewMarketManager(client *natsjs.Client, pool *pgxpool.Pool, cfg ManagerConf
 	if batchCfg == (BatchConfig{}) {
 		batchCfg = DefaultBatchConfig()
 	}
+	checkpointInterval := cfg.CheckpointInterval
+	if checkpointInterval <= 0 {
+		checkpointInterval = defaultMatcherCheckpointInterval
+	}
+	maxSettlementTxBytes := cfg.SettlementTxMaxBytes
+	if maxSettlementTxBytes <= 0 {
+		maxSettlementTxBytes = internalsolana.DefaultSettlementMaxTxBytes
+	}
 	return &MarketManager{
-		client:           client,
-		pool:             pool,
-		batchConfig:      batchCfg,
-		positionRegistry: NewUserPositionRegistry(),
-		positionRepo:     NewUserPositionAccountRepo(pool),
-		actors:           make(map[uint64]*MarketActor),
-		checkpoints:      make(map[uint64]uint64),
+		client:               client,
+		pool:                 pool,
+		batchConfig:          batchCfg,
+		checkpointInterval:   checkpointInterval,
+		positionRegistry:     NewUserPositionRegistry(),
+		positionRepo:         NewUserPositionAccountRepo(pool),
+		orderRegistry:        NewOrderStateRegistry(),
+		orderRepo:            NewOrderStateAccountRepo(pool),
+		txEstimator:          internalsolana.NewSettlementTxEstimator(cfg.ProgramID, cfg.AddressTables),
+		maxSettlementTxBytes: maxSettlementTxBytes,
+		actors:               make(map[uint64]*MarketActor),
+		checkpoints:          make(map[uint64]uint64),
 	}
 }
 
@@ -70,6 +97,7 @@ func (m *MarketManager) Start(ctx context.Context, tickInterval time.Duration) e
 	if err := m.StartConsumer(ctx); err != nil {
 		return err
 	}
+	m.StartCheckpointLoop(ctx)
 	m.StartTickLoop(ctx, tickInterval)
 	return nil
 }
@@ -165,6 +193,9 @@ func (m *MarketManager) StartConsumer(ctx context.Context) error {
 					wrapper.SourceCmdSeq = meta.Sequence.Stream
 				}
 				cmd, _ := wrapper.Cmd.(*PlaceOrderCommand)
+				if cmd != nil {
+					cmd.SourceCmdSeq = wrapper.SourceCmdSeq
+				}
 				actor := m.GetOrCreateMarket(wrapper.Cmd.GetMarketID(), cmd.MarketPDA)
 				select {
 				case actor.CmdChan <- wrapper:
@@ -245,41 +276,88 @@ func (m *MarketManager) flushActorBatch(actor *MarketActor, now time.Time) error
 	if actor.Pending == nil || !actor.Pending.shouldFlush(now, m.batchConfig, m.maxFillsForBatch(actor.Pending), true) {
 		return nil
 	}
+	if estimate, err := m.estimatePendingTxBytes(actor.Pending); err == nil && m.maxSettlementTxBytes > 0 && estimate.TransactionBytes > m.maxSettlementTxBytes {
+		logger.Warnf("matcher batch estimated settlement tx bytes over limit market=%d bytes=%d limit=%d orders=%d cold_orders=%d fills=%d versioned=%t lookups=%d",
+			actor.MarketID, estimate.TransactionBytes, m.maxSettlementTxBytes, len(actor.Pending.event.Orders), m.countColdOrders(actor.Pending), len(actor.Pending.event.Fills), estimate.Versioned, estimate.LookupAccounts)
+	}
 	event := actor.Pending.freeze(now)
 	evtSeq, err := m.publishMatcherOutputs(event)
 	if err != nil {
 		logger.Warnf("failed to publish matcher outputs market=%d: %v", actor.MarketID, err)
 		return err
 	}
+	if event.SourceCmdSeqMax > actor.Book.LastProcessedSeq {
+		actor.Book.LastProcessedSeq = event.SourceCmdSeqMax
+	}
 	if event.SourceCmdSeqMax > 0 {
-		if err := m.saveCheckpoint(context.Background(), actor.MarketID, evtSeq, event.SourceCmdSeqMax); err != nil {
-			logger.Warnf("failed to persist matcher checkpoint market=%d source_cmd_seq=%d: %v", actor.MarketID, event.SourceCmdSeqMax, err)
-			return err
+		if m.pool == nil {
+			m.setCheckpoint(actor.MarketID, event.SourceCmdSeqMax)
+			ackCommandWrappers(actor.Pending.wrappers)
+		} else {
+			actor.stageCheckpoint(evtSeq, event.SourceCmdSeqMax, actor.Pending.wrappers)
 		}
+	} else {
+		ackCommandWrappers(actor.Pending.wrappers)
 	}
-	for _, wrapper := range actor.Pending.wrappers {
-		if wrapper.SourceCmdSeq > actor.Book.LastProcessedSeq {
-			actor.Book.LastProcessedSeq = wrapper.SourceCmdSeq
-		}
-		if wrapper.Msg != nil {
-			_ = wrapper.Msg.Ack()
-		}
-	}
-	m.setCheckpoint(actor.MarketID, actor.Book.LastProcessedSeq)
 	actor.Pending = newPendingBatch(actor.MarketID, actor.MarketPDA, now)
 	return nil
+}
+
+func (m *MarketManager) settlementTxShape(batch *pendingBatch) (internalsolana.SettlementTxShape, bool) {
+	uniqueWallets := make(map[string]struct{}, len(batch.event.Orders))
+	coldOrders := 0
+	for _, order := range batch.event.Orders {
+		wallet := strings.TrimSpace(order.Execution.WalletAddress)
+		if wallet != "" {
+			uniqueWallets[wallet] = struct{}{}
+		}
+		if wallet == "" || order.Execution.Nonce == 0 || m.orderRegistry == nil || !m.orderRegistry.Has(batch.event.MarketID, wallet, order.Execution.Nonce) {
+			coldOrders++
+		}
+	}
+	return internalsolana.SettlementTxShape{
+		UniqueUsers: len(uniqueWallets),
+		Orders:      len(batch.event.Orders),
+		ColdOrders:  coldOrders,
+		Fills:       0,
+	}, coldOrders > 0
+}
+
+func (m *MarketManager) countColdOrders(batch *pendingBatch) int {
+	shape, _ := m.settlementTxShape(batch)
+	return shape.ColdOrders
+}
+
+func (m *MarketManager) estimatePendingTxBytes(batch *pendingBatch) (internalsolana.SettlementTxEstimate, error) {
+	if m == nil || m.txEstimator == nil || batch == nil {
+		return internalsolana.SettlementTxEstimate{}, nil
+	}
+	shape, _ := m.settlementTxShape(batch)
+	shape.Fills = len(batch.event.Fills)
+	return m.txEstimator.Estimate(shape)
 }
 
 func (m *MarketManager) maxFillsForBatch(batch *pendingBatch) int {
 	if batch == nil {
 		return m.batchConfig.MaxFillsHot
 	}
-	if batch.requiresColdLimit(m.positionRegistry) {
-		if m.batchConfig.MaxFillsCold > 0 {
-			return m.batchConfig.MaxFillsCold
-		}
+	shape, hasColdOrder := m.settlementTxShape(batch)
+	hasColdPosition := batch.requiresColdLimit(m.positionRegistry)
+	ceiling := m.batchConfig.MaxFillsHot
+	if (hasColdOrder || hasColdPosition) && m.batchConfig.MaxFillsCold > 0 {
+		ceiling = m.batchConfig.MaxFillsCold
 	}
-	return m.batchConfig.MaxFillsHot
+	if ceiling <= 0 {
+		ceiling = m.batchConfig.MaxFillsHot
+	}
+	if m.txEstimator == nil || m.maxSettlementTxBytes <= 0 {
+		return ceiling
+	}
+	allowed, _, err := m.txEstimator.MaxFillsWithinLimit(shape, m.maxSettlementTxBytes, ceiling)
+	if err != nil || allowed <= 0 {
+		return ceiling
+	}
+	return allowed
 }
 
 func (m *MarketManager) publishMatcherOutputs(event MatchBatchEvent) (uint64, error) {
@@ -364,6 +442,9 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 	if err := m.loadUserPositionRegistry(ctx); err != nil {
 		return err
 	}
+	if err := m.loadOrderStateRegistry(ctx); err != nil {
+		return err
+	}
 	if err := m.loadCheckpoints(ctx); err != nil {
 		return err
 	}
@@ -385,6 +466,7 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
             o.intent_hex,
             o.nonce,
             o.created_cmd_seq,
+            EXTRACT(EPOCH FROM o.created_at)::BIGINT AS created_at,
             COALESCE(mk.market_pda, ''),
             EXTRACT(EPOCH FROM mk.close_time)::BIGINT AS close_time
         FROM orders o
@@ -417,13 +499,14 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 			intentHex         string
 			nonce             int64
 			createdCmdSeq     int64
+			createdAt         int64
 			marketPDA         string
 			closeTime         int64
 		)
 		if err := rows.Scan(
 			&orderID, &marketIDStr, &walletAddress, &originalAction, &originalOutcome, &originalPriceTick,
 			&side, &orderType, &priceTick, &remainingSpend, &remainingQty, &expireTime, &signature,
-			&intentHex, &nonce, &createdCmdSeq, &marketPDA, &closeTime,
+			&intentHex, &nonce, &createdCmdSeq, &createdAt, &marketPDA, &closeTime,
 		); err != nil {
 			return err
 		}
@@ -450,9 +533,11 @@ func (m *MarketManager) RecoverFromStore(ctx context.Context) error {
 		order.RemainingSpend = uint64(remainingSpend)
 		order.RemainingQty = uint64(remainingQty)
 		order.ExpireTime = expireTime
+		order.Timestamp = createdAt
 		order.Signature = signature
 		order.IntentBytesHex = intentHex
 		order.Nonce = uint64(nonce)
+		order.CreatedCmdSeq = uint64(createdCmdSeq)
 		actor.Book.RestoreOrder(order)
 		if createdCmdSeq > 0 && uint64(createdCmdSeq) > actor.Book.LastProcessedSeq {
 			actor.Book.LastProcessedSeq = uint64(createdCmdSeq)
@@ -477,6 +562,19 @@ func (m *MarketManager) loadUserPositionRegistry(ctx context.Context) error {
 	}
 	m.positionRegistry.Load(keys)
 	logger.Infof("matcher loaded user position registry entries=%d", m.positionRegistry.Size())
+	return nil
+}
+
+func (m *MarketManager) loadOrderStateRegistry(ctx context.Context) error {
+	if m.orderRepo == nil || m.orderRegistry == nil {
+		return nil
+	}
+	keys, err := m.orderRepo.LoadAll(ctx)
+	if err != nil {
+		return fmt.Errorf("matcher load order state registry: %w", err)
+	}
+	m.orderRegistry.Load(keys)
+	logger.Infof("matcher loaded order state registry entries=%d", m.orderRegistry.Size())
 	return nil
 }
 
@@ -599,6 +697,28 @@ func (m *MarketManager) handleSettlementConfirmed(msg *nats.Msg) {
 	_ = msg.Ack()
 }
 
+func (m *MarketManager) ObserveProcessedSettlement(marketID uint64, wallets []string, matchEventJSON []byte) {
+	for _, wallet := range wallets {
+		m.positionRegistry.MarkExists(marketID, wallet)
+	}
+	if len(matchEventJSON) == 0 || m.orderRegistry == nil {
+		return
+	}
+	var event MatchBatchEvent
+	if err := json.Unmarshal(matchEventJSON, &event); err != nil {
+		logger.Warnf("matcher observe processed settlement decode failed market=%d err=%v", marketID, err)
+		return
+	}
+	for _, order := range event.Orders {
+		wallet := strings.TrimSpace(order.Execution.WalletAddress)
+		nonce := order.Execution.Nonce
+		if wallet == "" || nonce == 0 {
+			continue
+		}
+		m.orderRegistry.MarkExists(marketID, wallet, nonce)
+	}
+}
+
 func (m *MarketManager) StartTickLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Second
@@ -624,6 +744,131 @@ func (m *MarketManager) StartTickLoop(ctx context.Context, interval time.Duratio
 			}
 		}
 	}()
+}
+
+func (m *MarketManager) StartCheckpointLoop(ctx context.Context) {
+	if m == nil || m.pool == nil {
+		return
+	}
+	interval := m.checkpointInterval
+	if interval <= 0 {
+		interval = defaultMatcherCheckpointInterval
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushCtx, cancel := context.WithTimeout(context.Background(), checkpointFlushTimeout(interval))
+				err := m.flushCheckpointBatch(flushCtx)
+				cancel()
+				if err != nil {
+					logger.Warnf("matcher checkpoint batch flush failed: %v", err)
+				}
+			case <-ctx.Done():
+				flushCtx, cancel := context.WithTimeout(context.Background(), checkpointFlushTimeout(interval))
+				err := m.flushCheckpointBatch(flushCtx)
+				cancel()
+				if err != nil {
+					logger.Warnf("matcher final checkpoint flush failed: %v", err)
+				}
+				return
+			}
+		}
+	}()
+}
+
+type matcherCheckpointTarget struct {
+	actor        *MarketActor
+	marketID     uint64
+	evtSeq       uint64
+	sourceCmdSeq uint64
+}
+
+func (m *MarketManager) flushCheckpointBatch(ctx context.Context) error {
+	if m == nil || m.pool == nil {
+		return nil
+	}
+	targets := m.collectCheckpointTargets()
+	if len(targets) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	queued := make([]matcherCheckpointTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.sourceCmdSeq == 0 {
+			continue
+		}
+		evtSeqInt, err := toSafeInt64(target.evtSeq)
+		if err != nil {
+			return fmt.Errorf("matcher checkpoint evt seq market=%d: %w", target.marketID, err)
+		}
+		sourceSeqInt, err := toSafeInt64(target.sourceCmdSeq)
+		if err != nil {
+			return fmt.Errorf("matcher checkpoint source seq market=%d: %w", target.marketID, err)
+		}
+		batch.Queue(`
+			INSERT INTO consumer_cursors (consumer_name, market_id, last_evt_seq, last_source_cmd_seq, updated_at)
+			VALUES ($1, $2::NUMERIC(20,0), $3, $4, NOW())
+			ON CONFLICT (consumer_name, market_id) DO UPDATE SET
+				last_evt_seq = GREATEST(consumer_cursors.last_evt_seq, EXCLUDED.last_evt_seq),
+				last_source_cmd_seq = GREATEST(consumer_cursors.last_source_cmd_seq, EXCLUDED.last_source_cmd_seq),
+				updated_at = NOW()
+		`, matcherReservedConsumer, strconv.FormatUint(target.marketID, 10), evtSeqInt, sourceSeqInt)
+		queued = append(queued, target)
+	}
+	if len(queued) == 0 {
+		return nil
+	}
+
+	results := m.pool.SendBatch(ctx, batch)
+	flushed := make([]matcherCheckpointTarget, 0, len(queued))
+	var flushErr error
+	for _, target := range queued {
+		if _, err := results.Exec(); err != nil {
+			flushErr = fmt.Errorf("matcher checkpoint flush market=%d source_cmd_seq=%d: %w", target.marketID, target.sourceCmdSeq, err)
+			break
+		}
+		flushed = append(flushed, target)
+	}
+	if err := results.Close(); err != nil && flushErr == nil {
+		flushErr = fmt.Errorf("matcher checkpoint batch close: %w", err)
+	}
+	for _, target := range flushed {
+		m.setCheckpoint(target.marketID, target.sourceCmdSeq)
+		ackCommandWrappers(target.actor.completeCheckpoint(matcherCheckpointSnapshot{
+			evtSeq:       target.evtSeq,
+			sourceCmdSeq: target.sourceCmdSeq,
+		}))
+	}
+	return flushErr
+}
+
+func (m *MarketManager) collectCheckpointTargets() []matcherCheckpointTarget {
+	actors := m.listActors()
+	targets := make([]matcherCheckpointTarget, 0, len(actors))
+	for _, actor := range actors {
+		snapshot, ok := actor.checkpointSnapshot()
+		if !ok {
+			continue
+		}
+		targets = append(targets, matcherCheckpointTarget{
+			actor:        actor,
+			marketID:     actor.MarketID,
+			evtSeq:       snapshot.evtSeq,
+			sourceCmdSeq: snapshot.sourceCmdSeq,
+		})
+	}
+	return targets
+}
+
+func checkpointFlushTimeout(interval time.Duration) time.Duration {
+	timeout := interval * 4
+	if timeout < time.Second {
+		return time.Second
+	}
+	return timeout
 }
 
 // publishOrderReleasedEvents publishes an evt.order.released.{market_id} event for
@@ -682,4 +927,13 @@ func toSafeInt64(v uint64) (int64, error) {
 		return 0, fmt.Errorf("value %d overflows int64", v)
 	}
 	return int64(v), nil
+}
+
+func ackCommandWrappers(wrappers []*CommandWrapper) {
+	for _, wrapper := range wrappers {
+		if wrapper == nil || wrapper.Msg == nil {
+			continue
+		}
+		_ = wrapper.Msg.Ack()
+	}
 }

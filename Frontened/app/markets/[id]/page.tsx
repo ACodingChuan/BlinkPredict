@@ -20,7 +20,7 @@ type ExpiryPreset = "1h" | "6h" | "23h" | "3d" | "7d";
 export default function MarketDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { user, login, getAccessToken } = usePrivy();
-  const { balance } = useUSDCBalance();
+  const { balance, syncAfterMutation } = useUSDCBalance();
   const { placeOrder, loading: tradeLoading } = useTrading();
   const marketFeed = useMarketPublicFeed(id);
 
@@ -91,6 +91,22 @@ export default function MarketDetailPage() {
 
   if (loading) return <div className="mx-auto max-w-6xl px-4 py-10">Loading market...</div>;
   if (!market) return <div className="mx-auto max-w-6xl px-4 py-10">Market not found.</div>;
+
+  const handlePlaceOrder = async () => {
+    const accepted = await placeOrder({
+      market,
+      action,
+      outcome,
+      orderType,
+      amount: tradeInput,
+      limitPrice,
+      expireTime: orderType === "limit" ? expiryRFC3339(expiryPreset) : undefined,
+      onAccepted: (payload) => setLastOrderID(payload.order_id),
+    });
+    if (accepted) {
+      await syncAfterMutation();
+    }
+  };
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -312,18 +328,9 @@ export default function MarketDetailPage() {
                     action === "buy" ? "bg-emerald-500 hover:bg-emerald-400" : "bg-rose-500 hover:bg-rose-400"
                   } disabled:opacity-50`}
                   disabled={tradeLoading || !tradeInput}
-                  onClick={() =>
-                    placeOrder({
-                      market,
-                      action,
-                      outcome,
-                      orderType,
-                      amount: tradeInput,
-                      limitPrice,
-                      expireTime: orderType === "limit" ? expiryRFC3339(expiryPreset) : undefined,
-                      onAccepted: (payload) => setLastOrderID(payload.order_id),
-                    })
-                  }
+                  onClick={() => {
+                    void handlePlaceOrder();
+                  }}
                 >
                   {tradeLoading ? "Submitting..." : `${action === "buy" ? "Buy" : "Sell"} ${outcome.toUpperCase()}`}
                 </button>

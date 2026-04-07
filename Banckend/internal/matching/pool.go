@@ -26,6 +26,7 @@ type MemoryOrder struct {
 	RemainingSpend    uint64
 	ExpireTime        int64
 	Timestamp         int64
+	CreatedCmdSeq     uint64
 	Signature         string
 	IntentBytesHex    string
 	Nonce             uint64 // 防碰撞nonce
@@ -60,6 +61,7 @@ func (o *MemoryOrder) InitFromCmd(cmd *PlaceOrderCommand) {
 	o.RemainingSpend = cmd.SpendAmount
 	o.ExpireTime = cmd.ExpireTime
 	o.Timestamp = cmd.Timestamp
+	o.CreatedCmdSeq = cmd.SourceCmdSeq
 	o.Signature = cmd.Signature
 	o.IntentBytesHex = cmd.IntentBytesHex
 	o.Nonce = cmd.Nonce

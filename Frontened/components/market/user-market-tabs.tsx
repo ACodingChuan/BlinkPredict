@@ -78,7 +78,7 @@ export const UserMarketTabs = ({
         <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Your Open Orders</h3>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Cancel sends `cmd.order.cancel.v1` to NATS through gateway. UI refresh is pure HTTP polling.</p>
         <div className="mt-4">
-          <UserOpenOrders marketId={marketId} refreshKey={refreshKey} />
+          <UserOpenOrders key={marketId} marketId={marketId} refreshKey={refreshKey} />
         </div>
       </div>
       <div>

@@ -133,3 +133,74 @@ func TestUpdateRedisReadModelsAppendsTradePayloadShape(t *testing.T) {
 		t.Fatalf("unexpected trade payload: %+v", trade)
 	}
 }
+
+func TestBatchPayloadFromMarketDeltaPreservesPerOrderCreationMetadata(t *testing.T) {
+	event := matching.MatchBatchEvent{
+		MarketID:        2002,
+		ProducedAt:      1_700_000_100,
+		SourceCmdSeqMin: 10,
+		SourceCmdSeqMax: 30,
+		Orders: []matching.MatchedOrder{
+			{
+				OrderIndex:    0,
+				OrderID:       101,
+				CreatedAt:     1_700_000_001,
+				CreatedCmdSeq: 11,
+				Execution: matching.ExecutionSnapshot{
+					WalletAddress:       "maker",
+					OriginalAction:      "sell",
+					OriginalOutcome:     "no",
+					OriginalPriceTick:   58,
+					OrderType:           "limit",
+					NormalizedSide:      "sell",
+					NormalizedPriceTick: 58,
+					QtyLots:             400,
+					Nonce:               1,
+				},
+			},
+			{
+				OrderIndex:    1,
+				OrderID:       202,
+				CreatedAt:     1_700_000_002,
+				CreatedCmdSeq: 29,
+				Execution: matching.ExecutionSnapshot{
+					WalletAddress:       "taker",
+					OriginalAction:      "buy",
+					OriginalOutcome:     "yes",
+					OriginalPriceTick:   59,
+					OrderType:           "limit",
+					NormalizedSide:      "buy",
+					NormalizedPriceTick: 59,
+					QtyLots:             500,
+					Nonce:               2,
+				},
+			},
+		},
+		OrderUpdates: []matching.OrderUpdate{
+			{OrderIndex: 1, Status: "partially_filled", RemainingQtyLots: 300},
+		},
+	}
+
+	batch := batchPayloadFromMarketDelta(event)
+	if len(batch.SourceOrders) != 2 {
+		t.Fatalf("expected 2 source orders, got %d", len(batch.SourceOrders))
+	}
+	if batch.SourceOrders[0].CreatedCmdSeq != 11 || batch.SourceOrders[1].CreatedCmdSeq != 29 {
+		t.Fatalf("unexpected created cmd seqs: %+v", batch.SourceOrders)
+	}
+	if batch.SourceOrders[0].CreatedAt != 1_700_000_001 || batch.SourceOrders[1].CreatedAt != 1_700_000_002 {
+		t.Fatalf("unexpected created timestamps: %+v", batch.SourceOrders)
+	}
+
+	pushes := buildPushMessages(&batch)
+	if len(pushes.userOrders) != 1 {
+		t.Fatalf("expected 1 user order push, got %d", len(pushes.userOrders))
+	}
+	push := pushes.userOrders[0]
+	if push.WalletAddress != "taker" {
+		t.Fatalf("unexpected wallet: %+v", push)
+	}
+	if push.Order.Side != "buy" || push.Order.Outcome != "yes" || push.Order.Price != "59" {
+		t.Fatalf("user order push used wrong source order metadata: %+v", push)
+	}
+}

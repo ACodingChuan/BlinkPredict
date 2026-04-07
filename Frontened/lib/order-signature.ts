@@ -4,9 +4,12 @@ import BN from "bn.js";
 import { PublicKey } from "@solana/web3.js";
 
 export const ORDER_INTENT_VERSION = 1;
+export const ORDER_INTENT_DOMAIN = "predix-order";
+export const ORDER_SIGNATURE_PREFIX = "bp1:";
+export const ORDER_INTENT_SIZE = 118;
 
 export interface OrderIntentFields {
-  version: number;           // u8
+  version: number;
   programId: Uint8Array;     // [u8; 32]
   market: Uint8Array;        // [u8; 32]
   user: Uint8Array;          // [u8; 32]
@@ -14,18 +17,38 @@ export interface OrderIntentFields {
   side: number;              // u8: 0=Buy, 1=Sell
   outcome: number;           // u8: 0=Yes, 1=No
   orderType: number;         // u8: 0=Limit, 1=Market
-  limitPrice: BN;            // u64 (price tick: 1..99, cents/share)
+  limitPrice: number;        // u8 (price tick: 1..99)
   totalAmount: BN;           // u64 (share lots or spend cents, both scaled by 100)
-  expiryTs: BN;              // i64
+  expiryTs: number;          // u32
 }
 
-// 固定长度 132 bytes
-export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
-  const buffer = new Uint8Array(132);
-  let offset = 0;
+function orderFlags(intent: Pick<OrderIntentFields, "side" | "outcome" | "orderType">): number {
+  let flags = 0;
+  if (intent.side === 1) flags |= 1 << 0;
+  if (intent.outcome === 1) flags |= 1 << 1;
+  if (intent.orderType === 1) flags |= 1 << 2;
+  return flags;
+}
 
-  buffer[offset] = intent.version;
-  offset += 1;
+function toU32LE(value: number): Uint8Array {
+  const out = new Uint8Array(4);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, value, true);
+  return out;
+}
+
+function toBase64UrlNoPad(bytes: Uint8Array): string {
+  return Buffer.from(bytes)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+// Fixed length 118 bytes, matching backend/contract OrderIntentV1.
+export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
+  const buffer = new Uint8Array(ORDER_INTENT_SIZE);
+  let offset = 0;
 
   buffer.set(intent.programId, offset);
   offset += 32;
@@ -39,32 +62,29 @@ export function serializeOrderIntent(intent: OrderIntentFields): Uint8Array {
   buffer.set(intent.nonce.toArray("le", 8), offset);
   offset += 8;
 
-  buffer[offset] = intent.side;
+  buffer[offset] = orderFlags(intent);
   offset += 1;
 
-  buffer[offset] = intent.outcome;
+  buffer[offset] = intent.limitPrice;
   offset += 1;
-
-  buffer[offset] = intent.orderType;
-  offset += 1;
-
-  buffer.set(intent.limitPrice.toArray("le", 8), offset);
-  offset += 8;
 
   buffer.set(intent.totalAmount.toArray("le", 8), offset);
   offset += 8;
 
-  buffer.set(intent.expiryTs.toArray("le", 8), offset);
+  buffer.set(toU32LE(intent.expiryTs), offset);
   return buffer;
 }
 
 export function hashOrderIntent(intentBytes: Uint8Array): Uint8Array {
-  return new Uint8Array(keccak_256(intentBytes));
+  const domainBytes = new TextEncoder().encode(ORDER_INTENT_DOMAIN);
+  const payload = new Uint8Array(domainBytes.length + intentBytes.length);
+  payload.set(domainBytes, 0);
+  payload.set(intentBytes, domainBytes.length);
+  return new Uint8Array(keccak_256(payload));
 }
 
 export function buildOrderSignatureMessage(messageHash: Uint8Array): Uint8Array {
-  const hexHash = Array.from(messageHash, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return new TextEncoder().encode(hexHash);
+  return new TextEncoder().encode(`${ORDER_SIGNATURE_PREFIX}${toBase64UrlNoPad(messageHash)}`);
 }
 
 // 42 位毫秒时间戳 + 22 位随机数
@@ -107,14 +127,14 @@ export function buildOrderIntent(params: BuildOrderIntentParams): {
     side: params.side === "buy" ? 0 : 1,
     outcome: params.outcome === "yes" ? 0 : 1,
     orderType: params.orderType === "limit" ? 0 : 1,
-    limitPrice: new BN(params.limitPrice),
+    limitPrice: params.limitPrice,
     totalAmount: new BN(params.totalAmount),
-    expiryTs: new BN(params.expiryTs),
+    expiryTs: params.expiryTs,
   };
 
   const intentBytes = serializeOrderIntent(intent);
   const messageHash = hashOrderIntent(intentBytes);
-  const signableMessage = new TextEncoder().encode(Buffer.from(messageHash).toString("hex"));
+  const signableMessage = buildOrderSignatureMessage(messageHash);
   return { intent, intentBytes, messageHash, signableMessage };
 }
 

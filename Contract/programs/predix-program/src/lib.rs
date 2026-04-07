@@ -254,10 +254,11 @@ pub mod predix_program {
         );
         require!(now < ctx.accounts.market.close_ts, ErrorCode::MarketExpired);
 
-        let unique_users = collect_unique_users(&args.orders)?;
-        let unique_user_count = unique_users.len();
+        let user_count = args.user_count as usize;
         let order_count = args.orders.len();
-        let expected_accounts = unique_user_count
+        require!(user_count > 0, ErrorCode::InvalidRemainingAccountsLayout);
+        require!(order_count > 0, ErrorCode::InvalidOrder);
+        let expected_accounts = user_count
             .checked_mul(2)
             .and_then(|v| v.checked_add(order_count))
             .ok_or(ErrorCode::MathOverflow)?;
@@ -267,30 +268,22 @@ pub mod predix_program {
         );
 
         for order in &args.orders {
-            require!(order.version == 1, ErrorCode::InvalidOrder);
-            require_keys_eq!(order.program_id, crate::ID, ErrorCode::InvalidOrder);
-            require_keys_eq!(
-                order.market,
-                ctx.accounts.market.key(),
-                ErrorCode::InvalidMarket
-            );
-            require!(order.total_amount > 0, ErrorCode::InvalidAmount);
             require!(
-                order.limit_price > 0 && order.limit_price < 100,
-                ErrorCode::InvalidAmount
+                (order.user_idx as usize) < user_count,
+                ErrorCode::InvalidRemainingAccountsLayout
             );
-            require!(order.expiry_ts >= now, ErrorCode::OrderExpired);
-            require!(
-                minimum_order_notional(order)? >= 100,
-                ErrorCode::InvalidAmount
-            );
+            if order.cold_witness_idx != u8::MAX {
+                require!(
+                    (order.cold_witness_idx as usize) < args.cold_witnesses.len(),
+                    ErrorCode::InvalidOrder
+                );
+            }
         }
 
         let (ledger_accounts, position_accounts, order_state_accounts) =
-            split_remaining_accounts(ctx.remaining_accounts, unique_user_count, order_count)?;
-        validate_user_accounts(
+            split_remaining_accounts(ctx.remaining_accounts, user_count, order_count)?;
+        let users = validate_user_accounts(
             ctx.accounts.market.key(),
-            &unique_users,
             ledger_accounts,
             position_accounts,
         )?;
@@ -315,43 +308,66 @@ pub mod predix_program {
                 fill.fill_price > 0 && fill.fill_price < 100,
                 ErrorCode::InvalidAmount
             );
+            require!(
+                fill.maker_idx != fill.taker_idx,
+                ErrorCode::InvalidMatchBranch
+            );
 
-            let maker = &args.orders[fill.maker_idx as usize];
-            let taker = &args.orders[fill.taker_idx as usize];
-            let maker_user_idx = find_user_index(&unique_users, &maker.user)?;
-            let taker_user_idx = find_user_index(&unique_users, &taker.user)?;
+            let maker_slot = &args.orders[fill.maker_idx as usize];
+            let taker_slot = &args.orders[fill.taker_idx as usize];
+            let maker_user_idx = maker_slot.user_idx as usize;
+            let taker_user_idx = taker_slot.user_idx as usize;
+            let maker_user = users[maker_user_idx];
+            let taker_user = users[taker_user_idx];
 
             let maker_ledger_loader =
                 AccountLoader::<UserLedger>::try_from(&ledger_accounts[maker_user_idx])?;
             let taker_ledger_loader =
                 AccountLoader::<UserLedger>::try_from(&ledger_accounts[taker_user_idx])?;
-            let maker_position_loader =
-                AccountLoader::<UserPosition>::try_from(&position_accounts[maker_user_idx])?;
-            let taker_position_loader =
-                AccountLoader::<UserPosition>::try_from(&position_accounts[taker_user_idx])?;
+            let maker_position_loader = load_or_init_user_position(
+                &ctx.accounts.relayer,
+                &ctx.accounts.system_program,
+                &ctx.accounts.market,
+                maker_user,
+                &position_accounts[maker_user_idx],
+            )?;
+            let taker_position_loader = load_or_init_user_position(
+                &ctx.accounts.relayer,
+                &ctx.accounts.system_program,
+                &ctx.accounts.market,
+                taker_user,
+                &position_accounts[taker_user_idx],
+            )?;
 
             let maker_order_state_loader = load_or_init_order_state(
                 &ctx.accounts.relayer,
                 &ctx.accounts.system_program,
                 &ctx.accounts.market,
+                maker_user,
                 &order_state_accounts[fill.maker_idx as usize],
-                maker,
+                cold_witness_for_slot(maker_slot, &args.cold_witnesses)?,
                 &ctx.accounts.instruction_sysvar,
             )?;
             let taker_order_state_loader = load_or_init_order_state(
                 &ctx.accounts.relayer,
                 &ctx.accounts.system_program,
                 &ctx.accounts.market,
+                taker_user,
                 &order_state_accounts[fill.taker_idx as usize],
-                taker,
+                cold_witness_for_slot(taker_slot, &args.cold_witnesses)?,
                 &ctx.accounts.instruction_sysvar,
             )?;
 
             {
                 let maker_ledger = maker_ledger_loader.load()?;
                 let maker_order_state = maker_order_state_loader.load()?;
+                let maker = order_state_to_intent(
+                    maker_user,
+                    ctx.accounts.market.key(),
+                    &maker_order_state,
+                )?;
                 validate_order_state(
-                    maker,
+                    &maker,
                     &maker_order_state,
                     &maker_ledger,
                     now,
@@ -362,8 +378,13 @@ pub mod predix_program {
             {
                 let taker_ledger = taker_ledger_loader.load()?;
                 let taker_order_state = taker_order_state_loader.load()?;
+                let taker = order_state_to_intent(
+                    taker_user,
+                    ctx.accounts.market.key(),
+                    &taker_order_state,
+                )?;
                 validate_order_state(
-                    taker,
+                    &taker,
                     &taker_order_state,
                     &taker_ledger,
                     now,
@@ -372,12 +393,25 @@ pub mod predix_program {
                 )?;
             }
 
-            let branch = classify_branch(maker, taker)?;
+            let maker_state = maker_order_state_loader.load()?;
+            let taker_state = taker_order_state_loader.load()?;
+            let maker = order_state_to_intent(maker_user, ctx.accounts.market.key(), &maker_state)?;
+            let taker = order_state_to_intent(taker_user, ctx.accounts.market.key(), &taker_state)?;
+            // filled_amount must advance from the pre-fill snapshot. For market buys, using the
+            // post-fill cash remainder can undercount the spend progress for the current fill.
+            let maker_progress =
+                order_progress_delta(&maker, &maker_state, fill.fill_amount, fill.fill_price)?;
+            let taker_progress =
+                order_progress_delta(&taker, &taker_state, fill.fill_amount, fill.fill_price)?;
+            drop(maker_state);
+            drop(taker_state);
+
+            let branch = classify_branch(&maker, &taker)?;
             let trade_result = apply_fill(
                 branch,
                 fill,
-                maker,
-                taker,
+                &maker,
+                &taker,
                 &ctx.accounts.market,
                 &maker_order_state_loader,
                 &taker_order_state_loader,
@@ -388,13 +422,6 @@ pub mod predix_program {
             )?;
 
             {
-                let maker_state = maker_order_state_loader.load()?;
-                let maker_progress = order_progress_delta(
-                    maker,
-                    &maker_state,
-                    fill.fill_amount,
-                    fill.fill_price,
-                )?;
                 let mut maker_order_state = maker_order_state_loader.load_mut()?;
                 maker_order_state.filled_amount = maker_order_state
                     .filled_amount
@@ -402,13 +429,6 @@ pub mod predix_program {
                     .ok_or(ErrorCode::MathOverflow)?;
             }
             {
-                let taker_state = taker_order_state_loader.load()?;
-                let taker_progress = order_progress_delta(
-                    taker,
-                    &taker_state,
-                    fill.fill_amount,
-                    fill.fill_price,
-                )?;
                 let mut taker_order_state = taker_order_state_loader.load_mut()?;
                 taker_order_state.filled_amount = taker_order_state
                     .filled_amount
@@ -423,7 +443,7 @@ pub mod predix_program {
                 .checked_add(trade_result.no_open_interest_delta)
                 .ok_or(ErrorCode::MathOverflow)?;
             market_volume = market_volume
-                .checked_add(fill.fill_amount)
+                .checked_add(fill.fill_amount as u64)
                 .ok_or(ErrorCode::MathOverflow)?;
             creator_fee_delta = creator_fee_delta
                 .checked_add(trade_result.creator_fee)
@@ -437,8 +457,8 @@ pub mod predix_program {
                 branch,
                 maker: maker.user,
                 taker: taker.user,
-                fill_amount: fill.fill_amount,
-                fill_price: fill.fill_price,
+                fill_amount: fill.fill_amount as u64,
+                fill_price: fill.fill_price as u64,
             });
         }
 
@@ -791,16 +811,6 @@ fn is_zero_feed_id(value: &[u8; 32]) -> bool {
     value.iter().all(|item| *item == 0)
 }
 
-fn collect_unique_users(orders: &[OrderIntentV1]) -> Result<Vec<Pubkey>> {
-    let mut users = Vec::with_capacity(orders.len());
-    for order in orders {
-        if !users.iter().any(|existing| existing == &order.user) {
-            users.push(order.user);
-        }
-    }
-    Ok(users)
-}
-
 fn split_remaining_accounts<'info>(
     accounts: &'info [AccountInfo<'info>],
     user_count: usize,
@@ -827,13 +837,6 @@ fn split_remaining_accounts<'info>(
     Ok((ledgers, positions, order_states))
 }
 
-fn find_user_index(users: &[Pubkey], user: &Pubkey) -> Result<usize> {
-    users
-        .iter()
-        .position(|candidate| candidate == user)
-        .ok_or_else(|| error!(ErrorCode::InvalidRemainingAccountsLayout))
-}
-
 fn ledger_unit_multiplier(decimals: u8) -> Result<u64> {
     require!(decimals >= 2, ErrorCode::InvalidCollateralMintDecimals);
     let exponent = decimals - 2;
@@ -846,11 +849,21 @@ fn ledger_unit_multiplier(decimals: u8) -> Result<u64> {
 
 fn validate_user_accounts<'info>(
     market_key: Pubkey,
-    users: &[Pubkey],
     ledgers: &'info [AccountInfo<'info>],
     positions: &'info [AccountInfo<'info>],
-) -> Result<()> {
-    for (idx, user) in users.iter().enumerate() {
+) -> Result<Vec<Pubkey>> {
+    require!(
+        ledgers.len() == positions.len(),
+        ErrorCode::InvalidRemainingAccountsLayout
+    );
+
+    let mut users = Vec::with_capacity(ledgers.len());
+    for idx in 0..ledgers.len() {
+        let ledger = AccountLoader::<UserLedger>::try_from(&ledgers[idx])?;
+        let ledger_data = ledger.load()?;
+        let user = ledger_data.owner;
+        drop(ledger_data);
+
         let ledger_pda =
             Pubkey::find_program_address(&[b"user_ledger", user.as_ref()], &crate::ID).0;
         require_keys_eq!(
@@ -870,44 +883,123 @@ fn validate_user_accounts<'info>(
             ErrorCode::InvalidRemainingAccountsLayout
         );
 
-        let ledger = AccountLoader::<UserLedger>::try_from(&ledgers[idx])?;
-        let ledger_data = ledger.load()?;
-        require_keys_eq!(ledger_data.owner, *user, ErrorCode::InvalidAccountOwner);
-        drop(ledger_data);
-
-        let position = AccountLoader::<UserPosition>::try_from(&positions[idx])?;
-        let position_data = position.load()?;
-        require_keys_eq!(position_data.owner, *user, ErrorCode::InvalidUserPosition);
-        require_keys_eq!(position_data.market, market_key, ErrorCode::InvalidMarket);
+        if positions[idx].owner != &anchor_lang::system_program::ID {
+            let position = AccountLoader::<UserPosition>::try_from(&positions[idx])?;
+            let position_data = position.load()?;
+            require_keys_eq!(position_data.owner, user, ErrorCode::InvalidUserPosition);
+            require_keys_eq!(position_data.market, market_key, ErrorCode::InvalidMarket);
+        }
+        users.push(user);
     }
-    Ok(())
+    Ok(users)
+}
+
+fn load_or_init_user_position<'info>(
+    payer: &Signer<'info>,
+    system_program: &Program<'info, System>,
+    market: &Account<'info, MarketState>,
+    user: Pubkey,
+    position_ai: &'info AccountInfo<'info>,
+) -> Result<anchor_lang::accounts::account_loader::AccountLoader<'info, UserPosition>> {
+    let (expected_pda, bump) = Pubkey::find_program_address(
+        &[b"position", user.as_ref(), market.key().as_ref()],
+        &crate::ID,
+    );
+    require_keys_eq!(
+        expected_pda,
+        *position_ai.key,
+        ErrorCode::InvalidUserPosition
+    );
+
+    if position_ai.owner == &anchor_lang::system_program::ID {
+        let rent = Rent::get()?;
+        let space = 8 + UserPosition::INIT_SPACE;
+        let lamports = rent.minimum_balance(space);
+        let bump_seed = [bump];
+        let market_key = market.key();
+        let seeds: &[&[u8]] = &[b"position", user.as_ref(), market_key.as_ref(), &bump_seed];
+        invoke_signed(
+            &system_instruction::create_account(
+                &payer.key(),
+                position_ai.key,
+                lamports,
+                space as u64,
+                &crate::ID,
+            ),
+            &[
+                payer.to_account_info(),
+                position_ai.clone(),
+                system_program.to_account_info(),
+            ],
+            &[seeds],
+        )?;
+
+        let loader = AccountLoader::<UserPosition>::try_from_unchecked(&crate::ID, position_ai)?;
+        {
+            let mut position = loader.load_init()?;
+            position.owner = user;
+            position.market = market.key();
+            position.yes_shares = 0;
+            position.no_shares = 0;
+            position.claimed_yes_shares = 0;
+            position.claimed_no_shares = 0;
+            position.bump = bump;
+            position._reserved = [0; 7];
+        }
+        loader.exit(&crate::ID)?;
+        return Ok(loader);
+    }
+
+    let loader = AccountLoader::<UserPosition>::try_from(position_ai)?;
+    {
+        let position = loader.load()?;
+        require_keys_eq!(position.owner, user, ErrorCode::InvalidUserPosition);
+        require_keys_eq!(position.market, market.key(), ErrorCode::InvalidMarket);
+    }
+    Ok(loader)
+}
+
+fn cold_witness_for_slot<'a>(
+    slot: &OrderSlot,
+    witnesses: &'a [ColdOrderWitness],
+) -> Result<Option<&'a ColdOrderWitness>> {
+    if slot.cold_witness_idx == u8::MAX {
+        return Ok(None);
+    }
+    witnesses
+        .get(slot.cold_witness_idx as usize)
+        .map(Some)
+        .ok_or_else(|| error!(ErrorCode::InvalidOrder))
 }
 
 fn load_or_init_order_state<'info>(
     payer: &Signer<'info>,
     system_program: &Program<'info, System>,
     market: &Account<'info, MarketState>,
+    user: Pubkey,
     order_state_ai: &'info AccountInfo<'info>,
-    order: &OrderIntentV1,
+    witness: Option<&ColdOrderWitness>,
     instruction_sysvar: &UncheckedAccount<'info>,
 ) -> Result<anchor_lang::accounts::account_loader::AccountLoader<'info, OrderState>> {
-    let (expected_pda, bump) = Pubkey::find_program_address(
-        &[
-            b"order",
-            order.user.as_ref(),
-            market.key().as_ref(),
-            &order.nonce.to_le_bytes(),
-        ],
-        &crate::ID,
-    );
-    require_keys_eq!(
-        expected_pda,
-        *order_state_ai.key,
-        ErrorCode::InvalidOrderState
-    );
-
     if order_state_ai.owner == &anchor_lang::system_program::ID {
-        verify_ed25519_instruction(order, instruction_sysvar)?;
+        let witness = witness.ok_or_else(|| error!(ErrorCode::InvalidOrder))?;
+        let order = order_from_witness(user, market.key(), witness)?;
+        let (expected_pda, bump) = Pubkey::find_program_address(
+            &[
+                b"order",
+                user.as_ref(),
+                market.key().as_ref(),
+                &order.nonce.to_le_bytes(),
+            ],
+            &crate::ID,
+        );
+        require_keys_eq!(
+            expected_pda,
+            *order_state_ai.key,
+            ErrorCode::InvalidOrderState
+        );
+        validate_cold_order(&order, Clock::get()?.unix_timestamp)?;
+        verify_ed25519_instruction(&order, instruction_sysvar)?;
         let rent = Rent::get()?;
         let space = 8 + OrderState::INIT_SPACE;
         let lamports = rent.minimum_balance(space);
@@ -940,24 +1032,42 @@ fn load_or_init_order_state<'info>(
         let loader = AccountLoader::<OrderState>::try_from_unchecked(&crate::ID, order_state_ai)?;
         {
             let mut state = loader.load_init()?;
-            state.owner = order.user;
+            state.owner = user;
             state.nonce = order.nonce;
-            state.order_hash = order_hash(order)?;
             state.total_amount = order.total_amount;
             state.filled_amount = 0;
             state.paid_cash = 0;
-            state.paid_creator_fee = 0;
-            state.paid_platform_fee = 0;
+            state.expiry_ts = order.expiry_ts;
+            state.limit_price = order.limit_price;
+            state.flags = order_flags(order.side, order.outcome, order.order_type, false);
             state.cash_remainder = 0;
-            state.canceled = 0;
             state.bump = bump;
-            state._reserved = [0; 5];
+            state._reserved = [0; 8];
         }
         loader.exit(&crate::ID)?;
         return Ok(loader);
     }
 
-    AccountLoader::<OrderState>::try_from(order_state_ai)
+    let loader = AccountLoader::<OrderState>::try_from(order_state_ai)?;
+    {
+        let state = loader.load()?;
+        let (expected_pda, _) = Pubkey::find_program_address(
+            &[
+                b"order",
+                user.as_ref(),
+                market.key().as_ref(),
+                &state.nonce.to_le_bytes(),
+            ],
+            &crate::ID,
+        );
+        require_keys_eq!(
+            expected_pda,
+            *order_state_ai.key,
+            ErrorCode::InvalidOrderState
+        );
+        require_keys_eq!(state.owner, user, ErrorCode::InvalidOrderState);
+    }
+    Ok(loader)
 }
 
 fn verify_ed25519_instruction(
@@ -1044,8 +1154,8 @@ fn validate_order_state(
     order_state: &OrderState,
     ledger: &UserLedger,
     now: i64,
-    fill_amount: u64,
-    fill_price: u64,
+    fill_amount: u32,
+    fill_price: u8,
 ) -> Result<()> {
     let progress_amount = order_progress_delta(order, order_state, fill_amount, fill_price)?;
     require_keys_eq!(order_state.owner, order.user, ErrorCode::InvalidOrderState);
@@ -1054,8 +1164,8 @@ fn validate_order_state(
         order_state.nonce == order.nonce,
         ErrorCode::InvalidOrderState
     );
-    require!(order_state.canceled == 0, ErrorCode::OrderCanceled);
-    require!(order.expiry_ts >= now, ErrorCode::OrderExpired);
+    require!(!order_state.is_canceled(), ErrorCode::OrderCanceled);
+    require!(i64::from(order.expiry_ts) >= now, ErrorCode::OrderExpired);
     require!(
         extract_order_timestamp_ms(order.nonce)? >= ledger.cancel_all_before_ts,
         ErrorCode::OrderCanceled
@@ -1065,8 +1175,20 @@ fn validate_order_state(
         ErrorCode::InvalidOrderState
     );
     require!(
-        order_state.order_hash == order_hash(order)?,
+        order_state.expiry_ts == order.expiry_ts,
         ErrorCode::InvalidOrderState
+    );
+    require!(
+        order_state.limit_price == order.limit_price,
+        ErrorCode::InvalidOrderState
+    );
+    require!(
+        order_state.flags == order_flags(order.side, order.outcome, order.order_type, false),
+        ErrorCode::InvalidOrderState
+    );
+    require!(
+        minimum_order_notional(order)? >= 100,
+        ErrorCode::InvalidAmount
     );
     require!(
         order_state
@@ -1080,12 +1202,12 @@ fn validate_order_state(
     Ok(())
 }
 
-fn validate_fill_price_for_order(order: &OrderIntentV1, fill_price: u64) -> Result<()> {
+fn validate_fill_price_for_order(order: &OrderIntentV1, fill_price: u8) -> Result<()> {
     require!(fill_price > 0 && fill_price < 100, ErrorCode::InvalidAmount);
     let limit_tick = order.limit_price;
     let effective_tick = match order.outcome {
         Outcome::Yes => fill_price,
-        Outcome::No => 100u64
+        Outcome::No => 100u8
             .checked_sub(fill_price)
             .ok_or(ErrorCode::MathOverflow)?,
     };
@@ -1104,13 +1226,15 @@ fn extract_order_timestamp_ms(nonce: u64) -> Result<i64> {
 fn order_progress_delta(
     order: &OrderIntentV1,
     order_state: &OrderState,
-    fill_amount: u64,
-    fill_price: u64,
+    fill_amount: u32,
+    fill_price: u8,
 ) -> Result<u64> {
     if order.order_type == OrderType::Market && order.side == Side::Buy {
-        return Ok(cash_progress_after_fill(order, order_state, fill_amount, fill_price)?.delta_cash);
+        return Ok(
+            cash_progress_after_fill(order, order_state, fill_amount, fill_price)?.delta_cash,
+        );
     }
-    Ok(fill_amount)
+    Ok(fill_amount as u64)
 }
 
 fn classify_branch(maker: &OrderIntentV1, taker: &OrderIntentV1) -> Result<SettleBranch> {
@@ -1161,25 +1285,40 @@ fn apply_fill<'info>(
 ) -> Result<TradeResult> {
     let maker_state = maker_order_state_loader.load()?;
     let taker_state = taker_order_state_loader.load()?;
-    let maker_cash = cash_progress_after_fill(maker, &maker_state, fill.fill_amount, fill.fill_price)?;
-    let taker_cash = cash_progress_after_fill(taker, &taker_state, fill.fill_amount, fill.fill_price)?;
-    let taker_creator_fee_total =
-        ceil_mul_div(taker_cash.new_paid_cash, market.creator_fee_bps as u64, 10_000)?;
-    let taker_platform_fee_total =
-        ceil_mul_div(taker_cash.new_paid_cash, market.platform_fee_bps as u64, 10_000)?;
+    let maker_cash =
+        cash_progress_after_fill(maker, &maker_state, fill.fill_amount, fill.fill_price)?;
+    let taker_cash =
+        cash_progress_after_fill(taker, &taker_state, fill.fill_amount, fill.fill_price)?;
+    let taker_creator_fee_before =
+        ceil_mul_div(taker_state.paid_cash, market.creator_fee_bps as u64, 10_000)?;
+    let taker_platform_fee_before = ceil_mul_div(
+        taker_state.paid_cash,
+        market.platform_fee_bps as u64,
+        10_000,
+    )?;
+    let taker_creator_fee_total = ceil_mul_div(
+        taker_cash.new_paid_cash,
+        market.creator_fee_bps as u64,
+        10_000,
+    )?;
+    let taker_platform_fee_total = ceil_mul_div(
+        taker_cash.new_paid_cash,
+        market.platform_fee_bps as u64,
+        10_000,
+    )?;
     require!(
-        taker_creator_fee_total >= taker_state.paid_creator_fee,
+        taker_creator_fee_total >= taker_creator_fee_before,
         ErrorCode::MathOverflow
     );
     require!(
-        taker_platform_fee_total >= taker_state.paid_platform_fee,
+        taker_platform_fee_total >= taker_platform_fee_before,
         ErrorCode::MathOverflow
     );
     let taker_creator_fee = taker_creator_fee_total
-        .checked_sub(taker_state.paid_creator_fee)
+        .checked_sub(taker_creator_fee_before)
         .ok_or(ErrorCode::MathOverflow)?;
     let taker_platform_fee = taker_platform_fee_total
-        .checked_sub(taker_state.paid_platform_fee)
+        .checked_sub(taker_platform_fee_before)
         .ok_or(ErrorCode::MathOverflow)?;
     let taker_total_fee = taker_creator_fee
         .checked_add(taker_platform_fee)
@@ -1190,7 +1329,12 @@ fn apply_fill<'info>(
     let trade_result = match branch {
         SettleBranch::MatchAndMint => {
             debit_buyer(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
-            debit_buyer(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
+            debit_buyer(
+                taker_ledger_loader,
+                taker_cash.delta_cash,
+                true,
+                taker_total_fee,
+            )?;
             credit_position(
                 maker_position_loader,
                 maker.outcome,
@@ -1216,7 +1360,12 @@ fn apply_fill<'info>(
             let maker_is_buy = maker.side == Side::Buy;
             if maker_is_buy {
                 debit_buyer(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
-                credit_seller(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
+                credit_seller(
+                    taker_ledger_loader,
+                    taker_cash.delta_cash,
+                    true,
+                    taker_total_fee,
+                )?;
                 credit_position(
                     maker_position_loader,
                     maker.outcome,
@@ -1229,7 +1378,12 @@ fn apply_fill<'info>(
                 )?;
             } else {
                 credit_seller(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
-                debit_buyer(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
+                debit_buyer(
+                    taker_ledger_loader,
+                    taker_cash.delta_cash,
+                    true,
+                    taker_total_fee,
+                )?;
                 credit_position(
                     maker_position_loader,
                     maker.outcome,
@@ -1250,7 +1404,12 @@ fn apply_fill<'info>(
         }
         SettleBranch::MergeAndBurn => {
             credit_seller(maker_ledger_loader, maker_cash.delta_cash, false, 0)?;
-            credit_seller(taker_ledger_loader, taker_cash.delta_cash, true, taker_total_fee)?;
+            credit_seller(
+                taker_ledger_loader,
+                taker_cash.delta_cash,
+                true,
+                taker_total_fee,
+            )?;
             credit_position(
                 maker_position_loader,
                 maker.outcome,
@@ -1278,14 +1437,6 @@ fn apply_fill<'info>(
         let mut taker_state = taker_order_state_loader.load_mut()?;
         taker_state.paid_cash = taker_cash.new_paid_cash;
         taker_state.cash_remainder = taker_cash.new_remainder;
-        taker_state.paid_creator_fee = accumulate_paid_fee(
-            taker_state.paid_creator_fee,
-            taker_creator_fee,
-        )?;
-        taker_state.paid_platform_fee = accumulate_paid_fee(
-            taker_state.paid_platform_fee,
-            taker_platform_fee,
-        )?;
     }
     Ok(trade_result)
 }
@@ -1376,11 +1527,11 @@ fn apply_market_delta(
     Ok(())
 }
 
-fn trade_cash_for_order(order: &OrderIntentV1, qty: u64, fill_price: u64) -> Result<u64> {
+fn trade_cash_for_order(order: &OrderIntentV1, qty: u64, fill_price: u8) -> Result<u64> {
     let effective_price = match order.outcome {
-        Outcome::Yes => fill_price,
+        Outcome::Yes => fill_price as u64,
         Outcome::No => 100u64
-            .checked_sub(fill_price)
+            .checked_sub(fill_price as u64)
             .ok_or(ErrorCode::MathOverflow)?,
     };
     ceil_mul_div(qty, effective_price, 100)
@@ -1395,16 +1546,16 @@ struct CashProgress {
 fn cash_progress_after_fill(
     order: &OrderIntentV1,
     order_state: &OrderState,
-    qty: u64,
-    fill_price: u64,
+    qty: u32,
+    fill_price: u8,
 ) -> Result<CashProgress> {
     let effective_price = match order.outcome {
-        Outcome::Yes => fill_price,
+        Outcome::Yes => fill_price as u64,
         Outcome::No => 100u64
-            .checked_sub(fill_price)
+            .checked_sub(fill_price as u64)
             .ok_or(ErrorCode::MathOverflow)?,
     };
-    let increment = (qty as u128)
+    let increment = (u64::from(qty) as u128)
         .checked_mul(effective_price as u128)
         .ok_or(ErrorCode::MathOverflow)?;
     let previous_remainder = order_state.cash_remainder as u128;
@@ -1412,13 +1563,10 @@ fn cash_progress_after_fill(
     let combined = previous_remainder
         .checked_add(increment)
         .ok_or(ErrorCode::MathOverflow)?;
-    let rounded_total = combined
-        .checked_add(99)
-        .ok_or(ErrorCode::MathOverflow)?
-        / 100;
+    let rounded_total = combined.checked_add(99).ok_or(ErrorCode::MathOverflow)? / 100;
     require!(rounded_total >= previous_carry, ErrorCode::MathOverflow);
-    let delta_cash =
-        u64::try_from(rounded_total - previous_carry).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let delta_cash = u64::try_from(rounded_total - previous_carry)
+        .map_err(|_| error!(ErrorCode::MathOverflow))?;
     let new_paid_cash = order_state
         .paid_cash
         .checked_add(delta_cash)
@@ -1432,15 +1580,11 @@ fn cash_progress_after_fill(
     })
 }
 
-fn accumulate_paid_fee(current: u64, delta: u64) -> Result<u64> {
-    current.checked_add(delta).ok_or_else(|| error!(ErrorCode::MathOverflow))
-}
-
 fn minimum_order_notional(order: &OrderIntentV1) -> Result<u64> {
     if order.order_type == OrderType::Market && order.side == Side::Buy {
         return Ok(order.total_amount);
     }
-    ceil_mul_div(order.total_amount, order.limit_price, 100)
+    ceil_mul_div(order.total_amount, order.limit_price as u64, 100)
 }
 
 fn ceil_mul_div(lhs: u64, rhs: u64, denominator: u64) -> Result<u64> {
@@ -1468,22 +1612,159 @@ fn apply_signed_delta(value: u64, delta: i128) -> Result<u64> {
     }
 }
 
-fn order_hash(order: &OrderIntentV1) -> Result<[u8; 32]> {
-    let encoded = order.try_to_vec()?;
-    Ok(solana_program::keccak::hash(&encoded).to_bytes())
+fn order_from_witness(
+    user: Pubkey,
+    market: Pubkey,
+    witness: &ColdOrderWitness,
+) -> Result<OrderIntentV1> {
+    require!(
+        witness.flags & !(ORDER_FLAG_SIDE_SELL | ORDER_FLAG_OUTCOME_NO | ORDER_FLAG_TYPE_MARKET)
+            == 0,
+        ErrorCode::InvalidOrder
+    );
+    Ok(OrderIntentV1 {
+        program_id: crate::ID,
+        market,
+        user,
+        nonce: witness.nonce,
+        side: if witness.flags & ORDER_FLAG_SIDE_SELL != 0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        },
+        outcome: if witness.flags & ORDER_FLAG_OUTCOME_NO != 0 {
+            Outcome::No
+        } else {
+            Outcome::Yes
+        },
+        order_type: if witness.flags & ORDER_FLAG_TYPE_MARKET != 0 {
+            OrderType::Market
+        } else {
+            OrderType::Limit
+        },
+        limit_price: witness.limit_price,
+        total_amount: witness.total_amount,
+        expiry_ts: witness.expiry_ts,
+    })
+}
+
+fn order_state_to_intent(
+    user: Pubkey,
+    market: Pubkey,
+    state: &OrderState,
+) -> Result<OrderIntentV1> {
+    require_keys_eq!(state.owner, user, ErrorCode::InvalidOrderState);
+    require!(
+        state.flags
+            & !(ORDER_FLAG_SIDE_SELL
+                | ORDER_FLAG_OUTCOME_NO
+                | ORDER_FLAG_TYPE_MARKET
+                | ORDER_FLAG_CANCELED)
+            == 0,
+        ErrorCode::InvalidOrderState
+    );
+    Ok(OrderIntentV1 {
+        program_id: crate::ID,
+        market,
+        user,
+        nonce: state.nonce,
+        side: state.side(),
+        outcome: state.outcome(),
+        order_type: state.order_type(),
+        limit_price: state.limit_price,
+        total_amount: state.total_amount,
+        expiry_ts: state.expiry_ts,
+    })
+}
+
+fn validate_cold_order(order: &OrderIntentV1, now: i64) -> Result<()> {
+    require_keys_eq!(order.program_id, crate::ID, ErrorCode::InvalidOrder);
+    require!(order.total_amount > 0, ErrorCode::InvalidAmount);
+    require!(
+        order.limit_price > 0 && order.limit_price < 100,
+        ErrorCode::InvalidAmount
+    );
+    require!(i64::from(order.expiry_ts) >= now, ErrorCode::OrderExpired);
+    require!(
+        minimum_order_notional(order)? >= 100,
+        ErrorCode::InvalidAmount
+    );
+    Ok(())
+}
+
+fn order_flags(side: Side, outcome: Outcome, order_type: OrderType, canceled: bool) -> u8 {
+    let mut flags = 0u8;
+    if side == Side::Sell {
+        flags |= ORDER_FLAG_SIDE_SELL;
+    }
+    if outcome == Outcome::No {
+        flags |= ORDER_FLAG_OUTCOME_NO;
+    }
+    if order_type == OrderType::Market {
+        flags |= ORDER_FLAG_TYPE_MARKET;
+    }
+    if canceled {
+        flags |= ORDER_FLAG_CANCELED;
+    }
+    flags
+}
+
+fn order_signing_payload_bytes(order: &OrderIntentV1) -> Vec<u8> {
+    let mut out = Vec::with_capacity(118);
+    out.extend_from_slice(order.program_id.as_ref());
+    out.extend_from_slice(order.market.as_ref());
+    out.extend_from_slice(order.user.as_ref());
+    out.extend_from_slice(&order.nonce.to_le_bytes());
+    out.push(order_flags(
+        order.side,
+        order.outcome,
+        order.order_type,
+        false,
+    ));
+    out.push(order.limit_price);
+    out.extend_from_slice(&order.total_amount.to_le_bytes());
+    out.extend_from_slice(&order.expiry_ts.to_le_bytes());
+    out
 }
 
 fn order_signed_message_bytes(order: &OrderIntentV1) -> Result<Vec<u8>> {
-    let hash = order_hash(order)?;
-    Ok(lower_hex_bytes(&hash))
+    let hash =
+        solana_program::keccak::hashv(&[b"predix-order", &order_signing_payload_bytes(order)]);
+    let encoded = base64url_no_pad(hash.as_ref());
+    let mut out = Vec::with_capacity(4 + encoded.len());
+    out.extend_from_slice(b"bp1:");
+    out.extend_from_slice(&encoded);
+    Ok(out)
 }
 
-fn lower_hex_bytes(bytes: &[u8]) -> Vec<u8> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+fn base64url_no_pad(bytes: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = Vec::with_capacity((bytes.len() * 4).div_ceil(3));
+    let mut idx = 0usize;
+    while idx + 3 <= bytes.len() {
+        let b0 = bytes[idx];
+        let b1 = bytes[idx + 1];
+        let b2 = bytes[idx + 2];
+        out.push(TABLE[(b0 >> 2) as usize]);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]);
+        out.push(TABLE[(b2 & 0x3f) as usize]);
+        idx += 3;
+    }
+    match bytes.len() - idx {
+        1 => {
+            let b0 = bytes[idx];
+            out.push(TABLE[(b0 >> 2) as usize]);
+            out.push(TABLE[((b0 & 0x03) << 4) as usize]);
+        }
+        2 => {
+            let b0 = bytes[idx];
+            let b1 = bytes[idx + 1];
+            out.push(TABLE[(b0 >> 2) as usize]);
+            out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+            out.push(TABLE[((b1 & 0x0f) << 2) as usize]);
+        }
+        _ => {}
     }
     out
 }
@@ -1494,7 +1775,6 @@ mod tests {
 
     fn sample_order(side: Side, outcome: Outcome) -> OrderIntentV1 {
         OrderIntentV1 {
-            version: 1,
             program_id: crate::ID,
             market: Pubkey::new_unique(),
             user: Pubkey::new_unique(),
@@ -1504,7 +1784,33 @@ mod tests {
             order_type: OrderType::Limit,
             limit_price: 60,
             total_amount: 100,
-            expiry_ts: i64::MAX,
+            expiry_ts: u32::MAX,
+        }
+    }
+
+    fn sample_state(order: &OrderIntentV1) -> OrderState {
+        OrderState {
+            owner: order.user,
+            nonce: order.nonce,
+            total_amount: order.total_amount,
+            filled_amount: 0,
+            paid_cash: 0,
+            expiry_ts: order.expiry_ts,
+            limit_price: order.limit_price,
+            flags: order_flags(order.side, order.outcome, order.order_type, false),
+            cash_remainder: 0,
+            bump: 0,
+            _reserved: [0; 8],
+        }
+    }
+
+    fn sample_ledger(order: &OrderIntentV1) -> UserLedger {
+        UserLedger {
+            owner: order.user,
+            available_usdc: 1_000_000,
+            cancel_all_before_ts: 0,
+            bump: 0,
+            _reserved: [0; 7],
         }
     }
 
@@ -1535,22 +1841,26 @@ mod tests {
         let mut order = sample_order(Side::Buy, Outcome::Yes);
         order.order_type = OrderType::Market;
         order.total_amount = 60;
-        let state = OrderState {
-            owner: order.user,
-            nonce: order.nonce,
-            order_hash: [0; 32],
-            total_amount: order.total_amount,
-            filled_amount: 0,
-            paid_cash: 0,
-            paid_creator_fee: 0,
-            paid_platform_fee: 0,
-            cash_remainder: 0,
-            canceled: 0,
-            bump: 0,
-            _reserved: [0; 5],
-        };
+        let state = sample_state(&order);
 
         assert_eq!(order_progress_delta(&order, &state, 100, 60).unwrap(), 60);
+    }
+
+    #[test]
+    fn market_buy_progress_must_be_taken_from_pre_fill_state() {
+        let mut order = sample_order(Side::Buy, Outcome::Yes);
+        order.order_type = OrderType::Market;
+        let mut state = sample_state(&order);
+
+        let pre_fill_progress = order_progress_delta(&order, &state, 1, 50).unwrap();
+        let cash = cash_progress_after_fill(&order, &state, 1, 50).unwrap();
+        state.paid_cash = cash.new_paid_cash;
+        state.cash_remainder = cash.new_remainder;
+
+        let post_fill_progress = order_progress_delta(&order, &state, 1, 50).unwrap();
+
+        assert_eq!(pre_fill_progress, 1);
+        assert_eq!(post_fill_progress, 0);
     }
 
     #[test]
@@ -1561,6 +1871,26 @@ mod tests {
 
         assert!(validate_fill_price_for_order(&order, 60).is_err());
         assert!(validate_fill_price_for_order(&order, 59).is_ok());
+    }
+
+    #[test]
+    fn validate_cold_order_rejects_sub_one_usdc_notional() {
+        let mut order = sample_order(Side::Buy, Outcome::Yes);
+        order.total_amount = 100;
+        order.limit_price = 99;
+
+        assert!(validate_cold_order(&order, 0).is_err());
+    }
+
+    #[test]
+    fn validate_order_state_rejects_sub_one_usdc_notional() {
+        let mut order = sample_order(Side::Buy, Outcome::Yes);
+        order.total_amount = 100;
+        order.limit_price = 99;
+        let state = sample_state(&order);
+        let ledger = sample_ledger(&order);
+
+        assert!(validate_order_state(&order, &state, &ledger, 0, 1, 99).is_err());
     }
 
     #[test]
@@ -1592,45 +1922,13 @@ mod tests {
     #[test]
     fn cash_progress_is_path_independent_for_split_fills() {
         let order = sample_order(Side::Buy, Outcome::Yes);
-        let mut state = OrderState {
-            owner: order.user,
-            nonce: order.nonce,
-            order_hash: [0; 32],
-            total_amount: order.total_amount,
-            filled_amount: 0,
-            paid_cash: 0,
-            paid_creator_fee: 0,
-            paid_platform_fee: 0,
-            cash_remainder: 0,
-            canceled: 0,
-            bump: 0,
-            _reserved: [0; 5],
-        };
+        let mut state = sample_state(&order);
         let first = cash_progress_after_fill(&order, &state, 1, 50).unwrap();
         state.paid_cash = first.new_paid_cash;
         state.cash_remainder = first.new_remainder;
         let second = cash_progress_after_fill(&order, &state, 1, 50).unwrap();
 
-        let one_shot = cash_progress_after_fill(
-            &order,
-            &OrderState {
-                owner: order.user,
-                nonce: order.nonce,
-                order_hash: [0; 32],
-                total_amount: order.total_amount,
-                filled_amount: 0,
-                paid_cash: 0,
-                paid_creator_fee: 0,
-                paid_platform_fee: 0,
-                cash_remainder: 0,
-                canceled: 0,
-                bump: 0,
-                _reserved: [0; 5],
-            },
-            2,
-            50,
-        )
-        .unwrap();
+        let one_shot = cash_progress_after_fill(&order, &sample_state(&order), 2, 50).unwrap();
 
         assert_eq!(first.delta_cash + second.delta_cash, one_shot.delta_cash);
         assert_eq!(second.new_paid_cash, one_shot.new_paid_cash);

@@ -43,12 +43,12 @@ func (w *Waiter) WaitForConfirmed(ctx context.Context, signature solana.Signatur
 	if w == nil || w.rpc == nil {
 		return Result{}, fmt.Errorf("chainconfirm rpc client is not configured")
 	}
-	logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm wait start", map[string]any{
+	logging.LogWS(w.log, ctx, zerolog.DebugLevel, "chain confirm wait start", map[string]any{
 		"signature": signature.String(),
 		"ws_url":    w.wsURL,
 	})
 	if status, ok, err := w.checkStatus(ctx, signature); err == nil && ok {
-		logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm http status hit", map[string]any{
+		logging.LogWS(w.log, ctx, zerolog.DebugLevel, "chain confirm http status hit", map[string]any{
 			"signature": signature.String(),
 			"slot":      status.Slot,
 			"status":    status.ConfirmationStatus,
@@ -58,7 +58,7 @@ func (w *Waiter) WaitForConfirmed(ctx context.Context, signature solana.Signatur
 	if w.rt != nil {
 		res, err := w.waitViaRouter(ctx, signature)
 		if err == nil {
-			logging.LogWS(w.log, ctx, zerolog.InfoLevel, "chain confirm websocket hit", map[string]any{
+			logging.LogWS(w.log, ctx, zerolog.DebugLevel, "chain confirm websocket hit", map[string]any{
 				"signature": signature.String(),
 				"slot":      res.Slot,
 				"status":    res.ConfirmationStatus,
@@ -75,7 +75,7 @@ func (w *Waiter) WaitForConfirmed(ctx context.Context, signature solana.Signatur
 
 func (w *Waiter) waitViaRouter(ctx context.Context, signature solana.Signature) (Result, error) {
 	ch := make(chan SignatureResult, 1)
-	unsubscribe, err := w.rt.SubscribeSignature(signature.String(), "chainconfirm:"+signature.String(), "confirm_waiter", ch)
+	unsubscribe, err := w.rt.SubscribeSignature(signature.String(), "chainconfirm:"+signature.String(), "confirm_waiter", "confirmed", ch)
 	if err != nil {
 		return Result{}, err
 	}

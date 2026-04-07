@@ -1,17 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "@/app/utils/axiosInstance";
 import { OpenOrderItem, OpenOrdersResponse } from "@/types/market";
 import { usePrivy } from "@/lib/auth-client";
 import { toast } from "sonner";
 
+const ORDER_SYNC_DELAYS_MS = [0, 350, 1200, 2500];
+
 export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; refreshKey?: string }) => {
   const { user, getAccessToken } = usePrivy();
   const [orders, setOrders] = useState<OpenOrderItem[]>([]);
   const [matchingEnabled, setMatchingEnabled] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string>("");
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const syncJobRef = useRef(0);
 
   const hasOrders = useMemo(() => orders.length > 0, [orders]);
 
@@ -30,8 +34,10 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
         setOrders(data.orders || []);
         setMatchingEnabled(Boolean(data.matching_enabled));
         setLastUpdatedAt(new Date().toISOString());
+        setHasLoadedOnce(true);
       } catch (error) {
         console.error("load open orders failed", error);
+        setHasLoadedOnce(true);
       } finally {
         if (!options?.silent) {
           setLoading(false);
@@ -41,9 +47,24 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
     [getAccessToken, marketId, user],
   );
 
+  const scheduleRefreshBurst = useCallback(() => {
+    const jobID = ++syncJobRef.current;
+    for (const delayMs of ORDER_SYNC_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        if (jobID !== syncJobRef.current) {
+          return;
+        }
+        void loadOrders({ silent: delayMs !== 0 });
+      }, delayMs);
+      if (jobID !== syncJobRef.current) {
+        clearTimeout(timer);
+      }
+    }
+  }, [loadOrders]);
+
   useEffect(() => {
     if (!user) return;
-    void loadOrders();
+    scheduleRefreshBurst();
 
     const pollTimer = setInterval(() => {
       if (document.visibilityState !== "visible") return;
@@ -59,16 +80,17 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
+      syncJobRef.current += 1;
       clearInterval(pollTimer);
       window.removeEventListener("focus", handleVisibilityChange);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [loadOrders, user]);
+  }, [loadOrders, scheduleRefreshBurst, user]);
 
   useEffect(() => {
     if (!refreshKey || !user) return;
-    void loadOrders({ silent: true });
-  }, [loadOrders, refreshKey, user]);
+    scheduleRefreshBurst();
+  }, [refreshKey, scheduleRefreshBurst, user]);
 
   const handleCancel = async (orderID: string) => {
     const token = await getAccessToken();
@@ -82,7 +104,7 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
         headers: { Authorization: `Bearer ${token}` },
       });
       toast.success("Cancel command accepted");
-      await loadOrders({ silent: true });
+      scheduleRefreshBurst();
     } catch (error: unknown) {
       const response = typeof error === "object" && error !== null && "response" in error ? (error as { response?: { data?: { message?: string } } }).response : undefined;
       toast.error(response?.data?.message || "Cancel request failed");
@@ -100,7 +122,7 @@ export const UserOpenOrders = ({ marketId, refreshKey }: { marketId: string; ref
   if (!hasOrders) {
     return (
       <div className="rounded-3xl border border-dashed border-zinc-300 px-4 py-8 text-center text-sm text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-        {loading ? "Loading..." : matchingEnabled ? "No open orders." : "No open orders yet (matcher still in rollout)."}
+        {!hasLoadedOnce || loading ? "Loading..." : matchingEnabled ? "No open orders." : "No open orders yet (matcher still in rollout)."}
       </div>
     );
   }

@@ -112,7 +112,8 @@ func (b *pendingBatch) ensureOrder(order *MemoryOrder, createdAt int64) uint16 {
 			IntentBytesHex: order.IntentBytesHex,
 			Signature:      order.Signature,
 		},
-		CreatedAt: createdAt,
+		CreatedAt:     createdAt,
+		CreatedCmdSeq: order.CreatedCmdSeq,
 	})
 	b.sizeBytes += 256
 	return idx
@@ -132,7 +133,8 @@ func (b *pendingBatch) ensureOrderFromCommand(cmd *PlaceOrderCommand) uint16 {
 			IntentBytesHex: cmd.IntentBytesHex,
 			Signature:      cmd.Signature,
 		},
-		CreatedAt: cmd.Timestamp,
+		CreatedAt:     cmd.Timestamp,
+		CreatedCmdSeq: cmd.SourceCmdSeq,
 	})
 	b.sizeBytes += 256
 	return idx

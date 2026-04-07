@@ -433,6 +433,9 @@ func (w *Writer) upsertSourceOrder(ctx context.Context, tx pgx.Tx, marketID uint
 		return err
 	}
 	eventTime := timestampToTime(timestamp)
+	if order.CreatedAt > 0 {
+		eventTime = timestampToTime(order.CreatedAt)
+	}
 	expireTime := order.ExpireTime
 	_, err = tx.Exec(ctx, `
 		INSERT INTO orders (
@@ -1330,6 +1333,14 @@ func depthField(side uint8, priceTick uint8) string {
 func buildPushMessages(batch *matching.BatchEventPayload) pushMessages {
 	updatedAt := timestampToTime(batch.Timestamp)
 	pushes := pushMessages{}
+	sourceOrderByID := make(map[uint64]*matching.FullOrderData, len(batch.SourceOrders)+1)
+	for i := range batch.SourceOrders {
+		sourceOrder := &batch.SourceOrders[i]
+		sourceOrderByID[sourceOrder.OrderID] = sourceOrder
+	}
+	if batch.SourceOrder != nil {
+		sourceOrderByID[batch.SourceOrder.OrderID] = batch.SourceOrder
+	}
 	if len(batch.DepthEvents) > 0 {
 		pushes.marketDepths = append(pushes.marketDepths, buildMarketDepthPush(
 			batch.MarketID,
@@ -1345,7 +1356,7 @@ func buildPushMessages(batch *matching.BatchEventPayload) pushMessages {
 		if state.WalletAddress == "" {
 			continue
 		}
-		pushes.userOrders = append(pushes.userOrders, buildUserOrderPush(batch.MarketID, updatedAt, batch.SourceOrder, state))
+		pushes.userOrders = append(pushes.userOrders, buildUserOrderPush(batch.MarketID, updatedAt, sourceOrderByID[state.OrderID], state))
 	}
 	return pushes
 }
@@ -1502,12 +1513,14 @@ func batchPayloadFromMarketDelta(event matching.MatchBatchEvent) matching.BatchE
 	}
 
 	orderByIndex := make(map[uint16]matching.MatchedOrder, len(event.Orders))
-	createdCmdSeq := event.SourceCmdSeqMin
-	if createdCmdSeq == 0 {
-		createdCmdSeq = event.SourceCmdSeqMax
-	}
-
 	for _, order := range event.Orders {
+		createdCmdSeq := order.CreatedCmdSeq
+		if createdCmdSeq == 0 {
+			createdCmdSeq = event.SourceCmdSeqMax
+			if createdCmdSeq == 0 {
+				createdCmdSeq = event.SourceCmdSeqMin
+			}
+		}
 		orderByIndex[order.OrderIndex] = order
 		sourceOrder := matching.FullOrderData{
 			OrderID:            order.OrderID,
@@ -1525,6 +1538,7 @@ func batchPayloadFromMarketDelta(event matching.MatchBatchEvent) matching.BatchE
 			IntentBytesHex:     order.Settlement.IntentBytesHex,
 			Nonce:              order.Execution.Nonce,
 			CreatedCmdSeq:      createdCmdSeq,
+			CreatedAt:          order.CreatedAt,
 		}
 		batch.SourceOrders = append(batch.SourceOrders, sourceOrder)
 	}
@@ -1587,7 +1601,7 @@ func sideCode(label string) uint8 {
 }
 
 func depthSideCode(label string) uint8 {
-	if strings.EqualFold(label, "ask") {
+	if strings.EqualFold(label, "ask") || strings.EqualFold(label, "sell") {
 		return matching.SideSell
 	}
 	return matching.SideBuy

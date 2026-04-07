@@ -154,6 +154,7 @@ type PlaceOrderCommand struct {
 	IntentBytesHex    string `json:"intent_bytes"`
 	Nonce             uint64 `json:"nonce"` // 防碰撞nonce
 	Timestamp         int64  `json:"timestamp"`
+	SourceCmdSeq      uint64 `json:"-"`
 }
 
 func (c *PlaceOrderCommand) GetType() CommandType { return CmdTypePlaceOrder }
@@ -234,11 +235,12 @@ type SettlementPayload struct {
 }
 
 type MatchedOrder struct {
-	OrderIndex uint16            `json:"order_index"`
-	OrderID    uint64            `json:"order_id"`
-	Execution  ExecutionSnapshot `json:"execution"`
-	Settlement SettlementPayload `json:"settlement"`
-	CreatedAt  int64             `json:"created_at"`
+	OrderIndex    uint16            `json:"order_index"`
+	OrderID       uint64            `json:"order_id"`
+	Execution     ExecutionSnapshot `json:"execution"`
+	Settlement    SettlementPayload `json:"settlement"`
+	CreatedAt     int64             `json:"created_at"`
+	CreatedCmdSeq uint64            `json:"created_cmd_seq,omitempty"`
 }
 
 type MatchFill struct {
@@ -290,6 +292,7 @@ type FullOrderData struct {
 	IntentBytesHex     string `json:"intent_hex"`
 	Nonce              uint64 `json:"nonce"`
 	CreatedCmdSeq      uint64 `json:"created_cmd_seq"`
+	CreatedAt          int64  `json:"created_at"`
 }
 
 // BatchEventPayload 批量事件载体，保证原子性发布

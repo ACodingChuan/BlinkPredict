@@ -10,30 +10,30 @@ import (
 )
 
 type Config struct {
-	Port                     string
-	DatabaseURL              string
-	SolanaRPCURL             string
-	SolanaWSURL              string
-	ProgramID                string
-	AuthTokenSecret          string
-	LogLevel                 string
-	AdminEmails              map[string]struct{}
-	AdminWallets             map[string]struct{}
-	NATSURL                  string
-	NATSJSDomain             string
-	NATSStreamCMD            string
-	NATSStreamEVT            string
-	NATSStreamWHK            string
-	RedisURL                 string
-	MatcherTickInterval      time.Duration
-	MatcherBatchMaxFillsHot  int
-	MatcherBatchMaxFillsCold int
-	MatcherBatchMaxOrders    int
-	MatcherBatchMaxBytes     int
-	MatcherBatchMaxAge       time.Duration
-	MatcherBatchIdleFlush    time.Duration
-	MatcherBatchFlushTick    time.Duration
-	OrderbookDepth           int
+	Port                      string
+	DatabaseURL               string
+	SolanaRPCURL              string
+	SolanaWSURL               string
+	ProgramID                 string
+	AuthTokenSecret           string
+	LogLevel                  string
+	AdminEmails               map[string]struct{}
+	AdminWallets              map[string]struct{}
+	NATSURL                   string
+	NATSJSDomain              string
+	NATSStreamCMD             string
+	NATSStreamEVT             string
+	NATSStreamWHK             string
+	RedisURL                  string
+	MatcherTickInterval       time.Duration
+	MatcherBatchMaxFillsHot   int
+	MatcherBatchMaxFillsCold  int
+	MatcherBatchMaxOrders     int
+	MatcherBatchMaxBytes      int
+	MatcherBatchMaxAge        time.Duration
+	MatcherBatchIdleFlush     time.Duration
+	MatcherBatchFlushTick     time.Duration
+	MatcherCheckpointInterval time.Duration
 
 	VUSDCMint                  string
 	GlobalVault                string
@@ -53,6 +53,18 @@ type Config struct {
 
 	SettlementRelayerKeypair    string
 	SettlementReconcileInterval time.Duration
+	SettlementPrepareWorkerTick time.Duration
+	SettlementSchedulerScan     time.Duration
+	SettlementSubmittedPoll     time.Duration
+	SettlementRebroadcast       time.Duration
+	SettlementSubmittedHeight   time.Duration
+	SettlementTerminalPoll      time.Duration
+	SettlementTerminalBatchSize int
+	SettlementBlockhashPoll     time.Duration
+	SettlementBlockhashMaxAge   time.Duration
+	SettlementSendSkipPreflight bool
+	SettlementTxMaxBytes        int
+	SettlementStaticALTIDs      []string
 }
 
 func Load() Config {
@@ -68,30 +80,30 @@ func Load() Config {
 		matcherColdFills = 1
 	}
 	return Config{
-		Port:                     getEnv("PORT", "8080"),
-		DatabaseURL:              dbURL,
-		SolanaRPCURL:             getEnv("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
-		SolanaWSURL:              strings.TrimSpace(os.Getenv("SOLANA_WS_URL")),
-		ProgramID:                getEnv("PROGRAM_ID", "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE"),
-		AuthTokenSecret:          getEnv("AUTH_TOKEN_SECRET", "blinkpredict-dev-auth-secret"),
-		LogLevel:                 getEnv("LOG_LEVEL", "info"),
-		AdminEmails:              csvSet(os.Getenv("ADMIN_EMAILS")),
-		AdminWallets:             csvSet(os.Getenv("ADMIN_WALLETS")),
-		NATSURL:                  os.Getenv("NATS_URL"),
-		NATSJSDomain:             os.Getenv("NATS_JS_DOMAIN"),
-		NATSStreamCMD:            getEnv("NATS_STREAM_CMD", "AP_CMD"),
-		NATSStreamEVT:            getEnv("NATS_STREAM_EVT", "AP_EVT"),
-		NATSStreamWHK:            getEnv("NATS_STREAM_WHK", "AP_WHK"),
-		RedisURL:                 strings.TrimSpace(os.Getenv("REDIS_URL")),
-		MatcherTickInterval:      getEnvDuration("MATCHER_TICK_INTERVAL", time.Second),
-		MatcherBatchMaxFillsHot:  matcherHotFills,
-		MatcherBatchMaxFillsCold: matcherColdFills,
-		MatcherBatchMaxOrders:    getEnvInt("MATCHER_BATCH_MAX_ORDERS", 96),
-		MatcherBatchMaxBytes:     getEnvInt("MATCHER_BATCH_MAX_BYTES", 262144),
-		MatcherBatchMaxAge:       time.Duration(getEnvInt("MATCHER_BATCH_MAX_AGE_MS", 40)) * time.Millisecond,
-		MatcherBatchIdleFlush:    time.Duration(getEnvInt("MATCHER_BATCH_IDLE_FLUSH_MS", 15)) * time.Millisecond,
-		MatcherBatchFlushTick:    time.Duration(getEnvInt("MATCHER_BATCH_FLUSH_TICK_MS", 10)) * time.Millisecond,
-		OrderbookDepth:           getEnvInt("ORDERBOOK_DEPTH_LEVELS", 20),
+		Port:                      getEnv("PORT", "8080"),
+		DatabaseURL:               dbURL,
+		SolanaRPCURL:              getEnv("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
+		SolanaWSURL:               strings.TrimSpace(os.Getenv("SOLANA_WS_URL")),
+		ProgramID:                 getEnv("PROGRAM_ID", "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE"),
+		AuthTokenSecret:           getEnv("AUTH_TOKEN_SECRET", "blinkpredict-dev-auth-secret"),
+		LogLevel:                  getEnv("LOG_LEVEL", "info"),
+		AdminEmails:               csvSet(os.Getenv("ADMIN_EMAILS")),
+		AdminWallets:              csvSet(os.Getenv("ADMIN_WALLETS")),
+		NATSURL:                   os.Getenv("NATS_URL"),
+		NATSJSDomain:              os.Getenv("NATS_JS_DOMAIN"),
+		NATSStreamCMD:             getEnv("NATS_STREAM_CMD", "AP_CMD"),
+		NATSStreamEVT:             getEnv("NATS_STREAM_EVT", "AP_EVT"),
+		NATSStreamWHK:             getEnv("NATS_STREAM_WHK", "AP_WHK"),
+		RedisURL:                  strings.TrimSpace(os.Getenv("REDIS_URL")),
+		MatcherTickInterval:       getEnvDuration("MATCHER_TICK_INTERVAL", time.Second),
+		MatcherBatchMaxFillsHot:   matcherHotFills,
+		MatcherBatchMaxFillsCold:  matcherColdFills,
+		MatcherBatchMaxOrders:     getEnvInt("MATCHER_BATCH_MAX_ORDERS", 96),
+		MatcherBatchMaxBytes:      getEnvInt("MATCHER_BATCH_MAX_BYTES", 262144),
+		MatcherBatchMaxAge:        time.Duration(getEnvInt("MATCHER_BATCH_MAX_AGE_MS", 40)) * time.Millisecond,
+		MatcherBatchIdleFlush:     time.Duration(getEnvInt("MATCHER_BATCH_IDLE_FLUSH_MS", 15)) * time.Millisecond,
+		MatcherBatchFlushTick:     time.Duration(getEnvInt("MATCHER_BATCH_FLUSH_TICK_MS", 10)) * time.Millisecond,
+		MatcherCheckpointInterval: getEnvDuration("MATCHER_CHECKPOINT_INTERVAL", 100*time.Millisecond),
 
 		VUSDCMint:                  vusdcMint,
 		GlobalVault:                strings.TrimSpace(os.Getenv("GLOBAL_VAULT")),
@@ -111,6 +123,18 @@ func Load() Config {
 
 		SettlementRelayerKeypair:    strings.TrimSpace(os.Getenv("SETTLEMENT_RELAYER_KEYPAIR")),
 		SettlementReconcileInterval: getEnvDuration("SETTLEMENT_RECONCILE_INTERVAL", 10*time.Second),
+		SettlementPrepareWorkerTick: getEnvDuration("SETTLEMENT_PREPARE_WORKER_TICK", 300*time.Millisecond),
+		SettlementSchedulerScan:     getEnvDuration("SETTLEMENT_SCHEDULER_FALLBACK_SCAN", 300*time.Millisecond),
+		SettlementSubmittedPoll:     getEnvDuration("SETTLEMENT_SUBMITTED_STATUS_POLL", 15*time.Second),
+		SettlementRebroadcast:       getEnvDuration("SETTLEMENT_SUBMITTED_REBROADCAST", 8*time.Second),
+		SettlementSubmittedHeight:   getEnvDuration("SETTLEMENT_SUBMITTED_BLOCK_POLL", 15*time.Second),
+		SettlementTerminalPoll:      getEnvDuration("SETTLEMENT_TERMINAL_POLL_INTERVAL", 12*time.Second),
+		SettlementTerminalBatchSize: getEnvInt("SETTLEMENT_TERMINAL_POLL_BATCH_SIZE", 128),
+		SettlementBlockhashPoll:     getEnvDuration("SETTLEMENT_BLOCKHASH_POLL_INTERVAL", 15*time.Second),
+		SettlementBlockhashMaxAge:   getEnvDuration("SETTLEMENT_BLOCKHASH_MAX_CACHE_AGE", 45*time.Second),
+		SettlementSendSkipPreflight: getEnvBool("SETTLEMENT_SEND_SKIP_PREFLIGHT", true),
+		SettlementTxMaxBytes:        getEnvInt("SETTLEMENT_TX_MAX_BYTES", 1232),
+		SettlementStaticALTIDs:      csvList(os.Getenv("SETTLEMENT_STATIC_ALT_IDS")),
 	}
 }
 
@@ -185,6 +209,18 @@ func csvSet(value string) map[string]struct{} {
 		set[strings.ToLower(item)] = struct{}{}
 	}
 	return set
+}
+
+func csvList(value string) []string {
+	out := make([]string, 0)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func buildDatabaseURLFromParts() string {
