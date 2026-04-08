@@ -12,15 +12,16 @@ import { UserMarketTabs } from "@/components/market/user-market-tabs";
 import { useTrading } from "@/hooks/useTrading";
 import { useMarketPublicFeed } from "@/hooks/useMarketPublicFeed";
 import { useUSDCBalance } from "@/hooks/useUSDCBalance";
+import { useMarketPosition } from "@/hooks/useMarketPosition";
 import { Market, MarketMetadataDoc, MarketResponse } from "@/types/market";
 
 type TradeOrderType = "market" | "limit" | "split" | "merge";
-type ExpiryPreset = "1h" | "6h" | "23h" | "3d" | "7d";
 
 export default function MarketDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { user, login, getAccessToken } = usePrivy();
-  const { balance, syncAfterMutation } = useUSDCBalance();
+  const { syncAfterMutation: syncTradingBalance } = useUSDCBalance({ autoFetch: false });
+  const { position, loading: positionLoading, syncAfterMutation: syncPosition } = useMarketPosition(id);
   const { placeOrder, loading: tradeLoading } = useTrading();
   const marketFeed = useMarketPublicFeed(id);
 
@@ -34,7 +35,7 @@ export default function MarketDetailPage() {
   const [showOrderTypeMenu, setShowOrderTypeMenu] = useState(false);
   const [limitPrice, setLimitPrice] = useState(0.56);
   const [tradeInput, setTradeInput] = useState("");
-  const [expiryPreset, setExpiryPreset] = useState<ExpiryPreset>("23h");
+  const [expiryInput, setExpiryInput] = useState(() => defaultLimitExpiryLocal());
   const [lastOrderID, setLastOrderID] = useState("");
 
   useEffect(() => {
@@ -69,12 +70,13 @@ export default function MarketDetailPage() {
   }, [market?.metadata_url]);
 
   const yesPrice = clampCent(limitPrice);
-  const noPrice = 1 - yesPrice;
   const yesCents = Math.round(yesPrice * 100);
-  const noCents = Math.max(1, 100 - yesCents);
+  const noCents = 100 - yesCents;
+  const noPrice = noCents / 100;
+  const selectedLimitPrice = outcome === "yes" ? yesPrice : noPrice;
   const inputValue = Number(tradeInput || "0");
   const isMarketBuy = orderType === "market" && action === "buy";
-  const averagePrice = outcome === "yes" ? yesPrice : noPrice;
+  const averagePrice = selectedLimitPrice;
   const estimatedShares = isMarketBuy ? Math.max(0, inputValue / Math.max(averagePrice, 0.01)) : inputValue;
   const estimatedCost = isMarketBuy ? Math.max(0, inputValue) : Math.max(0, estimatedShares * averagePrice);
   const payoutIfWin = Math.max(0, estimatedShares - estimatedCost);
@@ -93,18 +95,29 @@ export default function MarketDetailPage() {
   if (!market) return <div className="mx-auto max-w-6xl px-4 py-10">Market not found.</div>;
 
   const handlePlaceOrder = async () => {
+    if (orderType === "limit") {
+      const expiryDate = parseLocalDateTime(expiryInput);
+      if (!expiryDate) {
+        toast.error("Please choose a valid expiry time");
+        return;
+      }
+      if (expiryDate.getTime() <= Date.now()) {
+        toast.error("Expiry time must be in the future");
+        return;
+      }
+    }
     const accepted = await placeOrder({
       market,
       action,
       outcome,
       orderType,
       amount: tradeInput,
-      limitPrice,
-      expireTime: orderType === "limit" ? expiryRFC3339(expiryPreset) : undefined,
+      limitPrice: selectedLimitPrice,
+      expireTime: orderType === "limit" ? localDateTimeToISOString(expiryInput) : undefined,
       onAccepted: (payload) => setLastOrderID(payload.order_id),
     });
     if (accepted) {
-      await syncAfterMutation();
+      await Promise.all([syncTradingBalance(), syncPosition()]);
     }
   };
 
@@ -115,7 +128,7 @@ export default function MarketDetailPage() {
           ← Back to markets
         </Link>
 
-        <div className="mt-6 grid gap-8 xl:grid-cols-[1.45fr_0.75fr]">
+        <div className="mt-6 grid gap-8 xl:grid-cols-[1.58fr_0.62fr]">
           <div className="space-y-6">
             <section className="overflow-hidden rounded-[28px] border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
               <div className="px-6 py-5 sm:px-8">
@@ -192,17 +205,17 @@ export default function MarketDetailPage() {
           </div>
 
           <aside className="xl:sticky xl:top-6 xl:h-fit">
-            <div className="overflow-hidden rounded-[24px] border border-zinc-800 bg-[#0f1118] text-white shadow-[0_12px_32px_rgba(0,0,0,0.35)]">
-              <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+            <div className="overflow-hidden rounded-[22px] border border-zinc-800 bg-[#0f1118] text-white shadow-[0_12px_32px_rgba(0,0,0,0.35)]">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2.5">
                 <div className="inline-flex rounded-full bg-white/10 p-1">
                   <button
-                    className={`rounded-full px-5 py-1.5 text-base font-semibold transition ${action === "buy" ? "bg-white/20 text-white" : "text-zinc-400"}`}
+                    className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition ${action === "buy" ? "bg-white/20 text-white" : "text-zinc-400"}`}
                     onClick={() => setAction("buy")}
                   >
                     Buy
                   </button>
                   <button
-                    className={`rounded-full px-5 py-1.5 text-base font-semibold transition ${action === "sell" ? "bg-white/20 text-white" : "text-zinc-400"}`}
+                    className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition ${action === "sell" ? "bg-white/20 text-white" : "text-zinc-400"}`}
                     onClick={() => setAction("sell")}
                   >
                     Sell
@@ -211,7 +224,7 @@ export default function MarketDetailPage() {
 
                 <div className="relative">
                   <button
-                    className="inline-flex items-center gap-2 text-lg font-semibold"
+                    className="inline-flex items-center gap-2 text-sm font-semibold"
                     onClick={() => setShowOrderTypeMenu((value) => !value)}
                   >
                     {orderTypeLabel(orderType)}
@@ -236,36 +249,36 @@ export default function MarketDetailPage() {
                 </div>
               </div>
 
-              <div className="space-y-4 px-4 py-4">
-                <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-3 px-3 py-3">
+                <div className="grid grid-cols-2 gap-2.5">
                   <button
-                    className={`rounded-2xl border p-4 text-center ${outcome === "yes" ? "border-blue-400 bg-blue-500/10" : "border-white/10 bg-white/5"}`}
+                    className={`rounded-2xl border p-2.5 text-center ${outcome === "yes" ? "border-blue-400 bg-blue-500/10" : "border-white/10 bg-white/5"}`}
                     onClick={() => setOutcome("yes")}
                   >
-                    <div className="text-2xl font-semibold text-blue-300">Yes {yesCents}¢</div>
+                    <div className="text-lg font-semibold text-blue-300">Yes {yesCents}¢</div>
                   </button>
                   <button
-                    className={`rounded-2xl border p-4 text-center ${outcome === "no" ? "border-blue-400 bg-blue-500/10" : "border-white/10 bg-white/5"}`}
+                    className={`rounded-2xl border p-2.5 text-center ${outcome === "no" ? "border-blue-400 bg-blue-500/10" : "border-white/10 bg-white/5"}`}
                     onClick={() => setOutcome("no")}
                   >
-                    <div className="text-2xl font-semibold text-zinc-200">No {noCents}¢</div>
+                    <div className="text-lg font-semibold text-zinc-200">No {noCents}¢</div>
                   </button>
                 </div>
 
                 {orderType === "limit" ? (
                   <div>
-                    <label className="mb-2 block text-lg font-semibold text-zinc-200">Limit Price</label>
-                    <div className="flex items-center justify-between rounded-2xl border border-white/15 bg-white/5 px-4 py-2.5 text-2xl">
+                    <label className="mb-1.5 block text-sm font-semibold text-zinc-200">Limit Price</label>
+                    <div className="flex items-center justify-between rounded-2xl border border-white/15 bg-white/5 px-2.5 py-1.5 text-lg">
                       <button
-                        className="rounded-lg px-3 py-1 text-zinc-300 hover:bg-white/10"
-                        onClick={() => setLimitPrice((v) => clampCent(v - 0.01))}
+                        className="rounded-lg px-2.5 py-1 text-zinc-300 hover:bg-white/10"
+                        onClick={() => setLimitPrice((v) => clampCent(outcome === "yes" ? v - 0.01 : v + 0.01))}
                       >
                         −
                       </button>
-                      <span className="font-semibold">{Math.round(limitPrice * 100)}¢</span>
+                      <span className="font-semibold">{Math.round(selectedLimitPrice * 100)}¢</span>
                       <button
-                        className="rounded-lg px-3 py-1 text-zinc-300 hover:bg-white/10"
-                        onClick={() => setLimitPrice((v) => clampCent(v + 0.01))}
+                        className="rounded-lg px-2.5 py-1 text-zinc-300 hover:bg-white/10"
+                        onClick={() => setLimitPrice((v) => clampCent(outcome === "yes" ? v + 0.01 : v - 0.01))}
                       >
                         +
                       </button>
@@ -274,19 +287,19 @@ export default function MarketDetailPage() {
                 ) : null}
 
                 <div>
-                  <label className="mb-2 block text-lg font-semibold text-zinc-200">{isMarketBuy ? "Amount (USDC)" : "Shares"}</label>
+                  <label className="mb-1.5 block text-sm font-semibold text-zinc-200">{isMarketBuy ? "Amount (USDC)" : "Shares"}</label>
                   <input
-                    className="w-full rounded-2xl border border-white/15 bg-white/5 px-4 py-2.5 text-right text-3xl font-semibold outline-none placeholder:text-zinc-500"
+                    className="w-full rounded-2xl border border-white/15 bg-white/5 px-3 py-1.5 text-right text-xl font-semibold outline-none placeholder:text-zinc-500"
                     placeholder="0"
                     value={tradeInput}
                     onChange={(event) => setTradeInput(event.target.value)}
                     inputMode="decimal"
                   />
-                  <div className="mt-2 grid grid-cols-5 gap-2 text-sm">
+                  <div className="mt-1.5 grid grid-cols-5 gap-1.5 text-[11px]">
                     {(isMarketBuy ? [-10, -1, +1, +10, +25] : [-100, -10, +10, +100, +200]).map((step) => (
                       <button
                         key={step}
-                        className="rounded-xl border border-white/15 bg-white/5 py-1.5 font-semibold text-zinc-200"
+                        className="rounded-xl border border-white/15 bg-white/5 py-1 font-semibold text-zinc-200"
                         onClick={() => setTradeInput((v) => shiftShare(v, step))}
                       >
                         {step > 0 ? `+${step}` : step}
@@ -295,36 +308,58 @@ export default function MarketDetailPage() {
                   </div>
                 </div>
 
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold text-zinc-100">Market Position</span>
+                    <span className="text-[10px] uppercase tracking-[0.2em] text-zinc-500">
+                      {positionLoading ? "Loading" : "Projected"}
+                    </span>
+                  </div>
+                  {!user ? (
+                    <p className="mt-2 text-sm text-zinc-400">Connect your wallet to inspect YES / NO balances for this market.</p>
+                  ) : (
+                    <div className="mt-2.5 grid gap-2 sm:grid-cols-2">
+                      <PositionColumn
+                        title="YES"
+                        free={formatLots(position?.yes_free_lots)}
+                        locked={formatLots(position?.yes_locked_lots)}
+                        pending={formatLots(position?.yes_pending_lots)}
+                      />
+                      <PositionColumn
+                        title="NO"
+                        free={formatLots(position?.no_free_lots)}
+                        locked={formatLots(position?.no_locked_lots)}
+                        pending={formatLots(position?.no_pending_lots)}
+                      />
+                    </div>
+                  )}
+                </div>
+
                 {orderType === "limit" ? (
-                  <div className="rounded-2xl border border-white/10 p-4">
-                    <span className="text-base font-semibold text-zinc-200">Expiration</span>
-                    <select
-                      className="mt-3 w-full rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-base text-zinc-100 outline-none"
-                      value={expiryPreset}
-                      onChange={(event) => setExpiryPreset(event.target.value as ExpiryPreset)}
-                    >
-                      <option value="1h">In 1 hour</option>
-                      <option value="6h">In 6 hours</option>
-                      <option value="23h">In 23 hours</option>
-                      <option value="3d">In 3 days</option>
-                      <option value="7d">In 7 days</option>
-                    </select>
+                  <div className="rounded-2xl border border-white/10 p-3">
+                    <span className="text-sm font-semibold text-zinc-200">Expiration</span>
+                    <input
+                      className="mt-2.5 w-full rounded-xl border border-white/15 bg-white/5 px-3 py-1.5 text-sm text-zinc-100 outline-none"
+                      max="2099-12-31T23:59:59"
+                      min={currentLocalDateTime()}
+                      step={1}
+                      type="datetime-local"
+                      value={expiryInput}
+                      onChange={(event) => setExpiryInput(event.target.value)}
+                    />
+                    <p className="mt-1.5 text-[11px] leading-4 text-zinc-500">Local time, accurate to seconds. Latest allowed date is 2099-12-31 23:59:59.</p>
                   </div>
                 ) : null}
 
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm">
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-3 text-sm">
                   <SummaryRow label="Average price" value={`${Math.round(averagePrice * 100)}¢`} />
                   <SummaryRow label={isMarketBuy ? "You pay" : "Estimated cost"} value={`$${estimatedCost.toFixed(2)}`} />
                   <SummaryRow label="Estimated shares" value={estimatedShares.toFixed(2)} />
                   <SummaryRow label={`Payout if ${outcome.toUpperCase()} wins`} value={`$${payoutIfWin.toFixed(2)}`} highlight />
                 </div>
 
-                <div className="text-right text-lg font-semibold text-blue-400">
-                  Available: {balance} USDC
-                </div>
-
                 <button
-                  className={`w-full rounded-2xl px-4 py-3 text-xl font-semibold text-white shadow-lg ${
+                  className={`w-full rounded-2xl px-4 py-2.5 text-base font-semibold text-white shadow-lg ${
                     action === "buy" ? "bg-emerald-500 hover:bg-emerald-400" : "bg-rose-500 hover:bg-rose-400"
                   } disabled:opacity-50`}
                   disabled={tradeLoading || !tradeInput}
@@ -337,7 +372,7 @@ export default function MarketDetailPage() {
 
                 {lastOrderID ? (
                   <button
-                    className="w-full rounded-2xl border border-white/20 px-4 py-3 text-lg font-medium text-zinc-100 hover:bg-white/10"
+                    className="w-full rounded-2xl border border-white/20 px-4 py-2.5 text-base font-medium text-zinc-100 hover:bg-white/10"
                     onClick={async () => {
                       const token = await getAccessToken();
                       if (!token) {
@@ -350,6 +385,7 @@ export default function MarketDetailPage() {
                           headers: { Authorization: `Bearer ${token}` },
                         });
                         toast.success("Cancel command accepted", { description: lastOrderID });
+                        await Promise.all([syncTradingBalance(), syncPosition()]);
                       } catch (error: unknown) {
                         const response =
                           typeof error === "object" && error !== null && "response" in error
@@ -365,7 +401,7 @@ export default function MarketDetailPage() {
 
                 {!user ? (
                   <button
-                    className="w-full rounded-2xl border border-white/20 px-4 py-3 text-lg font-medium text-zinc-100 hover:bg-white/10"
+                    className="w-full rounded-2xl border border-white/20 px-4 py-2.5 text-base font-medium text-zinc-100 hover:bg-white/10"
                     onClick={login}
                   >
                     Connect wallet to trade
@@ -381,9 +417,30 @@ export default function MarketDetailPage() {
 }
 
 const SummaryRow = ({ label, value, highlight = false }: { label: string; value: string; highlight?: boolean }) => (
-  <div className="flex items-center justify-between py-1">
+  <div className="flex items-center justify-between py-0.5 text-[13px]">
     <span className="text-zinc-400">{label}</span>
     <span className={highlight ? "font-semibold text-emerald-400" : "font-semibold text-zinc-100"}>{value}</span>
+  </div>
+);
+
+const PositionColumn = ({
+  title,
+  free,
+  locked,
+  pending,
+}: {
+  title: string;
+  free: string;
+  locked: string;
+  pending: string;
+}) => (
+  <div className="rounded-2xl border border-white/10 bg-[#171b25] p-2.5 text-sm">
+    <div className="text-xs uppercase tracking-[0.2em] text-zinc-500">{title}</div>
+    <div className="mt-2 space-y-1">
+      <SummaryRow label="Available" value={free} />
+      <SummaryRow label="Locked" value={locked} />
+      <SummaryRow label="Pending" value={pending} />
+    </div>
   </div>
 );
 
@@ -405,15 +462,38 @@ function shiftShare(raw: string, delta: number): string {
   return Math.max(0, now + delta).toString();
 }
 
-function expiryRFC3339(preset: ExpiryPreset): string {
+function defaultLimitExpiryLocal(): string {
   const now = new Date();
-  const expiresAt = new Date(now);
-  if (preset === "1h") expiresAt.setHours(expiresAt.getHours() + 1);
-  if (preset === "6h") expiresAt.setHours(expiresAt.getHours() + 6);
-  if (preset === "23h") expiresAt.setHours(expiresAt.getHours() + 23);
-  if (preset === "3d") expiresAt.setDate(expiresAt.getDate() + 3);
-  if (preset === "7d") expiresAt.setDate(expiresAt.getDate() + 7);
-  return expiresAt.toISOString();
+  now.setSeconds(now.getSeconds() + 23 * 60 * 60);
+  return formatDateTimeLocal(now);
+}
+
+function currentLocalDateTime(): string {
+  return formatDateTimeLocal(new Date());
+}
+
+function formatDateTimeLocal(value: Date): string {
+  const year = value.getFullYear().toString().padStart(4, "0");
+  const month = (value.getMonth() + 1).toString().padStart(2, "0");
+  const day = value.getDate().toString().padStart(2, "0");
+  const hours = value.getHours().toString().padStart(2, "0");
+  const minutes = value.getMinutes().toString().padStart(2, "0");
+  const seconds = value.getSeconds().toString().padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+}
+
+function parseLocalDateTime(value: string): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+}
+
+function localDateTimeToISOString(value: string): string {
+  const parsed = parseLocalDateTime(value);
+  return parsed ? parsed.toISOString() : "";
 }
 
 function formatTime(value: string): string {
@@ -441,4 +521,12 @@ function buildDescription(market: Market | null, metadata: MarketMetadataDoc | n
   if (metadata?.description) return metadata.description;
   if (market?.description) return market.description;
   return "No rules provided.";
+}
+
+function formatLots(raw?: string): string {
+  const parsed = Number(raw || "0");
+  if (!Number.isFinite(parsed)) {
+    return "0.00";
+  }
+  return (parsed / 100).toFixed(2);
 }

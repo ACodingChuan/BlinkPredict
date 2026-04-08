@@ -237,6 +237,85 @@ pub mod predix_program {
         Ok(())
     }
 
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require_keys_eq!(
+            ctx.accounts.collateral_mint.key(),
+            ctx.accounts.config.collateral_mint,
+            ErrorCode::InvalidTokenAccount
+        );
+        require_keys_eq!(
+            ctx.accounts.global_vault.key(),
+            ctx.accounts.config.global_vault,
+            ErrorCode::InvalidTokenAccount
+        );
+        require_keys_eq!(
+            ctx.accounts.user_token_account.owner,
+            ctx.accounts.user.key(),
+            ErrorCode::InvalidTokenAccount
+        );
+        require_keys_eq!(
+            ctx.accounts.user_token_account.mint,
+            ctx.accounts.collateral_mint.key(),
+            ErrorCode::InvalidTokenAccount
+        );
+        require_keys_eq!(
+            ctx.accounts.global_vault.owner,
+            ctx.accounts.global_vault_authority.key(),
+            ErrorCode::InvalidTokenAccount
+        );
+        require_keys_eq!(
+            ctx.accounts.global_vault.mint,
+            ctx.accounts.collateral_mint.key(),
+            ErrorCode::InvalidTokenAccount
+        );
+
+        let multiplier = ledger_unit_multiplier(ctx.accounts.collateral_mint.decimals)?;
+        let token_amount = amount
+            .checked_mul(multiplier)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        {
+            let mut ledger = ctx.accounts.user_ledger.load_mut()?;
+            require_keys_eq!(
+                ledger.owner,
+                ctx.accounts.user.key(),
+                ErrorCode::InvalidAccountOwner
+            );
+            require!(
+                ledger.available_usdc >= amount,
+                ErrorCode::InsufficientCollateral
+            );
+            ledger.available_usdc = ledger
+                .available_usdc
+                .checked_sub(amount)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
+
+        let bump_seed = [ctx.accounts.config.vault_authority_bump];
+        let signer_seeds: &[&[u8]] = &[b"global_vault_authority", &bump_seed];
+        let signer = [signer_seeds];
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.global_vault.to_account_info(),
+            mint: ctx.accounts.collateral_mint.to_account_info(),
+            to: ctx.accounts.user_token_account.to_account_info(),
+            authority: ctx.accounts.global_vault_authority.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            &signer,
+        );
+        transfer_checked(cpi_ctx, token_amount, ctx.accounts.collateral_mint.decimals)?;
+
+        emit!(WithdrawSettled {
+            owner: ctx.accounts.user.key(),
+            amount,
+        });
+
+        Ok(())
+    }
+
     pub fn settle_match_batch<'info>(
         ctx: Context<'_, '_, 'info, 'info, SettleMatchBatch<'info>>,
         args: SettleMatchBatchArgs,
@@ -730,6 +809,32 @@ pub struct Deposit<'info> {
     pub collateral_mint: InterfaceAccount<'info, Mint>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, GlobalConfig>,
+    #[account(
+        mut,
+        seeds = [b"user_ledger", user.key().as_ref()],
+        bump
+    )]
+    pub user_ledger: AccountLoader<'info, UserLedger>,
+    #[account(mut)]
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut)]
+    pub global_vault: InterfaceAccount<'info, TokenAccount>,
+    /// CHECK: PDA signer only.
+    #[account(
+        seeds = [b"global_vault_authority"],
+        bump = config.vault_authority_bump,
+    )]
+    pub global_vault_authority: UncheckedAccount<'info>,
+    pub collateral_mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]

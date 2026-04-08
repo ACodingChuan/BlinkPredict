@@ -92,6 +92,18 @@ export interface OpenOrdersResponse {
   matching_enabled: boolean;
 }
 
+export interface PositionResponse {
+  market_id: string;
+  wallet_address: string;
+  yes_free_lots: string;
+  yes_locked_lots: string;
+  yes_pending_lots: string;
+  no_free_lots: string;
+  no_locked_lots: string;
+  no_pending_lots: string;
+  collateral_locked_units: string;
+}
+
 export interface TradeItem {
   id: string;
   price?: string;

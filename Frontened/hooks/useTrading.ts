@@ -5,7 +5,6 @@ import { Market, OrderbookSnapshot, PlaceOrderCommandResponse, TransactionEnvelo
 import { toast } from "sonner";
 import { usePrivy } from "@/lib/auth-client";
 import { useSignAndSendTransaction } from "@/hooks/useWalletTransactions";
-import { useUSDCStore } from "@/store/usdcStore";
 import { useCurrentSolanaWallet } from "@/hooks/useCurrentSolanaWallet";
 import {
   buildOrderIntent,
@@ -32,13 +31,6 @@ export const useTrading = () => {
   const { getAccessToken } = usePrivy();
   const { signAndSendTransaction } = useSignAndSendTransaction();
   const { wallet, walletAddress } = useCurrentSolanaWallet();
-  const syncBalance = useUSDCStore((state) => state.syncBalance);
-
-  const triggerBalanceSync = () => {
-    if (walletAddress) {
-      void syncBalance(walletAddress);
-    }
-  };
 
   const maybeSendTransaction = async (payload: TransactionEnvelope) => {
     if (!payload.tx_message) {
@@ -94,9 +86,7 @@ export const useTrading = () => {
           },
           { headers: { Authorization: `Bearer ${token}` } },
         );
-        const ok = await maybeSendTransaction(data);
-        if (ok) triggerBalanceSync();
-        return ok;
+        return maybeSendTransaction(data);
       }
 
       if (orderType === "claim") {
@@ -107,9 +97,7 @@ export const useTrading = () => {
           { market_id: market.market_id, collateral_mint: market.collateral_mint, amount: 0 },
           { headers: { Authorization: `Bearer ${token}` } },
         );
-        const ok = await maybeSendTransaction(data);
-        if (ok) triggerBalanceSync();
-        return ok;
+        return maybeSendTransaction(data);
       }
 
       const parsedAmount = Number(amount || "0");
@@ -211,8 +199,6 @@ export const useTrading = () => {
         description: `command_id: ${data.command_id}`,
       });
       onAccepted?.(data);
-      await refreshTradingBalance();
-      triggerBalanceSync();
       return true;
     } catch (error: unknown) {
       const response = typeof error === "object" && error !== null && "response" in error ? (error as { response?: { data?: { message?: string; code?: string } } }).response : undefined;
@@ -228,17 +214,7 @@ export const useTrading = () => {
     }
   };
 
-  const refreshTradingBalance = async () => {
-    if (!walletAddress) return;
-
-    try {
-      await syncBalance(walletAddress);
-    } catch (error) {
-      console.error("Failed to refresh trading balance:", error);
-    }
-  };
-
-  return { placeOrder, loading, refreshTradingBalance };
+  return { placeOrder, loading };
 };
 function toPriceTick(price: number): number | undefined {
   if (!Number.isFinite(price)) {

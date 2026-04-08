@@ -6,7 +6,7 @@ import { useUSDCBalance } from "@/hooks/useUSDCBalance";
 
 export default function ProfilePage() {
   const { user, login } = usePrivy();
-  const { balance, totalBalance } = useUSDCBalance();
+  const { availableBalance, lockedBalance, pendingBalance, totalBalance } = useUSDCBalance({ autoFetch: false });
   const solanaAddress = user?.walletAddress || null;
 
   return (
@@ -23,7 +23,9 @@ export default function ProfilePage() {
           <div className="mt-6 grid gap-4 md:grid-cols-2">
             <Info label="Wallet" value={solanaAddress || "No Solana wallet linked"} mono />
             <Info label="Trading total" value={`${totalBalance} vUSDC`} />
-            <Info label="Trading available" value={`${balance} vUSDC`} />
+            <Info label="Trading available" value={`${availableBalance} vUSDC`} />
+            <Info label="Trading locked" value={`${lockedBalance} vUSDC`} />
+            <Info label="Trading pending" value={`${pendingBalance} vUSDC`} />
             <Info label="v1a status" value="Position and claim flows are scaffolded; matching-led fills arrive in v1b." />
             <Info label="Primary account" value={solanaAddress || "Wallet account"} />
           </div>

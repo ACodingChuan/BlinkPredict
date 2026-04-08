@@ -1,17 +1,11 @@
 "use client";
 
-import { useState } from "react";
 import Link from "next/link";
+import { useState } from "react";
 import { usePrivy } from "@/lib/auth-client";
-import { useTheme } from "next-themes";
-import { toast } from "sonner";
-import api from "@/app/utils/axiosInstance";
-import { useUSDCStore } from "@/store/usdcStore";
 
 export const UserMenu = () => {
-  const { user, authenticated, logout, getAccessToken } = usePrivy();
-  const syncBalance = useUSDCStore((state) => state.syncBalance);
-  const { theme, setTheme } = useTheme();
+  const { user, authenticated, logout } = usePrivy();
   const [isOpen, setIsOpen] = useState(false);
 
   if (!user || !authenticated) return null;
@@ -19,32 +13,6 @@ export const UserMenu = () => {
   const address = user.walletAddress;
   const displayName = `${address.slice(0, 6)}...${address.slice(-4)}`;
   const initial = address[0]?.toUpperCase() || "U";
-
-  const handleFaucet = async () => {
-    try {
-      const token = await getAccessToken();
-      if (!token) {
-        toast.error("Not authenticated", { description: "Please login again." });
-        return;
-      }
-      const { data } = await api.post(
-        "/faucet/claim",
-        { wallet_address: address },
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
-      toast.success("Faucet submitted", { description: data.signature });
-      void syncBalance(address);
-      setIsOpen(false);
-    } catch (error: unknown) {
-      const response =
-        typeof error === "object" && error !== null && "response" in error
-          ? (error as { response?: { status?: number; data?: { message?: string; next_allowed_at?: string } } }).response
-          : undefined;
-      const message = response?.data?.message || (error instanceof Error ? error.message : "Faucet failed");
-      const next = response?.data?.next_allowed_at;
-      toast.error(message, next ? { description: `Next allowed at: ${next}` } : undefined);
-    }
-  };
 
   return (
     <div className="relative">
@@ -65,13 +33,12 @@ export const UserMenu = () => {
             <p className="truncate text-sm font-bold text-zinc-900 dark:text-white">{displayName}</p>
             <p className="mt-0.5 truncate font-mono text-xs text-zinc-500">{address}</p>
           </div>
-          <div className="py-1">
-            <button onClick={handleFaucet} className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm font-semibold text-[#07C285] hover:bg-zinc-50 dark:hover:bg-zinc-800" type="button">Faucet (vUSDC)</button>
-            <Link href="/profile" className="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800">Profile</Link>
-            {user.isAdmin ? <Link href="/admin/markets" className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-[#07C285] hover:bg-zinc-50 dark:hover:bg-zinc-800">Admin Dashboard</Link> : null}
-          </div>
+          {user.isAdmin ? (
+            <div className="py-1">
+              <Link href="/admin/markets" className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-[#07C285] hover:bg-zinc-50 dark:hover:bg-zinc-800">Admin Dashboard</Link>
+            </div>
+          ) : null}
           <div className="mt-1 border-t border-zinc-100 pt-1 dark:border-zinc-800">
-            <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")} className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800" type="button">Theme</button>
             <button onClick={() => void logout()} className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-900/10" type="button">Log out</button>
           </div>
         </div>

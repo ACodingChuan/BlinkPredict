@@ -27,6 +27,12 @@ pub struct DepositSettled {
 }
 
 #[event]
+pub struct WithdrawSettled {
+    pub owner: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
 pub struct UserLedgerClosed {
     pub owner: Pubkey,
 }
