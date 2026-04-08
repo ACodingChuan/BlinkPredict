@@ -102,8 +102,12 @@ CREATE TABLE IF NOT EXISTS funds_recovery_state (
     pending_reserves_json JSONB NOT NULL DEFAULT '[]'::JSONB,
     processed_submits_json JSONB NOT NULL DEFAULT '[]'::JSONB,
     processed_deposits_json JSONB NOT NULL DEFAULT '[]'::JSONB,
+    processed_withdrawals_json JSONB NOT NULL DEFAULT '[]'::JSONB,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE funds_recovery_state
+    ADD COLUMN IF NOT EXISTS processed_withdrawals_json JSONB NOT NULL DEFAULT '[]'::JSONB;
 
 CREATE TABLE IF NOT EXISTS deposit_requests (
     id UUID PRIMARY KEY,
@@ -142,6 +146,24 @@ CREATE INDEX IF NOT EXISTS idx_deposit_submissions_status_created
 
 CREATE INDEX IF NOT EXISTS idx_deposit_submissions_wallet_created
     ON deposit_submissions (wallet_address, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS withdraw_submissions (
+    signature TEXT PRIMARY KEY,
+    wallet_address VARCHAR(44) NOT NULL,
+    amount_units BIGINT NOT NULL CHECK (amount_units > 0),
+    status TEXT NOT NULL CHECK (status IN ('submitted', 'watching', 'confirmed', 'failed', 'expired')),
+    failure_reason TEXT NOT NULL DEFAULT '',
+    slot BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    confirmed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_withdraw_submissions_status_created
+    ON withdraw_submissions (status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_withdraw_submissions_wallet_created
+    ON withdraw_submissions (wallet_address, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS market_submissions (
     signature TEXT PRIMARY KEY,

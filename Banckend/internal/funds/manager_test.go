@@ -51,7 +51,7 @@ func TestBuyFillStaysPendingUntilSettlementConfirmed(t *testing.T) {
 	if snap.Position.PendingYesShares != 100 {
 		t.Fatalf("expected pending yes shares to increase, got %#v", snap.Position)
 	}
-	if snap.Ledger.LockedUSDC != 0 || snap.Ledger.AvailableUSDC != 945 || snap.Ledger.PendingUSDC != -55 {
+	if snap.Ledger.LockedUSDC != 0 || snap.Ledger.AvailableUSDC != 945 || snap.Ledger.PendingUSDC != 0 {
 		t.Fatalf("unexpected ledger after fill: %#v", snap.Ledger)
 	}
 

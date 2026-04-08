@@ -217,7 +217,7 @@ func TestApplySettlementConfirmedByBatch_BuyYes(t *testing.T) {
 	m.SeedLedger(wallet, UserWallet{
 		AvailableUSDC: 0,
 		LockedUSDC:    0,
-		PendingUSDC:   -60, // 成交时花了 60 units
+		PendingUSDC:   0,
 	})
 	m.SeedPosition(wallet, pda, MarketPosition{
 		PendingYesShares: 100, // 成交了 100 股等待确认
@@ -261,12 +261,19 @@ func TestApplySettlementConfirmedByBatch_BuyYes(t *testing.T) {
 	}
 
 	pos := m.Position(wallet, pda)
+	ledger := m.Ledger(wallet)
 	// pending_yes_shares 应该从 100 减少到 0，available_yes_shares 应该增加 100
 	if pos.PendingYesShares != 0 {
 		t.Errorf("expected PendingYesShares=0, got %d", pos.PendingYesShares)
 	}
 	if pos.AvailableYesShares != 100 {
 		t.Errorf("expected AvailableYesShares=100, got %d", pos.AvailableYesShares)
+	}
+	if ledger.PendingUSDC != 0 {
+		t.Errorf("expected PendingUSDC=0 after confirmed buy, got %d", ledger.PendingUSDC)
+	}
+	if ledger.AvailableUSDC != 0 {
+		t.Errorf("expected AvailableUSDC unchanged on confirmed buy, got %d", ledger.AvailableUSDC)
 	}
 }
 
@@ -279,7 +286,7 @@ func TestApplySettlementFailedByBatch_BuyYes(t *testing.T) {
 	m.SeedLedger(wallet, UserWallet{
 		AvailableUSDC: 40, // 限价差额已还回
 		LockedUSDC:    0,
-		PendingUSDC:   -60, // 实际花了 60（负数表示买入花费）
+		PendingUSDC:   0,
 	})
 	m.SeedPosition(wallet, pda, MarketPosition{
 		PendingYesShares: 100,

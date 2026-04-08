@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,8 +34,11 @@ import (
 	"blinkpredict/banckend/internal/pusher"
 	"blinkpredict/banckend/internal/query"
 	"blinkpredict/banckend/internal/settlement"
+	internalsolana "blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
+	"blinkpredict/banckend/internal/withdrawconfirm"
+	"blinkpredict/banckend/internal/withdraws"
 
 	gsolana "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -143,7 +148,10 @@ func (s *Server) Router() http.Handler {
 	}
 	r.Post("/api/markets", s.handleCreateMarket)
 	r.Post("/api/faucet/claim", s.handleFaucetClaim)
+	r.Post("/api/deposits/envelope", s.handleBuildDepositEnvelope)
 	r.Post("/api/deposits", s.handleSubmitDeposit)
+	r.Post("/api/withdrawals/envelope", s.handleBuildWithdrawEnvelope)
+	r.Post("/api/withdrawals", s.handleSubmitWithdraw)
 	r.Post("/api/orders", s.handlePlaceOrder)
 	r.Delete("/api/orders/{orderId}", s.handleCancelOrder)
 
@@ -227,16 +235,18 @@ func (s *Server) handleSubmitDeposit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "signature is required")
 		return
 	}
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, req.WalletAddress)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	req.WalletAddress = walletAddress
 	if req.AmountUnits == 0 {
 		writeError(w, http.StatusBadRequest, "amount_units must be greater than 0")
 		return
 	}
 	if _, err := gsolana.SignatureFromBase58(req.Signature); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid signature")
-		return
-	}
-	if _, err := gsolana.PublicKeyFromBase58(req.WalletAddress); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid wallet_address")
 		return
 	}
 	repo := depositconfirm.NewRepository(s.dbPool)
@@ -267,6 +277,94 @@ func (s *Server) handleSubmitDeposit(w http.ResponseWriter, r *http.Request) {
 		WalletAddress: submission.WalletAddress,
 		AmountUnits:   submission.AmountUnits,
 	})
+}
+
+func (s *Server) handleSubmitWithdraw(w http.ResponseWriter, r *http.Request) {
+	var req withdraws.SubmitWithdrawRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Signature = strings.TrimSpace(req.Signature)
+	req.WalletAddress = strings.TrimSpace(req.WalletAddress)
+	if req.Signature == "" {
+		writeError(w, http.StatusBadRequest, "signature is required")
+		return
+	}
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, req.WalletAddress)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	req.WalletAddress = walletAddress
+	if req.AmountUnits == 0 {
+		writeError(w, http.StatusBadRequest, "amount_units must be greater than 0")
+		return
+	}
+	if _, err := gsolana.SignatureFromBase58(req.Signature); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid signature")
+		return
+	}
+	repo := withdrawconfirm.NewRepository(s.dbPool)
+	submission, err := repo.UpsertSubmitted(r.Context(), protocol.WithdrawConfirmCommand{
+		Signature:     req.Signature,
+		WalletAddress: req.WalletAddress,
+		AmountUnits:   req.AmountUnits,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if submission.WalletAddress != req.WalletAddress || submission.AmountUnits != req.AmountUnits {
+		writeError(w, http.StatusConflict, "signature already registered with a different wallet or amount")
+		return
+	}
+	if err := s.commands.PublishWithdrawConfirm(r.Context(), protocol.WithdrawConfirmCommand{
+		Signature:     submission.Signature,
+		WalletAddress: submission.WalletAddress,
+		AmountUnits:   submission.AmountUnits,
+	}); err != nil {
+		writeError(w, http.StatusNotImplemented, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, withdraws.SubmitWithdrawResponse{
+		Status:        submission.Status,
+		Signature:     submission.Signature,
+		WalletAddress: submission.WalletAddress,
+		AmountUnits:   submission.AmountUnits,
+	})
+}
+
+func (s *Server) handleBuildDepositEnvelope(w http.ResponseWriter, r *http.Request) {
+	envelope, err := s.buildTransferEnvelope(r, "deposit")
+	if err != nil {
+		status := http.StatusBadRequest
+		switch {
+		case strings.Contains(err.Error(), "not configured"):
+			status = http.StatusNotImplemented
+		case strings.Contains(err.Error(), "not initialized"), strings.Contains(err.Error(), "not found"):
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope)
+}
+
+func (s *Server) handleBuildWithdrawEnvelope(w http.ResponseWriter, r *http.Request) {
+	envelope, err := s.buildTransferEnvelope(r, "withdraw")
+	if err != nil {
+		status := http.StatusBadRequest
+		switch {
+		case strings.Contains(err.Error(), "not configured"):
+			status = http.StatusNotImplemented
+		case strings.Contains(err.Error(), "not initialized"), strings.Contains(err.Error(), "not found"):
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope)
 }
 
 // handleAuthChallenge godoc
@@ -1279,11 +1377,13 @@ func parseWalletAccountSnapshot(values map[string]string) (walletAccountSnapshot
 		CollateralTotalUnits:   total,
 		CollateralFreeUnits:    free,
 		CollateralLockedUnits:  locked,
-		CollateralPendingUnits: pending,
+		CollateralPendingUnits: clampNonNegativeInt64(pending),
 	}, nil
 }
 
 func (s *Server) upsertWalletAccountSnapshot(ctx context.Context, walletAddress string, next walletAccountSnapshot) error {
+	next.CollateralPendingUnits = clampNonNegativeInt64(next.CollateralPendingUnits)
+	next.CollateralTotalUnits = next.CollateralFreeUnits + next.CollateralLockedUnits + uint64(next.CollateralPendingUnits)
 	if err := s.persistWalletAccountSnapshot(ctx, walletAddress, next); err != nil {
 		return err
 	}
@@ -1348,7 +1448,16 @@ func (s *Server) loadWalletAccountSnapshotFromDB(ctx context.Context, walletAddr
 	if err := row.Scan(&snapshot.CollateralTotalUnits, &snapshot.CollateralFreeUnits, &snapshot.CollateralLockedUnits, &snapshot.CollateralPendingUnits); err != nil {
 		return walletAccountSnapshot{}, err
 	}
+	snapshot.CollateralPendingUnits = clampNonNegativeInt64(snapshot.CollateralPendingUnits)
+	snapshot.CollateralTotalUnits = snapshot.CollateralFreeUnits + snapshot.CollateralLockedUnits + uint64(snapshot.CollateralPendingUnits)
 	return snapshot, nil
+}
+
+func clampNonNegativeInt64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 func (s *Server) loadPositionSnapshotFromDB(ctx context.Context, marketID uint64, walletAddress string) (positionSnapshot, error) {
@@ -1577,6 +1686,175 @@ func isMissingTokenAccountError(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "not found") || strings.Contains(message, "could not find account")
+}
+
+type transferEnvelopeRequest struct {
+	WalletAddress string `json:"wallet_address"`
+	AmountUnits   uint64 `json:"amount_units"`
+}
+
+func (s *Server) buildTransferEnvelope(r *http.Request, kind string) (orders.TransactionEnvelope, error) {
+	if s.rpcClient == nil {
+		return orders.TransactionEnvelope{}, errors.New("solana rpc client is not configured")
+	}
+	var req transferEnvelopeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return orders.TransactionEnvelope{}, errors.New("invalid request body")
+	}
+	walletAddress, err := s.resolveAuthenticatedWalletAddress(r, strings.TrimSpace(req.WalletAddress))
+	if err != nil {
+		return orders.TransactionEnvelope{}, err
+	}
+	if req.AmountUnits == 0 {
+		return orders.TransactionEnvelope{}, errors.New("amount_units must be greater than 0")
+	}
+
+	programID, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(s.cfg.ProgramID))
+	if err != nil {
+		return orders.TransactionEnvelope{}, errors.New("program_id is not configured")
+	}
+	mint, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(s.cfg.VUSDCMint))
+	if err != nil {
+		return orders.TransactionEnvelope{}, errors.New("vusdc mint is not configured")
+	}
+	globalVault, err := gsolana.PublicKeyFromBase58(strings.TrimSpace(s.cfg.GlobalVault))
+	if err != nil {
+		return orders.TransactionEnvelope{}, errors.New("global vault is not configured")
+	}
+	wallet, err := gsolana.PublicKeyFromBase58(walletAddress)
+	if err != nil {
+		return orders.TransactionEnvelope{}, errors.New("invalid wallet_address")
+	}
+	configPDA, err := internalsolana.DeriveConfigPDA(programID)
+	if err != nil {
+		return orders.TransactionEnvelope{}, err
+	}
+	userLedgerPDA, err := internalsolana.DeriveUserLedgerPDA(programID, wallet)
+	if err != nil {
+		return orders.TransactionEnvelope{}, err
+	}
+	vaultAuthorityPDA, _, err := gsolana.FindProgramAddress([][]byte{[]byte("global_vault_authority")}, programID)
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("derive global vault authority: %w", err)
+	}
+	tokenProgramID, err := detectMintTokenProgram(r.Context(), s.rpcClient, mint)
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("detect token program: %w", err)
+	}
+	userATA, err := findAssociatedTokenAddress(wallet, mint, tokenProgramID)
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("derive associated token address: %w", err)
+	}
+
+	instructions := make([]gsolana.Instruction, 0, 2)
+	ataInfo, err := s.rpcClient.GetAccountInfo(r.Context(), userATA)
+	if err != nil && !isMissingTokenAccountError(err) {
+		return orders.TransactionEnvelope{}, fmt.Errorf("lookup user token account: %w", err)
+	}
+	ataExists := err == nil && ataInfo != nil && ataInfo.Value != nil
+
+	switch kind {
+	case "deposit":
+		if !ataExists {
+			return orders.TransactionEnvelope{}, errors.New("wallet vUSDC token account not found")
+		}
+	case "withdraw":
+		ledgerInfo, ledgerErr := s.rpcClient.GetAccountInfo(r.Context(), userLedgerPDA)
+		if ledgerErr != nil && !isMissingTokenAccountError(ledgerErr) {
+			return orders.TransactionEnvelope{}, fmt.Errorf("lookup user ledger: %w", ledgerErr)
+		}
+		if ledgerErr != nil || ledgerInfo == nil || ledgerInfo.Value == nil {
+			return orders.TransactionEnvelope{}, errors.New("trading ledger is not initialized")
+		}
+		if !ataExists {
+			instructions = append(instructions, buildCreateATAInstruction(
+				wallet,
+				wallet,
+				mint,
+				userATA,
+				tokenProgramID,
+				gsolana.SPLAssociatedTokenAccountProgramID,
+			))
+		}
+	default:
+		return orders.TransactionEnvelope{}, errors.New("unsupported transfer kind")
+	}
+
+	data := encodeAnchorAmountInstruction(kind, req.AmountUnits)
+	accounts := gsolana.AccountMetaSlice{
+		{PublicKey: wallet, IsSigner: true, IsWritable: true},
+		{PublicKey: configPDA, IsSigner: false, IsWritable: false},
+		{PublicKey: userLedgerPDA, IsSigner: false, IsWritable: true},
+		{PublicKey: userATA, IsSigner: false, IsWritable: true},
+		{PublicKey: globalVault, IsSigner: false, IsWritable: true},
+		{PublicKey: vaultAuthorityPDA, IsSigner: false, IsWritable: false},
+		{PublicKey: mint, IsSigner: false, IsWritable: false},
+		{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
+	}
+	if kind == "deposit" {
+		accounts = append(accounts, &gsolana.AccountMeta{PublicKey: gsolana.SystemProgramID})
+	}
+	instructions = append(instructions, gsolana.NewInstruction(programID, accounts, data))
+
+	latest, err := s.rpcClient.GetLatestBlockhash(r.Context(), rpc.CommitmentProcessed)
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("get latest blockhash: %w", err)
+	}
+	tx, err := gsolana.NewTransaction(
+		instructions,
+		latest.Value.Blockhash,
+		gsolana.TransactionPayer(wallet),
+	)
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("build transaction: %w", err)
+	}
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return orders.TransactionEnvelope{}, fmt.Errorf("serialize transaction: %w", err)
+	}
+
+	message := "Deposit transaction ready for wallet signature"
+	if kind == "withdraw" {
+		message = "Withdraw transaction ready for wallet signature"
+	}
+	return orders.TransactionEnvelope{
+		TxMessage: base64.StdEncoding.EncodeToString(raw),
+		Message:   message,
+	}, nil
+}
+
+func encodeAnchorAmountInstruction(name string, amount uint64) []byte {
+	discriminator := anchorInstructionDiscriminator(name)
+	data := make([]byte, 16)
+	copy(data[:8], discriminator[:])
+	binary.LittleEndian.PutUint64(data[8:], amount)
+	return data
+}
+
+func anchorInstructionDiscriminator(name string) [8]byte {
+	hash := sha256.Sum256([]byte("global:" + name))
+	var out [8]byte
+	copy(out[:], hash[:8])
+	return out
+}
+
+func buildCreateATAInstruction(
+	payer gsolana.PublicKey,
+	wallet gsolana.PublicKey,
+	mint gsolana.PublicKey,
+	ata gsolana.PublicKey,
+	tokenProgramID gsolana.PublicKey,
+	associatedProgramID gsolana.PublicKey,
+) gsolana.Instruction {
+	accounts := gsolana.AccountMetaSlice{
+		{PublicKey: payer, IsSigner: true, IsWritable: true},
+		{PublicKey: ata, IsSigner: false, IsWritable: true},
+		{PublicKey: wallet, IsSigner: false, IsWritable: false},
+		{PublicKey: mint, IsSigner: false, IsWritable: false},
+		{PublicKey: gsolana.SystemProgramID, IsSigner: false, IsWritable: false},
+		{PublicKey: tokenProgramID, IsSigner: false, IsWritable: false},
+	}
+	return gsolana.NewInstruction(associatedProgramID, accounts, []byte{})
 }
 
 // handleCancelOrder godoc

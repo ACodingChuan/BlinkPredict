@@ -7,18 +7,20 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const recoveryStateRowID int16 = 1
 
 type RecoveryState struct {
-	LastFlushedEventSeq uint64
-	Inflight            []*InflightMatch
-	PendingTerminals    []*PendingTerminal
-	PendingReserves     []PendingReserve
-	ProcessedSubmits    []string
-	ProcessedDeposits   []string
+	LastFlushedEventSeq  uint64
+	Inflight             []*InflightMatch
+	PendingTerminals     []*PendingTerminal
+	PendingReserves      []PendingReserve
+	ProcessedSubmits     []string
+	ProcessedDeposits    []string
+	ProcessedWithdrawals []string
 }
 
 func loadRecoveryState(ctx context.Context, pool *pgxpool.Pool) (*RecoveryState, error) {
@@ -32,6 +34,7 @@ func loadRecoveryState(ctx context.Context, pool *pgxpool.Pool) (*RecoveryState,
 		pendingReservesJSON []byte
 		submitsJSON         []byte
 		depositsJSON        []byte
+		withdrawalsJSON     []byte
 	)
 	err := pool.QueryRow(ctx, `
 		SELECT last_flushed_evt_seq,
@@ -39,10 +42,24 @@ func loadRecoveryState(ctx context.Context, pool *pgxpool.Pool) (*RecoveryState,
 		       pending_terminals_json,
 		       pending_reserves_json,
 		       processed_submits_json,
-		       processed_deposits_json
+		       processed_deposits_json,
+		       processed_withdrawals_json
 		FROM funds_recovery_state
 		WHERE recovery_id = $1
-	`, recoveryStateRowID).Scan(&lastSeq, &inflightJSON, &pendingJSON, &pendingReservesJSON, &submitsJSON, &depositsJSON)
+	`, recoveryStateRowID).Scan(&lastSeq, &inflightJSON, &pendingJSON, &pendingReservesJSON, &submitsJSON, &depositsJSON, &withdrawalsJSON)
+	if isUndefinedColumnPgError(err, "processed_withdrawals_json") {
+		err = pool.QueryRow(ctx, `
+			SELECT last_flushed_evt_seq,
+			       inflight_json,
+			       pending_terminals_json,
+			       pending_reserves_json,
+			       processed_submits_json,
+			       processed_deposits_json
+			FROM funds_recovery_state
+			WHERE recovery_id = $1
+		`, recoveryStateRowID).Scan(&lastSeq, &inflightJSON, &pendingJSON, &pendingReservesJSON, &submitsJSON, &depositsJSON)
+		withdrawalsJSON = []byte("[]")
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -58,6 +75,7 @@ func loadRecoveryState(ctx context.Context, pool *pgxpool.Pool) (*RecoveryState,
 	pendingReservesJSON = normalizeJSONSlice(pendingReservesJSON)
 	submitsJSON = normalizeJSONSlice(submitsJSON)
 	depositsJSON = normalizeJSONSlice(depositsJSON)
+	withdrawalsJSON = normalizeJSONSlice(withdrawalsJSON)
 	if err := json.Unmarshal(inflightJSON, &state.Inflight); err != nil {
 		return nil, fmt.Errorf("decode funds inflight recovery state: %w", err)
 	}
@@ -73,6 +91,9 @@ func loadRecoveryState(ctx context.Context, pool *pgxpool.Pool) (*RecoveryState,
 	if err := json.Unmarshal(depositsJSON, &state.ProcessedDeposits); err != nil {
 		return nil, fmt.Errorf("decode funds deposit recovery state: %w", err)
 	}
+	if err := json.Unmarshal(withdrawalsJSON, &state.ProcessedWithdrawals); err != nil {
+		return nil, fmt.Errorf("decode funds withdrawal recovery state: %w", err)
+	}
 	return state, nil
 }
 
@@ -81,4 +102,15 @@ func normalizeJSONSlice(raw []byte) []byte {
 		return []byte("[]")
 	}
 	return raw
+}
+
+func isUndefinedColumnPgError(err error, column string) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42703" && pgErr.ColumnName == column
 }

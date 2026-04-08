@@ -212,6 +212,23 @@ func (m *Manager) ApplyDepositConfirmed(walletAddress string, amount uint64) {
 	shard.ledgers[walletAddress] = ledger
 }
 
+func (m *Manager) ApplyWithdrawConfirmed(walletAddress string, amount uint64) {
+	if amount == 0 {
+		return
+	}
+	shard := m.shard(walletAddress)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	ledger := shard.ledgers[walletAddress]
+	if ledger.AvailableUSDC < amount {
+		ledger.AvailableUSDC = 0
+	} else {
+		ledger.AvailableUSDC -= amount
+	}
+	m.markLedgerDirtyLocked(walletAddress, &ledger)
+	shard.ledgers[walletAddress] = ledger
+}
+
 func (m *Manager) ReserveOrder(cmd ReserveOrderInput) error {
 	shard := m.shard(cmd.WalletAddress)
 	shard.mu.Lock()
@@ -404,7 +421,6 @@ func (m *Manager) applyFillForOrder(order ActiveOrder, qty uint64, normalizedPri
 			position.CollateralLockedUnits -= collateralConsume
 			actualUnits = consume
 		}
-		ledger.PendingUSDC -= int64(actualUnits)
 		if order.OriginalOutcome == OutcomeYes {
 			position.PendingYesShares += int64(qty)
 		} else {
@@ -697,12 +713,11 @@ func (m *Manager) ApplySettlementFailedByBatch(event *matching.MatchBatchEvent) 
 				position.PendingNoShares -= canRevert
 			}
 		}
-		// 买单实际花费的 USDC（PendingUSDCDelta < 0 表示买入花费）退回 available
+		// 买单失败时，只需要把本批真实成交花费退回 available。
+		// buy-side 不再把花费记成负 pending_usdc，因此这里不再恢复 pending。
 		if d.PendingUSDCDelta < 0 {
 			refund := uint64(-d.PendingUSDCDelta)
 			ledger.AvailableUSDC += refund
-			// pending_usdc 已经在 match 时被减了，现在恢复（减的是负数，所以要加回来）
-			ledger.PendingUSDC += -d.PendingUSDCDelta
 		}
 
 		// 卖单失败回滚：pending_usdc 清掉，股份退回 available

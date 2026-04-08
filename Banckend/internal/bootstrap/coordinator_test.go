@@ -3,7 +3,7 @@ package bootstrap
 import "testing"
 
 func TestCoordinatorDefaultsToInitAndNotReady(t *testing.T) {
-	c := NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, 0)
+	c := NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, nil, 0)
 
 	if c.OrdersReady() {
 		t.Fatal("expected write gate to be disabled before start")
@@ -24,6 +24,9 @@ func TestCoordinatorDefaultsToInitAndNotReady(t *testing.T) {
 	}
 	if status["deposit-confirm"] != StateInit {
 		t.Fatalf("expected deposit-confirm init, got %v", status["deposit-confirm"])
+	}
+	if status["withdraw-confirm"] != StateInit {
+		t.Fatalf("expected withdraw-confirm init, got %v", status["withdraw-confirm"])
 	}
 	if status["market-confirm"] != StateInit {
 		t.Fatalf("expected market-confirm init, got %v", status["market-confirm"])

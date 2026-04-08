@@ -33,6 +33,8 @@ const (
 	defaultSettlementConsumerName = "funds-settlement"
 	// defaultDepositConsumerName is the durable consumer for evt.deposit.confirmed (AP_EVT stream)
 	defaultDepositConsumerName = "funds-deposit"
+	// defaultWithdrawalConsumerName is the durable consumer for evt.withdraw.confirmed (AP_EVT stream)
+	defaultWithdrawalConsumerName = "funds-withdraw"
 	// defaultReleasedConsumerName is the durable consumer for evt.order.released (AP_EVT stream)
 	defaultReleasedConsumerName = "funds-released"
 	// defaultReservedConsumerName is the durable consumer for evt.order.reserved.* (AP_EVT stream)
@@ -62,6 +64,7 @@ type Service struct {
 	inflight      *InflightStore
 	submits       *SubmitStore
 	deposits      *DepositStore
+	withdrawals   *WithdrawalStore
 	pending       *PendingReserveStore
 	projector     *Projector
 	consumerName  string
@@ -71,6 +74,7 @@ type Service struct {
 	cmdSub        *nats.Subscription // CMD stream: order submit
 	settlementSub *nats.Subscription // EVT stream: settlement lifecycle
 	depositSub    *nats.Subscription // EVT stream: deposit confirmed
+	withdrawSub   *nats.Subscription // EVT stream: withdraw confirmed
 	releasedSub   *nats.Subscription // EVT stream: order released
 	reservedSub   *nats.Subscription // EVT stream: order reserved
 	rejectedSub   *nats.Subscription // EVT stream: order reserve rejected
@@ -83,6 +87,7 @@ func NewService(client *natsjs.Client, pool *pgxpool.Pool, rdb *redis.Client, ma
 	inflight := NewInflightStore()
 	submits := NewSubmitStore()
 	deposits := NewDepositStore()
+	withdrawals := NewWithdrawalStore()
 	pending := NewPendingReserveStore()
 	svc := &Service{
 		client:       client,
@@ -92,10 +97,11 @@ func NewService(client *natsjs.Client, pool *pgxpool.Pool, rdb *redis.Client, ma
 		inflight:     inflight,
 		submits:      submits,
 		deposits:     deposits,
+		withdrawals:  withdrawals,
 		pending:      pending,
 		consumerName: defaultDispatchConsumerName,
 	}
-	svc.projector = NewProjector(manager, inflight, submits, deposits, pending, pool, rdb, &svc.stateMu, &svc.evtSeq)
+	svc.projector = NewProjector(manager, inflight, submits, deposits, withdrawals, pending, pool, rdb, &svc.stateMu, &svc.evtSeq)
 	return svc
 }
 
@@ -133,6 +139,7 @@ func (s *Service) Start(ctx context.Context) error {
 	go s.cmdDispatchLoop(ctx)        // CMD: order submit
 	go s.settlementDispatchLoop(ctx) // EVT: settlement lifecycle
 	go s.depositDispatchLoop(ctx)    // EVT: deposit confirmed
+	go s.withdrawDispatchLoop(ctx)   // EVT: withdraw confirmed
 	go s.releasedDispatchLoop(ctx)   // EVT: order released
 	// 启动异步投影器
 	go s.projector.Run(ctx)
@@ -195,6 +202,9 @@ func (s *Service) recoverFromPostgres(ctx context.Context) error {
 		}
 		if lockedUnits < 0 {
 			lockedUnits = 0
+		}
+		if pendingUnits < 0 {
+			pendingUnits = 0
 		}
 		wallets[walletAddress] = struct{}{}
 		s.manager.SeedLedger(walletAddress, UserWallet{
@@ -290,12 +300,15 @@ func (s *Service) restoreRecoveryState(state *RecoveryState) error {
 	if s.deposits != nil {
 		s.deposits.Restore(state.ProcessedDeposits)
 	}
+	if s.withdrawals != nil {
+		s.withdrawals.Restore(state.ProcessedWithdrawals)
+	}
 	if s.pending != nil {
 		s.pending.Restore(state.PendingReserves)
 	}
 	s.evtSeq.Store(state.LastFlushedEventSeq)
-	serviceLogger.Infof("funds: restored pg recovery state seq=%d inflight=%d pending_terminals=%d pending_reserves=%d submits=%d deposits=%d",
-		state.LastFlushedEventSeq, len(state.Inflight), len(state.PendingTerminals), len(state.PendingReserves), len(state.ProcessedSubmits), len(state.ProcessedDeposits))
+	serviceLogger.Infof("funds: restored pg recovery state seq=%d inflight=%d pending_terminals=%d pending_reserves=%d submits=%d deposits=%d withdrawals=%d",
+		state.LastFlushedEventSeq, len(state.Inflight), len(state.PendingTerminals), len(state.PendingReserves), len(state.ProcessedSubmits), len(state.ProcessedDeposits), len(state.ProcessedWithdrawals))
 	return nil
 }
 
@@ -410,6 +423,15 @@ func (s *Service) ensureSubscription() error {
 			s.depositSub = depositSub
 		}
 	}
+	// Withdraw consumer: evt.withdraw.confirmed
+	if s.withdrawSub == nil {
+		withdrawSub, err := s.client.PullSubscribe(protocol.SubjectWithdrawConfirmed, defaultWithdrawalConsumerName)
+		if err != nil {
+			serviceLogger.Warnf("funds: withdraw pull subscribe failed: %v", err)
+		} else {
+			s.withdrawSub = withdrawSub
+		}
+	}
 	// Released consumer: evt.order.released.*
 	if s.releasedSub == nil {
 		releasedSub, err := s.client.PullSubscribe(protocol.SubjectOrderReleased+".*", defaultReleasedConsumerName)
@@ -505,6 +527,17 @@ func (s *Service) depositDispatchLoop(ctx context.Context) {
 	s.runFetchLoop(ctx, s.depositSub, "Deposit")
 }
 
+// withdrawDispatchLoop 消费 evt.withdraw.confirmed
+func (s *Service) withdrawDispatchLoop(ctx context.Context) {
+	if s.withdrawSub == nil {
+		return
+	}
+	defer func() {
+		_ = s.withdrawSub.Unsubscribe()
+	}()
+	s.runFetchLoop(ctx, s.withdrawSub, "Withdraw")
+}
+
 // releasedDispatchLoop 消费 evt.order.released.*
 func (s *Service) releasedDispatchLoop(ctx context.Context) {
 	if s.releasedSub == nil {
@@ -562,6 +595,8 @@ func (s *Service) dispatchMessage(ctx context.Context, msg *nats.Msg) {
 		s.handleSettlementFailedMessage(ctx, msg)
 	case strings.HasPrefix(subj, protocol.SubjectDepositConfirmed):
 		s.handleDepositConfirmedMessage(ctx, msg)
+	case strings.HasPrefix(subj, protocol.SubjectWithdrawConfirmed):
+		s.handleWithdrawConfirmedMessage(ctx, msg)
 	default:
 		serviceLogger.Warnf("funds dispatch: unknown subject %s, skipping", subj)
 		s.ack(msg)
@@ -975,6 +1010,31 @@ func (s *Service) handleDepositConfirmedMessage(_ context.Context, msg *nats.Msg
 	s.manager.ApplyDepositConfirmed(strings.TrimSpace(event.WalletAddress), event.AmountUnits)
 	if s.deposits != nil {
 		s.deposits.Mark(signature)
+	}
+	s.ack(msg)
+	s.stateMu.RUnlock()
+}
+
+func (s *Service) handleWithdrawConfirmedMessage(_ context.Context, msg *nats.Msg) {
+	var event protocol.WithdrawConfirmedEvent
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		serviceLogger.Warnf("funds decode withdraw confirmation failed: %v", err)
+		_ = msg.Term()
+		return
+	}
+	signature := strings.TrimSpace(event.Signature)
+	if signature == "" {
+		_ = msg.Term()
+		return
+	}
+	if s.withdrawals != nil && s.withdrawals.Has(signature) {
+		s.ack(msg)
+		return
+	}
+	s.stateMu.RLock()
+	s.manager.ApplyWithdrawConfirmed(strings.TrimSpace(event.WalletAddress), event.AmountUnits)
+	if s.withdrawals != nil {
+		s.withdrawals.Mark(signature)
 	}
 	s.ack(msg)
 	s.stateMu.RUnlock()

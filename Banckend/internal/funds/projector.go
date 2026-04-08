@@ -3,6 +3,7 @@ package funds
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ type Projector struct {
 	inflight      *InflightStore
 	submits       *SubmitStore
 	deposits      *DepositStore
+	withdrawals   *WithdrawalStore
 	pending       *PendingReserveStore
 	pool          *pgxpool.Pool
 	rdb           *redis.Client
@@ -43,12 +45,13 @@ type Projector struct {
 	recoveryDirty atomic.Bool
 }
 
-func NewProjector(manager *Manager, inflight *InflightStore, submits *SubmitStore, deposits *DepositStore, pending *PendingReserveStore, pool *pgxpool.Pool, rdb *redis.Client, stateMu *sync.RWMutex, lastEventSeq *atomic.Uint64) *Projector {
+func NewProjector(manager *Manager, inflight *InflightStore, submits *SubmitStore, deposits *DepositStore, withdrawals *WithdrawalStore, pending *PendingReserveStore, pool *pgxpool.Pool, rdb *redis.Client, stateMu *sync.RWMutex, lastEventSeq *atomic.Uint64) *Projector {
 	return &Projector{
 		manager:      manager,
 		inflight:     inflight,
 		submits:      submits,
 		deposits:     deposits,
+		withdrawals:  withdrawals,
 		pending:      pending,
 		pool:         pool,
 		rdb:          rdb,
@@ -91,6 +94,7 @@ type recoverySnapshot struct {
 	pendingReserves []PendingReserve
 	submits         []string
 	deposits        []string
+	withdrawals     []string
 	lastEvtSeq      uint64
 }
 
@@ -165,6 +169,9 @@ func (p *Projector) captureFlushState() ([]DirtyWalletSnapshot, []DirtyPositionS
 		}
 		if p.deposits != nil {
 			recovery.deposits = p.deposits.Snapshot()
+		}
+		if p.withdrawals != nil {
+			recovery.withdrawals = p.withdrawals.Snapshot()
 		}
 		if p.pending != nil {
 			recovery.pendingReserves = p.pending.Snapshot()
@@ -255,16 +262,15 @@ func (p *Projector) upsertWalletBatch(ctx context.Context, execer dbExec, wallet
 			sb.WriteString(", ")
 		}
 		totalUnits := int64(w.Ledger.AvailableUSDC) + int64(w.Ledger.LockedUSDC)
-		if w.Ledger.PendingUSDC > 0 {
-			totalUnits += w.Ledger.PendingUSDC
-		}
+		pendingUnits := nonNegativePendingUnits(w.Ledger.PendingUSDC)
+		totalUnits += pendingUnits
 		sb.WriteString(fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, NOW())", paramIdx, paramIdx+1, paramIdx+2, paramIdx+3, paramIdx+4))
 		args = append(args,
 			w.WalletAddress,
 			totalUnits,
 			int64(w.Ledger.AvailableUSDC),
 			int64(w.Ledger.LockedUSDC),
-			w.Ledger.PendingUSDC,
+			pendingUnits,
 		)
 		paramIdx += 5
 	}
@@ -406,8 +412,37 @@ func (p *Projector) upsertRecoveryStateTx(ctx context.Context, tx pgx.Tx, recove
 	if err != nil {
 		return fmt.Errorf("marshal recovery deposits: %w", err)
 	}
+	withdrawalsJSON, err := json.Marshal(recovery.withdrawals)
+	if err != nil {
+		return fmt.Errorf("marshal recovery withdrawals: %w", err)
+	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	_, err = tx.Exec(timeoutCtx, `
+		INSERT INTO funds_recovery_state (
+			recovery_id,
+			last_flushed_evt_seq,
+			inflight_json,
+			pending_terminals_json,
+			pending_reserves_json,
+			processed_submits_json,
+			processed_deposits_json,
+			processed_withdrawals_json,
+			updated_at
+		) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, NOW())
+		ON CONFLICT (recovery_id) DO UPDATE SET
+			last_flushed_evt_seq    = EXCLUDED.last_flushed_evt_seq,
+			inflight_json           = EXCLUDED.inflight_json,
+			pending_terminals_json  = EXCLUDED.pending_terminals_json,
+			pending_reserves_json   = EXCLUDED.pending_reserves_json,
+			processed_submits_json  = EXCLUDED.processed_submits_json,
+			processed_deposits_json = EXCLUDED.processed_deposits_json,
+			processed_withdrawals_json = EXCLUDED.processed_withdrawals_json,
+			updated_at              = NOW()
+	`, recoveryStateRowID, int64(recovery.lastEvtSeq), inflightJSON, pendingJSON, pendingReservesJSON, submitsJSON, depositsJSON, withdrawalsJSON)
+	if err == nil || !isUndefinedColumnError(err, "processed_withdrawals_json") {
+		return err
+	}
 	_, err = tx.Exec(timeoutCtx, `
 		INSERT INTO funds_recovery_state (
 			recovery_id,
@@ -429,6 +464,24 @@ func (p *Projector) upsertRecoveryStateTx(ctx context.Context, tx pgx.Tx, recove
 			updated_at              = NOW()
 	`, recoveryStateRowID, int64(recovery.lastEvtSeq), inflightJSON, pendingJSON, pendingReservesJSON, submitsJSON, depositsJSON)
 	return err
+}
+
+func isUndefinedColumnError(err error, column string) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42703" && (pgErr.ColumnName == column || strings.Contains(pgErr.Message, column))
+}
+
+func nonNegativePendingUnits(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 // refreshRedisWallets 把单个 wallet 的最新状态刷入 Redis。
@@ -474,14 +527,13 @@ func (p *Projector) refreshRedisWalletBatch(ctx context.Context, wallets []Dirty
 	for _, w := range wallets {
 		key := fmt.Sprintf("wallet-account:%s", w.WalletAddress)
 		totalUnits := int64(w.Ledger.AvailableUSDC) + int64(w.Ledger.LockedUSDC)
-		if w.Ledger.PendingUSDC > 0 {
-			totalUnits += w.Ledger.PendingUSDC
-		}
+		pendingUnits := nonNegativePendingUnits(w.Ledger.PendingUSDC)
+		totalUnits += pendingUnits
 		pipe.HSet(timeoutCtx, key, map[string]any{
 			"collateral_total_units":   totalUnits,
 			"collateral_free_units":    int64(w.Ledger.AvailableUSDC),
 			"collateral_locked_units":  int64(w.Ledger.LockedUSDC),
-			"collateral_pending_units": w.Ledger.PendingUSDC,
+			"collateral_pending_units": pendingUnits,
 			"updated_at":               updatedAt,
 		})
 	}

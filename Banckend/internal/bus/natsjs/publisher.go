@@ -38,6 +38,10 @@ func (p *CommandPublisher) PublishDepositConfirm(ctx context.Context, cmd protoc
 	return p.client.publishJSON(ctx, protocol.SubjectDepositConfirm, cmd.Signature, cmd)
 }
 
+func (p *CommandPublisher) PublishWithdrawConfirm(ctx context.Context, cmd protocol.WithdrawConfirmCommand) error {
+	return p.client.publishJSON(ctx, protocol.SubjectWithdrawConfirm, cmd.Signature, cmd)
+}
+
 func (p *CommandPublisher) PublishMarketConfirm(ctx context.Context, cmd protocol.MarketConfirmCommand) error {
 	return p.client.publishJSON(ctx, protocol.SubjectMarketConfirm, cmd.Signature, cmd)
 }

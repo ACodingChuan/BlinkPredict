@@ -26,7 +26,7 @@ const userContextKey contextKey = "auth_user"
 
 const (
 	defaultTokenTTL     = 7 * 24 * time.Hour
-	defaultChallengeTTL = 5 * time.Minute
+	defaultChallengeTTL = 24 * time.Hour
 	loginMessageVersion = "blinkpredict.login.v1"
 )
 

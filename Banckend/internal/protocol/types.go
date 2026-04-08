@@ -13,6 +13,7 @@ const (
 	CommandTypeSubmitOrder    = "cmd.order.submit"
 	CommandTypeCancelOrder    = "cmd.order.cancel"
 	CommandTypeDepositConfirm = "cmd.tx.confirm.deposit"
+	CommandTypeWithdrawConfirm = "cmd.tx.confirm.withdraw"
 	CommandTypeMarketConfirm  = "cmd.tx.confirm.market_create"
 )
 
@@ -21,6 +22,7 @@ const (
 	SubjectOrderSubmit          = "cmd.order.submit"
 	SubjectCancelOrder          = "cmd.order.cancel"
 	SubjectDepositConfirm       = "cmd.tx.confirm.deposit"
+	SubjectWithdrawConfirm      = "cmd.tx.confirm.withdraw"
 	SubjectMarketConfirm        = "cmd.tx.confirm.market_create"
 	SubjectOrderReserved        = "evt.order.reserved"
 	SubjectOrderReserveRejected = "evt.order.reserve_rejected"
@@ -29,6 +31,8 @@ const (
 	SubjectSettlementFailed     = "evt.settlement.failed"
 	SubjectDepositConfirmed     = "evt.deposit.confirmed"
 	SubjectDepositFailed        = "evt.deposit.failed"
+	SubjectWithdrawConfirmed    = "evt.withdraw.confirmed"
+	SubjectWithdrawFailed       = "evt.withdraw.failed"
 	SubjectMarketConfirmed      = "evt.market.confirmed"
 	SubjectMarketFailed         = "evt.market.failed"
 )
@@ -121,6 +125,25 @@ type DepositConfirmedEvent struct {
 }
 
 type DepositFailedEvent struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	Reason        string `json:"reason"`
+}
+
+type WithdrawConfirmCommand struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	AmountUnits   uint64 `json:"amount_units"`
+}
+
+type WithdrawConfirmedEvent struct {
+	Signature     string `json:"signature"`
+	WalletAddress string `json:"wallet_address"`
+	AmountUnits   uint64 `json:"amount_units"`
+	Slot          uint64 `json:"slot"`
+}
+
+type WithdrawFailedEvent struct {
 	Signature     string `json:"signature"`
 	WalletAddress string `json:"wallet_address"`
 	Reason        string `json:"reason"`
@@ -241,6 +264,7 @@ type CommandPublisher interface {
 	PublishPlaceOrder(context.Context, CommandEnvelope[PlaceOrderCommand]) error
 	PublishCancelOrder(context.Context, CommandEnvelope[CancelOrderCommand]) error
 	PublishDepositConfirm(context.Context, DepositConfirmCommand) error
+	PublishWithdrawConfirm(context.Context, WithdrawConfirmCommand) error
 	PublishMarketConfirm(context.Context, MarketConfirmCommand) error
 }
 
@@ -259,6 +283,10 @@ func (DisabledCommandPublisher) PublishCancelOrder(context.Context, CommandEnvel
 }
 
 func (DisabledCommandPublisher) PublishDepositConfirm(context.Context, DepositConfirmCommand) error {
+	return ErrCommandBusDisabled
+}
+
+func (DisabledCommandPublisher) PublishWithdrawConfirm(context.Context, WithdrawConfirmCommand) error {
 	return ErrCommandBusDisabled
 }
 

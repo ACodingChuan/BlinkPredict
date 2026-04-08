@@ -12,6 +12,7 @@ import (
 	"blinkpredict/banckend/internal/matching"
 	"blinkpredict/banckend/internal/pusher"
 	"blinkpredict/banckend/internal/settlement"
+	"blinkpredict/banckend/internal/withdrawconfirm"
 	"blinkpredict/banckend/internal/writer"
 )
 
@@ -23,6 +24,7 @@ type Coordinator struct {
 	matcher            *matching.MarketManager
 	pusher             *pusher.Service
 	depositConfirm     *depositconfirm.Service
+	withdrawConfirm    *withdrawconfirm.Service
 	marketConfirm      *marketconfirm.Service
 	marketProjector    *marketconfirm.Projector
 	settlement         *settlement.Service
@@ -31,6 +33,7 @@ type Coordinator struct {
 	matcherState       atomic.Int32
 	pusherState        atomic.Int32
 	depositState       atomic.Int32
+	withdrawState      atomic.Int32
 	marketConfirmState atomic.Int32
 	projectorState     atomic.Int32
 	settlementState    atomic.Int32
@@ -55,6 +58,7 @@ func NewCoordinator(
 	matcher *matching.MarketManager,
 	pusherSvc *pusher.Service,
 	depositSvc *depositconfirm.Service,
+	withdrawSvc *withdrawconfirm.Service,
 	marketConfirmSvc *marketconfirm.Service,
 	marketProjector *marketconfirm.Projector,
 	settlementSvc *settlement.Service,
@@ -66,6 +70,7 @@ func NewCoordinator(
 		matcher:         matcher,
 		pusher:          pusherSvc,
 		depositConfirm:  depositSvc,
+		withdrawConfirm: withdrawSvc,
 		marketConfirm:   marketConfirmSvc,
 		marketProjector: marketProjector,
 		settlement:      settlementSvc,
@@ -105,6 +110,13 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	if c.depositConfirm != nil {
 		if err := c.startModule(&c.depositState, StateStartingIndex(), "deposit-confirm", "starting deposit confirm service", func() error {
 			return c.depositConfirm.Start(ctx)
+		}); err != nil {
+			return err
+		}
+	}
+	if c.withdrawConfirm != nil {
+		if err := c.startModule(&c.withdrawState, StateStartingIndex(), "withdraw-confirm", "starting withdraw confirm service", func() error {
+			return c.withdrawConfirm.Start(ctx)
 		}); err != nil {
 			return err
 		}
@@ -161,6 +173,7 @@ func (c *Coordinator) Status() map[string]any {
 		"matcher":             stateFromIndex(c.matcherState.Load()),
 		"pusher":              stateFromIndex(c.pusherState.Load()),
 		"deposit-confirm":     stateFromIndex(c.depositState.Load()),
+		"withdraw-confirm":    stateFromIndex(c.withdrawState.Load()),
 		"market-confirm":      stateFromIndex(c.marketConfirmState.Load()),
 		"market-projector":    stateFromIndex(c.projectorState.Load()),
 		"settlement":          stateFromIndex(c.settlementState.Load()),

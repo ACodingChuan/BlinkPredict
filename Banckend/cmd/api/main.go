@@ -38,6 +38,7 @@ import (
 	internalsolana "blinkpredict/banckend/internal/solana"
 	"blinkpredict/banckend/internal/txreqs"
 	"blinkpredict/banckend/internal/webhooks"
+	"blinkpredict/banckend/internal/withdrawconfirm"
 	"blinkpredict/banckend/internal/writer"
 
 	"github.com/gagliardetto/solana-go"
@@ -97,6 +98,7 @@ func main() {
 	var pgWriter *writer.Writer
 	var settlementService *settlement.Service
 	var depositConfirmService *depositconfirm.Service
+	var withdrawConfirmService *withdrawconfirm.Service
 	var marketConfirmService *marketconfirm.Service
 	var marketProjector *marketconfirm.Projector
 	var marketManager *matching.MarketManager
@@ -135,10 +137,10 @@ func main() {
 				IdleFlush:    cfg.MatcherBatchIdleFlush,
 				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
-			CheckpointInterval:  cfg.MatcherCheckpointInterval,
-			ProgramID:           programID,
+			CheckpointInterval:   cfg.MatcherCheckpointInterval,
+			ProgramID:            programID,
 			SettlementTxMaxBytes: cfg.SettlementTxMaxBytes,
-			AddressTables:       settlementAddressTables,
+			AddressTables:        settlementAddressTables,
 		})
 	} else {
 		logger.Warnf("NATS disabled (set NATS_URL to enable command bus)")
@@ -165,10 +167,10 @@ func main() {
 				IdleFlush:    cfg.MatcherBatchIdleFlush,
 				FlushTick:    cfg.MatcherBatchFlushTick,
 			},
-			CheckpointInterval:  cfg.MatcherCheckpointInterval,
-			ProgramID:           programID,
+			CheckpointInterval:   cfg.MatcherCheckpointInterval,
+			ProgramID:            programID,
 			SettlementTxMaxBytes: cfg.SettlementTxMaxBytes,
-			AddressTables:       settlementAddressTables,
+			AddressTables:        settlementAddressTables,
 		})
 	}
 
@@ -204,7 +206,7 @@ func main() {
 	var webhookHandler *webhooks.HeliusHandler
 	var alchemyHandler *webhooks.AlchemyHandler
 	logger.Infof("Webhook ingress disabled; deposit and market flows use confirm workers only")
-	boot := bootstrap.NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, cfg.MatcherTickInterval)
+	boot := bootstrap.NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, nil, cfg.MatcherTickInterval)
 	if natsClient != nil {
 		if cfg.SolanaRPCURL != "" {
 			wsRouter = chainconfirm.NewRouter(cfg.SolanaWSURL, cfg.SolanaRPCURL, 2)
@@ -256,6 +258,9 @@ func main() {
 			depositConfirmService = depositconfirm.NewService(natsClient, pool, cfg, wsRouter)
 		}
 		if cfg.SolanaRPCURL != "" {
+			withdrawConfirmService = withdrawconfirm.NewService(natsClient, pool, cfg, wsRouter)
+		}
+		if cfg.SolanaRPCURL != "" {
 			marketConfirmService = marketconfirm.NewService(natsClient, pool, cfg, wsRouter)
 		}
 		boot = bootstrap.NewCoordinator(
@@ -264,6 +269,7 @@ func main() {
 			marketManager,
 			pusherService,
 			depositConfirmService,
+			withdrawConfirmService,
 			marketConfirmService,
 			marketProjector,
 			settlementService,
