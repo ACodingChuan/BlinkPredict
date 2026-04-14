@@ -54,7 +54,7 @@ flowchart LR
 
   U --> UI
   UI -->|REST /api| API
-  UI -->|WS /ws/markets/{id}| HUB
+  UI -->|WS /ws/markets/:id| HUB
   UI -->|签名 message/tx| U
   UI -->|校验 feed id| HERMES
   UI --> META
