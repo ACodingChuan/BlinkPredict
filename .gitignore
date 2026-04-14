@@ -13,6 +13,7 @@
 !Frontened/**
 !spec/
 !spec/**
+!README.md
 # Environment files / secrets (keep examples)
 **/.env
 **/.env.*
