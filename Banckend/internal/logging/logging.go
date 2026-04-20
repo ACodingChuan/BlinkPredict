@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -159,6 +160,9 @@ func FormatArgs(args []any) []any {
 }
 
 func formatValue(value any) any {
+	if isNilValue(value) {
+		return nil
+	}
 	switch typed := value.(type) {
 	case nil:
 		return nil
@@ -167,14 +171,32 @@ func formatValue(value any) any {
 			return ""
 		}
 		return string(typed)
+	case time.Time:
+		return typed.UTC().Format(time.RFC3339Nano)
+	case *time.Time:
+		if typed == nil {
+			return nil
+		}
+		return typed.UTC().Format(time.RFC3339Nano)
 	case fmt.Stringer:
 		return typed.String()
 	case error:
 		return typed.Error()
-	case time.Time:
-		return typed.UTC().Format(time.RFC3339Nano)
 	default:
 		return typed
+	}
+}
+
+func isNilValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
 	}
 }
 

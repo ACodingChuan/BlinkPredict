@@ -58,6 +58,14 @@ type queuedMarketMessage struct {
 }
 
 func NewHub(cfg config.Config, tickets *TicketStore, marketData MarketDataSource) *Hub {
+	allowedOrigins := make(map[string]struct{}, len(cfg.CORSAllowedOrigins))
+	for _, origin := range cfg.CORSAllowedOrigins {
+		normalized := strings.TrimSpace(origin)
+		if normalized == "" {
+			continue
+		}
+		allowedOrigins[normalized] = struct{}{}
+	}
 	return &Hub{
 		cfg:        cfg,
 		tickets:    tickets,
@@ -70,7 +78,8 @@ func NewHub(cfg config.Config, tickets *TicketStore, marketData MarketDataSource
 				if origin == "" {
 					return true
 				}
-				return origin == "http://localhost:3000" || origin == "http://127.0.0.1:3000"
+				_, ok := allowedOrigins[origin]
+				return ok
 			},
 		},
 		marketRooms: make(map[uint64]map[*connection]struct{}),

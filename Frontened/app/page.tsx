@@ -114,8 +114,8 @@ export default function HomePage() {
 
             <div className="mt-4 text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Resume</div>
             <div className="mt-2 space-y-2">
-              <PlaceholderAction icon="download" label="Download Resume (中文)" />
-              <PlaceholderAction icon="download" label="Download Resume (EN)" />
+              <DownloadAction href="/resume/resumezh-CN.pdf" label="Download Resume (中文)" />
+              <DownloadAction href="/resume/resume-en.pdf" label="Download Resume (EN)" />
             </div>
           </section>
         </section>
@@ -181,14 +181,15 @@ const ContactItem = ({ icon, label, value }: { icon: "mail" | "message"; label: 
   </div>
 );
 
-const PlaceholderAction = ({ label, icon }: { label: string; icon?: "download" }) => (
-  <button
+const DownloadAction = ({ href, label }: { href: string; label: string }) => (
+  <a
     className="flex w-full items-center justify-center gap-2 rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-2.5 text-[14px] font-semibold text-zinc-800 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
-    type="button"
+    href={href}
+    download
   >
-    {icon ? <ContactIcon kind={icon} /> : null}
+    <ContactIcon kind="download" />
     {label}
-  </button>
+  </a>
 );
 
 const ContactIcon = ({ kind }: { kind: "mail" | "message" | "download" }) => {

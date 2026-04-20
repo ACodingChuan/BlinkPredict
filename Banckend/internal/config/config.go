@@ -12,6 +12,7 @@ import (
 type Config struct {
 	Port                      string
 	DatabaseURL               string
+	CORSAllowedOrigins        []string
 	SolanaRPCURL              string
 	SolanaWSURL               string
 	ProgramID                 string
@@ -82,6 +83,7 @@ func Load() Config {
 	return Config{
 		Port:                      getEnv("PORT", "8080"),
 		DatabaseURL:               dbURL,
+		CORSAllowedOrigins:        csvList(getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")),
 		SolanaRPCURL:              getEnv("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
 		SolanaWSURL:               strings.TrimSpace(os.Getenv("SOLANA_WS_URL")),
 		ProgramID:                 getEnv("PROGRAM_ID", "2FoSgViaZXUXL8txXYxc893cUSpPCuvdVZBJ9YDzUKzE"),
